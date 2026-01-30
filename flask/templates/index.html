@@ -1,23 +1,23 @@
 <!doctype html>
-<html lang="de">
+<html lang="de" data-theme="{{ theme }}">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Live Stream - Bethaus Speyer</title>
+  <title>{{ page_title }}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@400;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}" />
-  <link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}" type="image/svg+xml" />
+  <link rel="icon" href="{{ favicon_url }}" type="{{ favicon_type }}" />
 </head>
-<body data-hls-url="{{ hls_url }}"{% if audio_hls_url %} data-audio-hls-url="{{ audio_hls_url }}"{% endif %}>
+<body{% if not audio_only %} data-hls-url="{{ hls_url }}"{% endif %}{% if audio_hls_url %} data-audio-hls-url="{{ audio_hls_url }}"{% endif %} data-audio-only="{{ '1' if audio_only else '0' }}" data-audio-status-url="{{ url_for('audio_status') }}" data-debug="{{ '1' if debug_enabled else '0' }}" data-schedule-base-url="{{ schedule_base_url }}">
   <div class="page">
     <header class="top">
       <div class="brand">
-        <img src="https://cdh-stephanus.org/wp-content/uploads/2020/05/Logo-nebeneinander.png" alt="CDH Stephanus Logo" />
+        <img src="{{ logo_url }}" alt="{{ logo_alt }}" />
         <div class="brand-meta">
           <div class="kicker">Live Stream</div>
-          <h1>Missionskonferenz 2026</h1>
+          <h1>{{ site_title }}</h1>
           <p class="sub">Live aus Speyer.</p>
         </div>
       </div>
@@ -26,11 +26,13 @@
     <section class="stage">
       <div class="player-card">
         <div class="player" id="player">
+          {% if not audio_only %}
           <video id="video" controls autoplay muted playsinline></video>
-          {% if audio_hls_url %}
+          {% endif %}
+          {% if audio_hls_url or audio_only %}
           <audio id="audio" playsinline preload="none"></audio>
           {% endif %}
-          {% if audio_hls_url %}
+          {% if audio_hls_url or audio_only %}
           <div id="audio-controls" class="audio-controls hidden" aria-live="polite">
             <button type="button" id="audio-toggle" aria-label="Audio pausieren">
               <svg viewBox="0 0 24 24" aria-hidden="true" class="audio-toggle-icon">
@@ -44,9 +46,15 @@
                 <span></span>
               </div>
             </button>
+            <!-- Volume Control 
+            <div class="audio-volume" aria-label="Lautstärke">
+              <span class="audio-volume-label">Lautstärke</span>
+              <input id="audio-volume" type="range" min="0" max="1" step="0.05" value="1" aria-label="Lautstärke" />
+            </div>
+            -->
           </div>
           {% endif %}
-          <div id="offline" class="offline">
+          <div id="offline" class="offline hidden">
             <img src="/static/offline.svg" alt="Stream offline" />
             <div class="offline-content">
               <p id="offline-title" class="offline-title">Stream offline</p>
@@ -66,16 +74,18 @@
         <div class="meta">
           <div class="badges">
             <div id="status" class="status status-offline">Offline</div>
-            <div id="clients" class="clients">Aktuelle Zuschauer: 0</div>
+            <div id="clients" class="clients">Aktuell online: 0</div>
+            <!-- Reload Button
             <button class="ghost small" id="reload" type="button">Neu laden</button>
+            -->
           </div>
           <div class="controls">
             <label class="toggle" id="autostart-label" for="autostart">
               <input type="checkbox" id="autostart" checked />
               <span class="switch" aria-hidden="true"></span>
-              <span>Autostart</span>
+              <span class="autostart-text">Autostart</span>
             </label>
-            {% if audio_hls_url %}
+            {% if audio_hls_url and not audio_only %}
             <label class="toggle" for="audio-only">
               <input type="checkbox" id="audio-only" />
               <span class="switch" aria-hidden="true"></span>
@@ -91,16 +101,14 @@
         <div class="info-card">
           <h2>So funktioniert's</h2>
           <ul>
-            <li>Die Übertragung startet automatisch, sobald wir online gehen.</li>
-            <li>Ton muss von dir aktiviert werden, sobald der Stream läuft.</li>
-            <li>Am besten im WLAN für stabile Qualität.</li>
-            <li>Bei Problemen hilft ein kurzes Neu laden.</li>
+            <li>Sobald der Stream online ist kannst du Audio aktivieren.</li>
+            <li>Für störungsfreie Wiedergabe auf guten Empfang achten.</li>
+            <li>Wiedergabe kann im Hintergrund weiterlaufen.</li>
           </ul>
         </div>
         <div class="info-card schedule-card">
           <div class="schedule-head">
             <h3>Streaming-Kalender</h3>
-            <span class="tz">Zeitzone: Lokalzeit</span>
           </div>
           <div id="schedule" class="schedule"></div>
           <p id="schedule-empty" class="schedule-empty" hidden>Derzeit keine Termine veröffentlicht.</p>
@@ -109,21 +117,21 @@
       </aside>
     </section>
 
-    <section class="stats">
+    <section class="stats{% if not debug_enabled %} hidden{% endif %}" id="stats-section">
       <div class="info-card stats-card">
         <div class="stats-head">
-          <h3>Zuschauer-Verlauf</h3>
+          <h3>Online-Verlauf</h3>
           <span class="stats-range">Letzte 60 Minuten</span>
         </div>
         <div class="stats-body">
-          <canvas id="stats-canvas" width="600" height="120" aria-label="Zuschauerstatistik" role="img"></canvas>
+          <canvas id="stats-canvas" width="600" height="120" aria-label="Onlinestatistik" role="img"></canvas>
           <p id="stats-empty" class="stats-empty" hidden>Noch keine Daten verfügbar.</p>
         </div>
       </div>
     </section>
 
     <footer class="footer">
-      <a href="https://cdh-stephanus.org/" target="_blank" rel="noopener noreferrer">CDH Stephanus</a> &middot; Speyer
+      <a href="{{ footer_url }}" target="_blank" rel="noopener noreferrer">{{ footer_text }}</a> &middot; Streaming
     </footer>
   </div>
 

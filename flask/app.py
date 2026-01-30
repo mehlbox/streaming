@@ -6,10 +6,18 @@ from threading import Lock
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from flask import Flask, abort, jsonify, render_template, request
+from flask import Flask, abort, jsonify, render_template, request, url_for
 from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
+
+def get_env_default(key: str, default: str) -> str:
+    value = os.getenv(key, "").strip()
+    return value or default
+
+def parse_bool(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 STREAM_NAME = os.getenv("STREAM_NAME", "live")
 STREAM_KEY = os.getenv("STREAM_KEY", "").strip()
 HLS_DIR = os.getenv("HLS_DIR", "/var/www/hls")
@@ -19,28 +27,75 @@ STATS_DB = os.getenv("STATS_DB", "/docker/streaming/flask/stats.db")
 STATS_SAMPLE_SECONDS = int(os.getenv("STATS_SAMPLE_SECONDS", "60"))
 AUDIO_STREAM_NAME = os.getenv("AUDIO_STREAM_NAME", "").strip()
 AUDIO_HLS_URL = os.getenv("AUDIO_HLS_URL", "").strip()
+AUDIO_ONLY = parse_bool(os.getenv("AUDIO_ONLY", ""))
+THEME = os.getenv("THEME", "ocean").strip().lower()
+SUPPORTED_THEMES = {"stephanus", "ocean", "midnight", "bethaus"}
+if THEME not in SUPPORTED_THEMES:
+    THEME = "ocean"
+SITE_TITLE = get_env_default("SITE_TITLE", "docker streaming")
+PAGE_TITLE = get_env_default("PAGE_TITLE", f"Live Stream - {SITE_TITLE}")
+LOGO_URL = get_env_default("LOGO_URL","",)
+LOGO_ALT = get_env_default("LOGO_ALT", "CDH Stephanus Logo")
+FAVICON_URL = os.getenv("FAVICON_URL", "").strip()
+FAVICON_TYPE = get_env_default("FAVICON_TYPE", "image/svg+xml")
+FOOTER_URL = get_env_default("FOOTER_URL", "https://cdh-stephanus.org/")
+FOOTER_TEXT = get_env_default("FOOTER_TEXT", "CDH Stephanus")
+SCHEDULE_BASE_URL = get_env_default("SCHEDULE_BASE_URL", "/static/data")
 socketio = SocketIO(app, cors_allowed_origins="*")
 client_lock = Lock()
 client_count = 0
 stats_lock = Lock()
 stats_task_started = False
 
-@app.get("/")
-def index():
+def render_index(debug_enabled: bool):
     audio_hls_url = None
     if AUDIO_HLS_URL:
         audio_hls_url = AUDIO_HLS_URL
     elif AUDIO_STREAM_NAME:
         audio_hls_url = f"/hls/{AUDIO_STREAM_NAME}.m3u8"
+    favicon_url = FAVICON_URL or url_for("static", filename="favicon.svg")
     return render_template(
         "index.html",
         hls_url=f"/hls/{STREAM_NAME}.m3u8",
         audio_hls_url=audio_hls_url,
+        theme=THEME,
+        site_title=SITE_TITLE,
+        page_title=PAGE_TITLE,
+        logo_url=LOGO_URL,
+        logo_alt=LOGO_ALT,
+        favicon_url=favicon_url,
+        favicon_type=FAVICON_TYPE,
+        audio_only=AUDIO_ONLY,
+        debug_enabled=debug_enabled,
+        footer_url=FOOTER_URL,
+        footer_text=FOOTER_TEXT,
+        schedule_base_url=SCHEDULE_BASE_URL,
     )
+
+
+@app.get("/")
+def index():
+    return render_index(False)
+
+
+@app.get("/debug")
+def debug_index():
+    return render_index(True)
 
 
 def is_live() -> bool:
     hls_path = Path(HLS_DIR) / f"{STREAM_NAME}.m3u8"
+    if not hls_path.exists():
+        return False
+    age = time.time() - hls_path.stat().st_mtime
+    return age <= HLS_STALE_SECONDS
+
+def is_audio_live() -> bool:
+    if AUDIO_HLS_URL:
+        return True
+    if not AUDIO_STREAM_NAME:
+        return False
+    hls_path = Path(HLS_DIR) / f"{AUDIO_STREAM_NAME}.m3u8"
     if not hls_path.exists():
         return False
     age = time.time() - hls_path.stat().st_mtime
@@ -67,6 +122,10 @@ def is_private_addr(addr: str) -> bool:
 @app.get("/status")
 def status():
     return jsonify({"live": is_live()})
+
+@app.get("/audio-status")
+def audio_status():
+    return jsonify({"live": is_audio_live()})
 
 
 def init_stats_db() -> None:

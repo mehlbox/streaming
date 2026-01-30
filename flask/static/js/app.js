@@ -11,9 +11,11 @@ const audioControlsEl = document.getElementById("audio-controls");
 const audioToggleBtn = document.getElementById("audio-toggle");
 const audioLabelEl = audioControlsEl?.querySelector(".audio-label");
 const audioTogglePath = audioControlsEl?.querySelector(".audio-toggle-icon path");
+const volumeSlider = document.getElementById("audio-volume");
 const debugPanel = document.getElementById("debug-panel");
 const autostartToggle = document.getElementById("autostart");
 const autostartLabel = document.getElementById("autostart-label");
+const autostartTextEl = autostartLabel?.querySelector(".autostart-text");
 const audioOnlyToggle = document.getElementById("audio-only");
 const clientsEl = document.getElementById("clients");
 const reloadBtn = document.getElementById("reload");
@@ -24,13 +26,13 @@ const offlineSubEl = document.getElementById("offline-sub");
 const statsCanvas = document.getElementById("stats-canvas");
 const statsEmptyEl = document.getElementById("stats-empty");
 const statsRangeEl = document.querySelector(".stats-range");
-const schedule = [
-  { date: "2026-02-01", time: "10:00", title: "Eröffnungsgottesdienst", durationMinutes: 90 },
-  { date: "2026-02-01", time: "19:30", title: "Abendimpuls", durationMinutes: 60 },
-  { date: "2026-02-02", time: "12:00", title: "Mittagsplenum", durationMinutes: 90 },
-  { date: "2026-02-03", time: "19:00", title: "Abschlussabend", durationMinutes: 90 }
-];
+const statsSection = document.getElementById("stats-section");
 const scheduleLocale = "de-DE";
+const scheduleTheme = document.documentElement?.dataset?.theme || "ocean";
+const scheduleBaseUrl = (document.body?.dataset?.scheduleBaseUrl || "/data").replace(/\/$/, "");
+const scheduleUrl = document.body?.dataset?.scheduleUrl || `${scheduleBaseUrl}/schedule-${scheduleTheme}.json`;
+const audioStatusUrl = document.body?.dataset?.audioStatusUrl || "/audio-status";
+const audioOnlyForced = document.body?.dataset?.audioOnly === "1";
 const timeFormatter = new Intl.DateTimeFormat(scheduleLocale, { hour: "2-digit", minute: "2-digit" });
 const dayFormatter = new Intl.DateTimeFormat(scheduleLocale, { day: "2-digit" });
 const monthFormatter = new Intl.DateTimeFormat(scheduleLocale, { month: "short" });
@@ -45,14 +47,22 @@ let hls = null;
 let started = false;
 let isLive = false;
 let autostartEnabled = autostartToggle?.checked ?? true;
-let audioOnlyEnabled = audioOnlyToggle?.checked ?? false;
+let audioOnlyEnabled = audioOnlyForced || (audioOnlyToggle?.checked ?? false);
 let mediaEl = video;
 let activeHlsUrl = hlsUrl;
 let mediaRecoveryAttempts = 0;
 let lastMediaRecoveryAt = 0;
 const audioOnlyStorageKey = "audioOnly";
+const autostartAttemptsKey = "autostartAttempts";
+const autostartMaxAttempts = 10;
+const volumeStorageKey = "audioVolume";
 let allowAutoplay = true;
-const debugEnabled = new URL(window.location.href).searchParams.has("debug");
+const debugEnabled = document.body?.dataset?.debug === "1";
+let scheduleData = [];
+let audioAvailable = true;
+let audioLive = false;
+let playbackActive = false;
+let autostartAttempts = 0;
 
 const debugLog = (message) => {
   if (!debugPanel || !debugEnabled) return;
@@ -60,6 +70,90 @@ const debugLog = (message) => {
   const ts = new Date().toLocaleTimeString();
   debugPanel.textContent += `[${ts}] ${message}\n`;
   debugPanel.scrollTop = debugPanel.scrollHeight;
+};
+
+const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+
+const loadVolume = () => {
+  const stored = localStorage.getItem(volumeStorageKey);
+  const value = Number.parseFloat(stored);
+  return Number.isFinite(value) ? clamp(value, 0, 1) : 1;
+};
+
+const applyVolume = () => {
+  if (!mediaEl) return;
+  const volume = clamp(currentVolume, 0, 1);
+  mediaEl.volume = volume;
+  if (volume === 0) {
+    mediaEl.muted = true;
+  }
+  if (volumeSlider) {
+    volumeSlider.value = volume.toString();
+  }
+};
+
+let currentVolume = loadVolume();
+
+const loadAutostartAttempts = () => {
+  const stored = sessionStorage.getItem(autostartAttemptsKey);
+  const value = Number.parseInt(stored, 10);
+  return Number.isFinite(value) && value >= 0 ? value : 0;
+};
+
+const logAutostartStatus = (reason) => {
+  if (!debugEnabled) return;
+  const state = autostartEnabled ? "on" : "off";
+  const suffix = reason ? ` - ${reason}` : "";
+  debugLog(`autostart ${state} (${autostartAttempts}/${autostartMaxAttempts})${suffix}`);
+};
+
+const setAutostartAttempts = (value, reason) => {
+  autostartAttempts = Math.max(0, value);
+  sessionStorage.setItem(autostartAttemptsKey, autostartAttempts.toString());
+  updateAutostartUI();
+  logAutostartStatus(reason);
+};
+
+const recordAutostartAttempt = () => {
+  if (!autostartEnabled) return;
+  const next = autostartAttempts + 1;
+  setAutostartAttempts(next, "attempt");
+  if (next >= autostartMaxAttempts) {
+    autostartEnabled = false;
+    if (autostartToggle) autostartToggle.checked = false;
+    logAutostartStatus("disabled");
+  }
+  updateAutostartUI();
+};
+
+autostartAttempts = loadAutostartAttempts();
+if (autostartAttempts >= autostartMaxAttempts) {
+  autostartEnabled = false;
+  if (autostartToggle) autostartToggle.checked = false;
+}
+logAutostartStatus("init");
+
+const fetchAudioStatus = async () => {
+  if (!audioStatusUrl) return false;
+  try {
+    const response = await fetch(audioStatusUrl, { cache: "no-store" });
+    if (!response.ok) return false;
+    const data = await response.json();
+    const live = !!data?.live;
+    audioLive = live;
+    audioAvailable = live;
+    return live;
+  } catch (error) {
+    return false;
+  }
+};
+
+const updateAudioLive = async () => {
+  const live = await fetchAudioStatus();
+  if (audioOnlyEnabled) {
+    setStatus(live);
+    updateAudioControls();
+  }
 };
 
 window.addEventListener("error", (event) => {
@@ -73,9 +167,15 @@ window.addEventListener("unhandledrejection", (event) => {
 });
 
 const toDate = (entry) => {
-  const [year, month, day] = entry.date.split("-").map(Number);
-  const [hour, minute] = entry.time.split(":").map(Number);
-  return new Date(year, month - 1, day, hour, minute);
+  if (!entry?.date || !entry?.time) return null;
+  const [year, month, day] = String(entry.date).split("-").map(Number);
+  const [hour, minute] = String(entry.time).split(":").map(Number);
+  if (!year || !month || !day || Number.isNaN(hour) || Number.isNaN(minute)) {
+    return null;
+  }
+  const date = new Date(year, month - 1, day, hour, minute);
+  if (Number.isNaN(date.getTime())) return null;
+  return date;
 };
 
 const isSameDay = (a, b) => (
@@ -84,25 +184,30 @@ const isSameDay = (a, b) => (
   && a.getDate() === b.getDate()
 );
 
-const scheduleData = schedule
-  .map((entry) => {
-    const start = toDate(entry);
-    const duration = Number.isFinite(entry.durationMinutes) ? entry.durationMinutes : 90;
-    const end = new Date(start.getTime() + duration * 60000);
-    return { ...entry, start, end, durationMinutes: duration };
-  })
-  .sort((a, b) => a.start - b.start);
+const normalizeSchedule = (entries) => (
+  (Array.isArray(entries) ? entries : [])
+    .map((entry) => {
+      const start = toDate(entry);
+      if (!start) return null;
+      const duration = Number.isFinite(entry.durationMinutes) ? entry.durationMinutes : 90;
+      const end = new Date(start.getTime() + duration * 60000);
+      return { ...entry, start, end, durationMinutes: duration };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.start - b.start)
+);
 
 const renderSchedule = () => {
   if (!scheduleEl) return;
   scheduleEl.innerHTML = "";
-  if (!scheduleData.length) {
+  const now = new Date();
+  const visibleEntries = scheduleData.filter((entry) => entry.end >= now);
+  if (!visibleEntries.length) {
     if (scheduleEmptyEl) scheduleEmptyEl.hidden = false;
     return;
   }
   if (scheduleEmptyEl) scheduleEmptyEl.hidden = true;
-  const now = new Date();
-  scheduleData.forEach((entry) => {
+  visibleEntries.forEach((entry) => {
     const item = document.createElement("div");
     item.className = "schedule-item";
     if (isSameDay(now, entry.start)) item.classList.add("is-today");
@@ -177,38 +282,80 @@ const refreshScheduleUI = () => {
   updateOfflineMessage();
 };
 
+const loadSchedule = async () => {
+  if (!scheduleUrl) {
+    scheduleData = [];
+    refreshScheduleUI();
+    return;
+  }
+  try {
+    const response = await fetch(scheduleUrl, { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`schedule fetch failed: ${response.status}`);
+    }
+    const data = await response.json();
+    const entries = Array.isArray(data) ? data : (data?.items || data?.schedule || []);
+    scheduleData = normalizeSchedule(entries);
+  } catch (error) {
+    console.log("Schedule fetch failed:", error);
+    scheduleData = [];
+  } finally {
+    refreshScheduleUI();
+  }
+};
+
 const updatePlayerClass = () => {
   if (!playerEl) return;
+  const audioReady = audioLive && audioAvailable;
+  const liveState = audioOnlyEnabled ? audioReady : isLive;
   playerEl.className = "player";
-  if (!isLive) playerEl.classList.add("offline-mode");
+  if (!liveState) playerEl.classList.add("offline-mode");
   if (audioOnlyEnabled) playerEl.classList.add("audio-only");
+  if (offlineEl) {
+    offlineEl.className = liveState ? "offline hidden" : "offline";
+  }
 };
 
 const updateAutostartUI = () => {
   if (!autostartLabel) return;
   if (audioOnlyEnabled) {
-    autostartLabel.classList.add("is-hidden");
+    autostartLabel.classList.add("hidden");
   } else {
-    autostartLabel.classList.remove("is-hidden");
+    autostartLabel.classList.remove("hidden");
+  }
+  if (autostartTextEl) {
+    if (!autostartEnabled && autostartAttempts >= autostartMaxAttempts) {
+      autostartTextEl.textContent = `Autostart aus (${autostartAttempts}/${autostartMaxAttempts})`;
+    } else {
+      autostartTextEl.textContent = "Autostart";
+    }
   }
 };
 
 const setActiveMedia = () => {
-  const wantsAudioOnly = audioOnlyToggle?.checked ?? audioOnlyEnabled;
-  if (wantsAudioOnly && !audioHlsUrl) {
+  const wantsAudioOnly = audioOnlyForced || (audioOnlyToggle?.checked ?? audioOnlyEnabled);
+  if (wantsAudioOnly && audioOnlyToggle && audioOnlyForced) {
+    audioOnlyToggle.checked = true;
+  }
+  if (wantsAudioOnly && !audioHlsUrl && !audioOnlyForced) {
     audioOnlyEnabled = false;
     if (audioOnlyToggle) audioOnlyToggle.checked = false;
     sessionStorage.removeItem(audioOnlyStorageKey);
   } else {
     audioOnlyEnabled = wantsAudioOnly;
-    if (audioOnlyToggle) {
+    if (audioOnlyToggle && !audioOnlyForced) {
       sessionStorage.setItem(audioOnlyStorageKey, audioOnlyEnabled ? "1" : "0");
     }
   }
   mediaEl = audioOnlyEnabled ? audio : video;
-  activeHlsUrl = audioOnlyEnabled && audioHlsUrl ? audioHlsUrl : hlsUrl;
+  if (audioOnlyEnabled) {
+    activeHlsUrl = audioHlsUrl || "";
+  } else {
+    activeHlsUrl = hlsUrl;
+  }
   updatePlayerClass();
   updateAutostartUI();
+  applyVolume();
 };
 
 const statsColors = () => {
@@ -288,7 +435,7 @@ const drawStats = (points) => {
 
   ctx.fillStyle = text;
   ctx.font = "11px \"Space Grotesk\", sans-serif";
-  ctx.fillText(`${last.count} Zuschauer`, padding, padding + 2);
+  ctx.fillText(`${last.count} Online`, padding, padding + 2);
 };
 
 const fetchStats = async () => {
@@ -350,13 +497,19 @@ if (url.searchParams.has("reload")) {
   history.replaceState(null, "", url.toString());
 }
 if (audioOnlyToggle) {
-  const storedAudioOnly = sessionStorage.getItem(audioOnlyStorageKey);
-  if (storedAudioOnly === "1") {
+  if (audioOnlyForced) {
     audioOnlyToggle.checked = true;
-  } else if (storedAudioOnly === "0") {
-    audioOnlyToggle.checked = false;
+    audioOnlyToggle.disabled = true;
+    audioOnlyEnabled = true;
+  } else {
+    const storedAudioOnly = sessionStorage.getItem(audioOnlyStorageKey);
+    if (storedAudioOnly === "1") {
+      audioOnlyToggle.checked = true;
+    } else if (storedAudioOnly === "0") {
+      audioOnlyToggle.checked = false;
+    }
+    audioOnlyEnabled = audioOnlyToggle.checked;
   }
-  audioOnlyEnabled = audioOnlyToggle.checked;
 }
 setActiveMedia();
 setInterval(() => {
@@ -365,13 +518,32 @@ setInterval(() => {
     forceReload();
   }
 }, 10000);
-refreshScheduleUI();
+loadSchedule();
 setInterval(refreshScheduleUI, 60000);
-initStats();
+if (audioOnlyEnabled) {
+  updateAudioLive();
+}
+setInterval(() => {
+  if (audioOnlyEnabled) {
+    updateAudioLive();
+  }
+}, 5000);
+if (debugEnabled) {
+  if (statsSection) statsSection.classList.remove("hidden");
+  initStats();
+} else if (statsSection) {
+  statsSection.classList.add("hidden");
+}
 
 if (autostartToggle) {
   autostartToggle.addEventListener("change", () => {
     autostartEnabled = autostartToggle.checked;
+    if (autostartEnabled) {
+      setAutostartAttempts(0, "user-enable");
+    } else {
+      logAutostartStatus("user-disable");
+    }
+    updateAutostartUI();
   });
 }
 
@@ -427,7 +599,7 @@ const updateUnmute = () => {
     updateAudioControls();
     return;
   }
-  const isPlaying = !mediaEl.paused && !mediaEl.ended;
+  const isPlaying = started && playbackActive;
   const show = isLive && isPlaying && mediaEl.muted;
   unmuteEl.className = show ? "unmute" : "unmute hidden";
   updateAudioControls();
@@ -448,7 +620,12 @@ const attemptPlay = (element) => {
 
 const updateAudioControls = () => {
   if (!audioControlsEl) return;
-  if (!audioOnlyEnabled || !isLive || !mediaEl) {
+  if (!audioOnlyEnabled || !mediaEl) {
+    audioControlsEl.className = "audio-controls hidden";
+    return;
+  }
+  const audioReady = audioLive && audioAvailable;
+  if (!audioReady) {
     audioControlsEl.className = "audio-controls hidden";
     return;
   }
@@ -457,6 +634,12 @@ const updateAudioControls = () => {
   audioControlsEl.className = isAudible ? "audio-controls playing" : "audio-controls idle";
   if (audioLabelEl) {
     audioLabelEl.textContent = isAudible ? "Audio pausieren" : "Audio starten";
+  }
+  if (audioToggleBtn) {
+    audioToggleBtn.setAttribute("aria-label", isAudible ? "Audio pausieren" : "Audio starten");
+  }
+  if (volumeSlider) {
+    volumeSlider.value = clamp(currentVolume, 0, 1).toString();
   }
   if (audioTogglePath) {
     audioTogglePath.setAttribute(
@@ -471,9 +654,6 @@ const setStatus = (live) => {
   isLive = live;
   statusEl.textContent = live ? "Online" : "Offline";
   statusEl.className = live ? "status status-online" : "status status-offline";
-  if (offlineEl) {
-    offlineEl.className = live ? "offline hidden" : "offline";
-  }
   updatePlayerClass();
   updateAutostartUI();
   updateOfflineMessage();
@@ -492,9 +672,21 @@ if (unmuteBtn) {
 }
 
 if (audioToggleBtn) {
-  audioToggleBtn.addEventListener("click", () => {
+  audioToggleBtn.addEventListener("click", async () => {
     if (!audioOnlyEnabled || !mediaEl) return;
-    if (!isLive) return;
+    if (!audioHlsUrl) {
+      audioAvailable = false;
+      debugLog("audio stream not configured");
+      updateAudioControls();
+      return;
+    }
+    const ready = await fetchAudioStatus();
+    audioAvailable = ready;
+    if (!ready) {
+      debugLog("audio stream offline");
+      updateAudioControls();
+      return;
+    }
     const hasSource = !!(mediaEl.currentSrc || mediaEl.src);
     if (!started || !hasSource) {
       setActiveMedia();
@@ -514,23 +706,74 @@ if (audioToggleBtn) {
   });
 }
 
+if (volumeSlider) {
+  volumeSlider.value = clamp(currentVolume, 0, 1).toString();
+  volumeSlider.addEventListener("input", () => {
+    const next = Number.parseFloat(volumeSlider.value);
+    if (!Number.isFinite(next)) return;
+    currentVolume = clamp(next, 0, 1);
+    localStorage.setItem(volumeStorageKey, currentVolume.toString());
+    if (mediaEl) {
+      mediaEl.volume = currentVolume;
+      mediaEl.muted = currentVolume === 0;
+    }
+    updateAudioControls();
+    updateUnmute();
+  });
+}
+
 [video, audio].forEach((element) => {
   if (!element) return;
   element.addEventListener("volumechange", updateUnmute);
   element.addEventListener("play", updateUnmute);
-  element.addEventListener("playing", updateUnmute);
-  element.addEventListener("pause", updateAudioControls);
+  element.addEventListener("playing", (event) => {
+    if (event.currentTarget !== mediaEl) return;
+    playbackActive = true;
+    if (autostartAttempts > 0) {
+      setAutostartAttempts(0, "reset");
+    }
+    updateUnmute();
+  });
+  element.addEventListener("pause", (event) => {
+    if (event.currentTarget === mediaEl) {
+      playbackActive = false;
+      updateUnmute();
+    }
+    updateAudioControls();
+  });
+  element.addEventListener("ended", (event) => {
+    if (event.currentTarget !== mediaEl) return;
+    playbackActive = false;
+    updateUnmute();
+  });
   element.addEventListener("error", (event) => {
     const err = event?.currentTarget?.error;
     const code = err?.code ?? "unknown";
     debugLog(`media error: code=${code}`);
     if (code === 4 && audioOnlyEnabled && started) {
+      audioAvailable = false;
       stopPlayer();
       updateAudioControls();
     }
+    if (event.currentTarget === mediaEl) {
+      playbackActive = false;
+      updateUnmute();
+    }
   });
-  element.addEventListener("stalled", () => debugLog("media stalled"));
-  element.addEventListener("waiting", () => debugLog("media waiting"));
+  element.addEventListener("stalled", (event) => {
+    debugLog("media stalled");
+    if (event.currentTarget === mediaEl) {
+      playbackActive = false;
+      updateUnmute();
+    }
+  });
+  element.addEventListener("waiting", (event) => {
+    debugLog("media waiting");
+    if (event.currentTarget === mediaEl) {
+      playbackActive = false;
+      updateUnmute();
+    }
+  });
   element.addEventListener("loadedmetadata", () => debugLog("media loadedmetadata"));
   element.addEventListener("canplay", () => debugLog("media canplay"));
 });
@@ -548,6 +791,7 @@ const stopPlayer = () => {
     hls = null;
   }
   started = false;
+  playbackActive = false;
   resetMediaElement(video);
   resetMediaElement(audio);
 };
@@ -559,6 +803,11 @@ const startPlayer = () => {
 const startPlayerWithOptions = ({ forcePlay }) => {
   if (started) return;
   setActiveMedia();
+  if (!activeHlsUrl) {
+    debugLog("no media source available");
+    updateAudioControls();
+    return;
+  }
   started = true;
   setStatus(true);
 
@@ -622,13 +871,17 @@ const startPlayerWithOptions = ({ forcePlay }) => {
 };
 
 const handleStatus = (live) => {
+  if (audioOnlyEnabled) {
+    updateAudioLive();
+    return;
+  }
   if (live) {
     setStatus(true);
-    if (audioOnlyEnabled) {
-      updateAudioControls();
-      return;
-    }
     if (!started) {
+      if (autostartEnabled) {
+        recordAutostartAttempt();
+        if (!autostartEnabled) return;
+      }
       setActiveMedia();
       if (allowAutoplay && mediaEl) {
         mediaEl.muted = true;
@@ -651,7 +904,7 @@ socket.on("status", (data) => {
 socket.on("clients", (data) => {
   if (!clientsEl) return;
   const count = Number.isFinite(data?.count) ? data.count : 0;
-  clientsEl.textContent = `Aktuelle Zuschauer: ${count}`;
+  clientsEl.textContent = `Aktuell online: ${count}`;
 });
 socket.on("disconnect", () => {
   setStatus(false);
