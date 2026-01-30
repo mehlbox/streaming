@@ -1,0 +1,55 @@
+# Bethaus Speyer Live Stream
+
+Simple Flask + Socket.IO frontend for a live HLS stream with viewer count, schedule, and a 1‑hour stats graph.
+
+## Quick start
+
+```bash
+# cd /docker/streaming
+# docker compose up -d
+```
+
+## OBS Studio setup
+
+### 1) Set OBS “Stream” settings
+
+In OBS Studio:
+
+1. **Settings → Stream**
+2. **Service**: `Custom...`
+3. **Server**: your RTMP ingest URL (example below)
+4. **Stream Key**: your stream name (example below)
+
+**Example**
+
+Settings in OBS:
+
+- **Server**: `rtmp://streaming.bethaus-speyer.de/live?key=YOUR_SECRET`
+- **Stream Key**: `live`
+
+### 3) Start streaming
+
+Click **Start Streaming** in OBS. The page will show **Online** once HLS segments are produced.
+
+## Environment variables
+
+- `STREAM_NAME` (default: `live`)
+- `STREAM_KEY` (default: empty; if set, must match the `key` in OBS)
+- `HLS_DIR` (default: `/var/www/hls`)
+- `HLS_STALE_SECONDS` (default: `15`)
+- `SOCKETIO_POLL_SECONDS` (default: `2`)
+- `STATS_DB` (default: `/docker/streaming/flask/stats.db`)
+- `STATS_SAMPLE_SECONDS` (default: `60`)
+- `AUDIO_STREAM_NAME` (optional: name of an audio-only stream; enables the "Nur Audio" toggle)
+- `AUDIO_HLS_URL` (optional: full URL to an audio-only HLS playlist; overrides `AUDIO_STREAM_NAME`)
+
+## Audio-only stream (low CPU, server-generated)
+
+The docker compose setup includes an `audio` ffmpeg container that reads the original RTMP stream and writes an audio-only HLS playlist at `/hls/audio.m3u8` using `-c:a copy` (very low CPU when the source audio is AAC). The UI toggle is enabled by `AUDIO_STREAM_NAME=audio`.
+
+If the source audio codec is not HLS-friendly, change the ffmpeg command to transcode, e.g. `-c:a aac -b:a 128k` (higher CPU).
+
+## Notes
+
+- The schedule and offline messages are configured in `flask/static/js/app.js`.
+- The stats graph reads `/stats?minutes=60` and draws a small canvas chart.

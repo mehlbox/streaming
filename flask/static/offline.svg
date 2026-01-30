@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0b0b"/>
+      <stop offset="100%" stop-color="#202020"/>
+    </linearGradient>
+  </defs>
+  <rect width="1600" height="900" fill="url(#bg)"/>
+  <g fill="#ffffff" opacity="0.08">
+    <circle cx="120" cy="140" r="80"/>
+    <circle cx="1480" cy="180" r="120"/>
+    <circle cx="1380" cy="760" r="140"/>
+  </g>
+  <g fill="none" stroke="#ffffff" opacity="0.12">
+    <rect x="200" y="200" width="1200" height="500" rx="24"/>
+  </g>
+  <g font-family="system-ui, sans-serif" text-anchor="middle">
+    <text x="800" y="465" font-size="56" fill="#f2f2f2">Stream Offline</text>
+    <text x="800" y="520" font-size="24" fill="#bdbdbd">aktuell findet keine Übertragung statt</text>
+  </g>
+</svg>

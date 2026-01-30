@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Live Stream - Bethaus Speyer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@400;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}" />
+  <link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}" type="image/svg+xml" />
+</head>
+<body data-hls-url="{{ hls_url }}"{% if audio_hls_url %} data-audio-hls-url="{{ audio_hls_url }}"{% endif %}>
+  <div class="page">
+    <header class="top">
+      <div class="brand">
+        <img src="https://cdh-stephanus.org/wp-content/uploads/2020/05/Logo-nebeneinander.png" alt="CDH Stephanus Logo" />
+        <div class="brand-meta">
+          <div class="kicker">Live Stream</div>
+          <h1>Missionskonferenz 2026</h1>
+          <p class="sub">Live aus Speyer.</p>
+        </div>
+      </div>
+    </header>
+
+    <section class="stage">
+      <div class="player-card">
+        <div class="player" id="player">
+          <video id="video" controls autoplay muted playsinline></video>
+          {% if audio_hls_url %}
+          <audio id="audio" playsinline preload="none"></audio>
+          {% endif %}
+          {% if audio_hls_url %}
+          <div id="audio-controls" class="audio-controls hidden" aria-live="polite">
+            <button type="button" id="audio-toggle" aria-label="Audio pausieren">
+              <svg viewBox="0 0 24 24" aria-hidden="true" class="audio-toggle-icon">
+                <path d="M6 5h4v14H6zm8 0h4v14h-4z"/>
+              </svg>
+              <span class="audio-label">Audio pausieren</span>
+              <div class="audio-eq" aria-hidden="true">
+                <span></span>
+                <span></span>
+                <span></span>
+                <span></span>
+              </div>
+            </button>
+          </div>
+          {% endif %}
+          <div id="offline" class="offline">
+            <img src="/static/offline.svg" alt="Stream offline" />
+            <div class="offline-content">
+              <p id="offline-title" class="offline-title">Stream offline</p>
+              <p id="offline-sub" class="offline-sub">Wir sind gleich wieder live. Bitte einen Moment Geduld.</p>
+            </div>
+          </div>
+          <div id="unmute" class="unmute hidden">
+            <button type="button" aria-label="Unmute">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 9v6h4l5 4V5L8 9H4zm11.5 3a4.5 4.5 0 0 0-2.25-3.9v7.8A4.5 4.5 0 0 0 15.5 12zm0-7a9.5 9.5 0 0 1 0 14v-2a7.5 7.5 0 0 0 0-10V5z"/>
+              </svg>
+              <span>Ton aktivieren</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="meta">
+          <div class="badges">
+            <div id="status" class="status status-offline">Offline</div>
+            <div id="clients" class="clients">Aktuelle Zuschauer: 0</div>
+            <button class="ghost small" id="reload" type="button">Neu laden</button>
+          </div>
+          <div class="controls">
+            <label class="toggle" id="autostart-label" for="autostart">
+              <input type="checkbox" id="autostart" checked />
+              <span class="switch" aria-hidden="true"></span>
+              <span>Autostart</span>
+            </label>
+            {% if audio_hls_url %}
+            <label class="toggle" for="audio-only">
+              <input type="checkbox" id="audio-only" />
+              <span class="switch" aria-hidden="true"></span>
+              <span>Nur Audio</span>
+            </label>
+            {% endif %}
+          </div>
+        </div>
+        <div id="debug-panel" class="debug-panel hidden" aria-live="polite"></div>
+      </div>
+
+      <aside class="info">
+        <div class="info-card">
+          <h2>So funktioniert's</h2>
+          <ul>
+            <li>Die Übertragung startet automatisch, sobald wir online gehen.</li>
+            <li>Ton muss von dir aktiviert werden, sobald der Stream läuft.</li>
+            <li>Am besten im WLAN für stabile Qualität.</li>
+            <li>Bei Problemen hilft ein kurzes Neu laden.</li>
+          </ul>
+        </div>
+        <div class="info-card schedule-card">
+          <div class="schedule-head">
+            <h3>Streaming-Kalender</h3>
+            <span class="tz">Zeitzone: Lokalzeit</span>
+          </div>
+          <div id="schedule" class="schedule"></div>
+          <p id="schedule-empty" class="schedule-empty" hidden>Derzeit keine Termine veröffentlicht.</p>
+          <p class="schedule-note">Änderungen vorbehalten.</p>
+        </div>
+      </aside>
+    </section>
+
+    <section class="stats">
+      <div class="info-card stats-card">
+        <div class="stats-head">
+          <h3>Zuschauer-Verlauf</h3>
+          <span class="stats-range">Letzte 60 Minuten</span>
+        </div>
+        <div class="stats-body">
+          <canvas id="stats-canvas" width="600" height="120" aria-label="Zuschauerstatistik" role="img"></canvas>
+          <p id="stats-empty" class="stats-empty" hidden>Noch keine Daten verfügbar.</p>
+        </div>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <a href="https://cdh-stephanus.org/" target="_blank" rel="noopener noreferrer">CDH Stephanus</a> &middot; Speyer
+    </footer>
+  </div>
+
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js"></script>
+  <script src="{{ url_for('static', filename='js/app.js') }}" defer></script>
+</body>
+</html>
