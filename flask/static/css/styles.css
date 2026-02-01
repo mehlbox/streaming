@@ -375,17 +375,20 @@ audio {
   pointer-events: none;
   z-index: 1;
 }
-.audio-orbit::before {
-  content: "";
-  position: absolute;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.9);
-  box-shadow: 0 0 10px rgba(255, 255, 255, 0.6);
-  top: -3px;
-  left: 50%;
-  transform: translateX(-50%);
+.audio-orbit {
+  --audio-orbit-dash: 12deg;
+  --audio-orbit-gap: 12deg;
+}
+@supports (background: conic-gradient(#fff 0 10deg, transparent 10deg 20deg)) {
+  .audio-orbit {
+    border: none;
+    background: repeating-conic-gradient(
+      rgba(255, 255, 255, 0.28) 0 var(--audio-orbit-dash),
+      transparent var(--audio-orbit-dash) calc(var(--audio-orbit-dash) + var(--audio-orbit-gap))
+    );
+    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 3px));
+    mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 3px));
+  }
 }
 .audio-controls button:focus-visible {
   outline: 2px solid rgba(255, 255, 255, 0.75);
@@ -497,14 +500,9 @@ audio {
 .audio-controls.playing .audio-eq {
   transform: scaleY(1.75);
 }
-.audio-controls.playing #audio-toggle {
-  animation: slow-rotate 18s linear infinite;
-}
-.audio-controls.playing #audio-toggle .audio-toggle-content {
-  animation: counter-rotate 18s linear infinite;
-}
 .audio-controls.playing #audio-toggle .audio-orbit {
   opacity: 0.9;
+  animation: slow-rotate 18s linear infinite;
 }
 .audio-controls.idle .audio-eq {
   transform: scaleY(0.35);
@@ -868,8 +866,7 @@ audio {
   .audio-eq span {
     animation: none;
   }
-  .audio-controls.playing #audio-toggle,
-  .audio-controls.playing #audio-toggle .audio-toggle-content {
+  .audio-controls.playing #audio-toggle .audio-orbit {
     animation: none;
   }
 }
