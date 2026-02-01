@@ -121,7 +121,7 @@ def is_private_addr(addr: str) -> bool:
 
 @app.get("/status")
 def status():
-    return jsonify({"live": is_live()})
+    return jsonify({"live": is_live(), "audio_live": is_audio_live()})
 
 @app.get("/audio-status")
 def audio_status():
@@ -205,7 +205,7 @@ def auth():
 def on_connect():
     global client_count
     ensure_stats_task()
-    emit("status", {"live": is_live()})
+    emit("status", {"live": is_live(), "audio_live": is_audio_live()})
     with client_lock:
         client_count += 1
         count = client_count
@@ -244,12 +244,15 @@ def stats():
 
 
 def status_watcher():
-    last = None
+    last_live = None
+    last_audio = None
     while True:
         live = is_live()
-        if live != last:
-            socketio.emit("status", {"live": live})
-            last = live
+        audio_live = is_audio_live()
+        if live != last_live or audio_live != last_audio:
+            socketio.emit("status", {"live": live, "audio_live": audio_live})
+            last_live = live
+            last_audio = audio_live
         socketio.sleep(SOCKETIO_POLL_SECONDS)
 
 

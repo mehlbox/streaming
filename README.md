@@ -42,12 +42,13 @@ Click **Start Streaming** in OBS. The page will show **Online** once HLS segment
 - `STATS_SAMPLE_SECONDS` (default: `60`)
 - `AUDIO_STREAM_NAME` (optional: name of an audio-only stream; enables the "Nur Audio" toggle)
 - `AUDIO_HLS_URL` (optional: full URL to an audio-only HLS playlist; overrides `AUDIO_STREAM_NAME`)
+- `AUDIO_INPUT_URL` (optional: input URL for audio-only ffmpeg; defaults to the live HLS playlist)
 
-## Audio-only stream (low CPU, server-generated)
+## Audio-only stream (server-generated)
 
-The docker compose setup includes an `audio` ffmpeg container that reads the original RTMP stream and writes an audio-only HLS playlist at `/hls/audio.m3u8` using `-c:a copy` (very low CPU when the source audio is AAC). The UI toggle is enabled by `AUDIO_STREAM_NAME=audio`.
+The docker compose setup includes an `audio` ffmpeg container that reads the live HLS playlist by default (or `AUDIO_INPUT_URL` if set) and writes an audio-only HLS playlist at `/hls/audio.m3u8` using AAC. The UI toggle is enabled by `AUDIO_STREAM_NAME=audio`.
 
-If the source audio codec is not HLS-friendly, change the ffmpeg command to transcode, e.g. `-c:a aac -b:a 128k` (higher CPU).
+If you prefer RTMP input or need a different source, set `AUDIO_INPUT_URL` to your desired URL.
 
 ## Notes
 

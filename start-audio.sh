@@ -42,17 +42,30 @@ while true; do
   OUT="/var/www/hls/${AUDIO_STREAM_NAME}.m3u8"
   SEG="/var/www/hls/${AUDIO_STREAM_NAME}_%03d.m4s"
 
-  if [ -n "${STREAM_KEY:-}" ]; then
-    INPUT="rtmp://nginx/stream/${STREAM_NAME:-live}?key=${STREAM_KEY}"
+  if [ -n "${AUDIO_INPUT_URL:-}" ]; then
+    INPUT="${AUDIO_INPUT_URL}"
   else
-    INPUT="rtmp://nginx/stream/${STREAM_NAME:-live}"
+    INPUT="http://nginx/hls/${STREAM_NAME:-live}.m3u8"
   fi
 
-  ffmpeg -hide_banner -loglevel error -nostdin -fflags +genpts -use_wallclock_as_timestamps 1 -rw_timeout 5000000 \
-    -i "${INPUT}" -vn -c:a aac -b:a 160k -ar 48000 -ac 2 -af aresample=async=1 \
+  set -- -hide_banner -loglevel error -nostdin -fflags +genpts -rw_timeout 5000000
+  case "${INPUT}" in
+    rtmp://*|rtmps://*)
+      set -- "$@" -use_wallclock_as_timestamps 1
+      ;;
+    http://*|https://*)
+      set -- "$@" -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5
+      ;;
+  esac
+  set -- "$@" -i "${INPUT}" -vn -c:a aac -b:a 160k -ar 48000 -ac 2 \
     -f hls -hls_time 4 -hls_list_size 6 -hls_flags delete_segments+independent_segments \
     -hls_segment_type fmp4 -hls_fmp4_init_filename audio_init.mp4 \
     -hls_segment_filename "${SEG}" "${OUT}"
+
+  if ! ffmpeg "$@"; then
+    sleep 2
+    continue
+  fi
 
   sleep 2
 done

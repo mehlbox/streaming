@@ -59,8 +59,8 @@ const volumeStorageKey = "audioVolume";
 let allowAutoplay = true;
 const debugEnabled = document.body?.dataset?.debug === "1";
 let scheduleData = [];
-let audioAvailable = true;
-let audioLive = false;
+let audioAvailable = false;
+let audioLive = null;
 let playbackActive = false;
 let autostartAttempts = 0;
 
@@ -268,14 +268,6 @@ const fetchAudioStatus = async () => {
     return live;
   } catch (error) {
     return false;
-  }
-};
-
-const updateAudioLive = async () => {
-  const live = await fetchAudioStatus();
-  if (audioOnlyEnabled) {
-    setStatus(live);
-    updateAudioControls();
   }
 };
 
@@ -643,14 +635,6 @@ setInterval(() => {
 }, 10000);
 loadSchedule();
 setInterval(refreshScheduleUI, 60000);
-if (audioOnlyEnabled) {
-  updateAudioLive();
-}
-setInterval(() => {
-  if (audioOnlyEnabled) {
-    updateAudioLive();
-  }
-}, 5000);
 if (debugEnabled) {
   if (statsSection) statsSection.classList.remove("hidden");
   initStats();
@@ -807,7 +791,10 @@ if (audioToggleBtn) {
       updateAudioControls();
       return;
     }
-    const ready = await fetchAudioStatus();
+    let ready = audioLive;
+    if (ready === null || socket?.connected === false) {
+      ready = await fetchAudioStatus();
+    }
     audioAvailable = ready;
     if (!ready) {
       debugLog("audio stream offline");
@@ -998,9 +985,14 @@ const startPlayerWithOptions = ({ forcePlay }) => {
   console.log("HLS not supported in this browser.");
 };
 
-const handleStatus = (live) => {
+const handleStatus = (live, audioLiveStatus) => {
+  if (typeof audioLiveStatus === "boolean") {
+    audioLive = audioLiveStatus;
+    audioAvailable = audioLiveStatus;
+  }
   if (audioOnlyEnabled) {
-    updateAudioLive();
+    setStatus(!!audioLive);
+    updateAudioControls();
     return;
   }
   if (live) {
@@ -1027,7 +1019,7 @@ const handleStatus = (live) => {
 
 const socket = io({ transports: ["websocket"] });
 socket.on("status", (data) => {
-  handleStatus(!!data?.live);
+  handleStatus(!!data?.live, data?.audio_live);
 });
 socket.on("clients", (data) => {
   if (!clientsEl) return;
@@ -1035,6 +1027,8 @@ socket.on("clients", (data) => {
   clientsEl.textContent = `Aktuell online: ${count}`;
 });
 socket.on("disconnect", () => {
+  audioLive = false;
+  audioAvailable = false;
   setStatus(false);
   if (started) {
     stopPlayer();
