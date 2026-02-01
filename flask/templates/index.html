@@ -35,10 +35,13 @@
           {% if audio_hls_url or audio_only %}
           <div id="audio-controls" class="audio-controls hidden" aria-live="polite">
             <button type="button" id="audio-toggle" aria-label="Audio pausieren">
-              <svg viewBox="0 0 24 24" aria-hidden="true" class="audio-toggle-icon">
-                <path d="M6 5h4v14H6zm8 0h4v14h-4z"/>
-              </svg>
-              <span class="audio-label">Audio pausieren</span>
+              <span class="audio-orbit audio-orbit--outer" aria-hidden="true"></span>
+              <span class="audio-toggle-content">
+                <svg viewBox="0 0 24 24" aria-hidden="true" class="audio-toggle-icon">
+                  <path d="M6 5h4v14H6zm8 0h4v14h-4z"/>
+                </svg>
+                <span class="audio-label">Audio pausieren</span>
+              </span>
             </button>
             <div class="audio-eq" aria-hidden="true">
               <span></span> <!-- 01 -->

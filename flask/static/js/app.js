@@ -74,6 +74,129 @@ const debugLog = (message) => {
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
+const audioEq = document.querySelector(".audio-eq");
+const audioEqBars = audioEq ? Array.from(audioEq.querySelectorAll("span")) : [];
+const audioVizConfig = {
+  fps: 20,
+  fftSize: 256,
+  smoothing: 0.8,
+  minDecibels: -90,
+  maxDecibels: -15,
+  minScale: 0.18,
+  maxScale: 1,
+  maxBin: 64
+};
+let audioContext = null;
+let audioAnalyser = null;
+let audioAnalyserData = null;
+let audioSourceNode = null;
+let audioVizActive = false;
+let audioVizRaf = null;
+let audioVizLast = 0;
+let audioVizDisabled = false;
+
+const getAudioContext = () => {
+  if (audioContext) return audioContext;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return null;
+  audioContext = new Ctx();
+  return audioContext;
+};
+
+const initAudioVisualizer = () => {
+  if (audioVizDisabled || !audioEqBars.length || !audio) return false;
+  const ctx = getAudioContext();
+  if (!ctx) {
+    audioVizDisabled = true;
+    return false;
+  }
+  if (!audioSourceNode) {
+    try {
+      audioSourceNode = ctx.createMediaElementSource(audio);
+    } catch (error) {
+      audioVizDisabled = true;
+      debugLog(`audio viz disabled: ${error?.message || error}`);
+      return false;
+    }
+  }
+  if (!audioAnalyser) {
+    audioAnalyser = ctx.createAnalyser();
+    audioAnalyser.fftSize = audioVizConfig.fftSize;
+    audioAnalyser.smoothingTimeConstant = audioVizConfig.smoothing;
+    audioAnalyser.minDecibels = audioVizConfig.minDecibels;
+    audioAnalyser.maxDecibels = audioVizConfig.maxDecibels;
+    audioAnalyserData = new Uint8Array(audioAnalyser.frequencyBinCount);
+    audioSourceNode.connect(audioAnalyser);
+    audioAnalyser.connect(ctx.destination);
+  }
+  return true;
+};
+
+const renderAudioVisualizer = () => {
+  if (!audioVizActive || !audioAnalyser || !audioAnalyserData) return;
+  const now = performance.now();
+  if (now - audioVizLast < 1000 / audioVizConfig.fps) {
+    audioVizRaf = requestAnimationFrame(renderAudioVisualizer);
+    return;
+  }
+  audioVizLast = now;
+  audioAnalyser.getByteFrequencyData(audioAnalyserData);
+  const barCount = audioEqBars.length;
+  const maxBin = Math.min(audioVizConfig.maxBin, audioAnalyserData.length);
+  const step = Math.max(1, Math.floor(maxBin / barCount));
+  for (let i = 0; i < barCount; i += 1) {
+    const start = i * step;
+    const end = Math.min(maxBin, start + step);
+    let sum = 0;
+    for (let j = start; j < end; j += 1) {
+      sum += audioAnalyserData[j];
+    }
+    const avg = sum / Math.max(1, end - start);
+    const normalized = avg / 255;
+    const scale = audioVizConfig.minScale
+      + normalized * (audioVizConfig.maxScale - audioVizConfig.minScale);
+    audioEqBars[i].style.setProperty("--eq-scale", scale.toFixed(3));
+  }
+  audioVizRaf = requestAnimationFrame(renderAudioVisualizer);
+};
+
+const startAudioVisualizer = () => {
+  if (audioVizActive) return;
+  if (!initAudioVisualizer()) return;
+  if (audioContext && audioContext.state === "suspended") {
+    audioContext.resume().catch(() => {});
+  }
+  if (audioEq) audioEq.classList.add("live");
+  audioVizActive = true;
+  audioVizLast = 0;
+  renderAudioVisualizer();
+};
+
+const stopAudioVisualizer = () => {
+  if (!audioVizActive) return;
+  audioVizActive = false;
+  if (audioVizRaf) cancelAnimationFrame(audioVizRaf);
+  audioVizRaf = null;
+  if (audioEq) audioEq.classList.remove("live");
+  audioEqBars.forEach((bar) => bar.style.removeProperty("--eq-scale"));
+};
+
+const shouldRunAudioVisualizer = () => {
+  if (!audioOnlyEnabled || !audio || !audioEqBars.length) return false;
+  if (document.hidden) return false;
+  if (audio.paused || audio.ended) return false;
+  if (audio.muted || audio.volume === 0) return false;
+  return true;
+};
+
+const syncAudioVisualizer = () => {
+  if (shouldRunAudioVisualizer()) {
+    startAudioVisualizer();
+  } else {
+    stopAudioVisualizer();
+  }
+};
+
 const loadVolume = () => {
   const stored = localStorage.getItem(volumeStorageKey);
   const value = Number.parseFloat(stored);
@@ -534,6 +657,7 @@ if (debugEnabled) {
 } else if (statsSection) {
   statsSection.classList.add("hidden");
 }
+document.addEventListener("visibilitychange", syncAudioVisualizer);
 
 if (autostartToggle) {
   autostartToggle.addEventListener("change", () => {
@@ -622,11 +746,13 @@ const updateAudioControls = () => {
   if (!audioControlsEl) return;
   if (!audioOnlyEnabled || !mediaEl) {
     audioControlsEl.className = "audio-controls hidden";
+    stopAudioVisualizer();
     return;
   }
   const audioReady = audioLive && audioAvailable;
   if (!audioReady) {
     audioControlsEl.className = "audio-controls hidden";
+    stopAudioVisualizer();
     return;
   }
   const isPlaying = !mediaEl.paused && !mediaEl.ended;
@@ -647,6 +773,7 @@ const updateAudioControls = () => {
       isAudible ? "M6 5h4v14H6zm8 0h4v14h-4z" : "M8 5v14l11-7z"
     );
   }
+  syncAudioVisualizer();
 };
 
 const setStatus = (live) => {
@@ -792,6 +919,7 @@ const stopPlayer = () => {
   }
   started = false;
   playbackActive = false;
+  stopAudioVisualizer();
   resetMediaElement(video);
   resetMediaElement(audio);
 };
