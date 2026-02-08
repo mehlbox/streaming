@@ -2,14 +2,19 @@ import os
 import ipaddress
 import sqlite3
 import time
+import secrets
 from threading import Lock
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from flask import Flask, abort, jsonify, render_template, request, url_for
+from flask import Flask, abort, jsonify, render_template, request, session, url_for
 from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
+SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
+if not SECRET_KEY:
+    SECRET_KEY = secrets.token_hex(32)
+app.config["SECRET_KEY"] = SECRET_KEY
 
 def get_env_default(key: str, default: str) -> str:
     value = os.getenv(key, "").strip()
@@ -35,19 +40,23 @@ if THEME not in SUPPORTED_THEMES:
 SITE_TITLE = get_env_default("SITE_TITLE", "docker streaming")
 PAGE_TITLE = get_env_default("PAGE_TITLE", f"Live Stream - {SITE_TITLE}")
 LOGO_URL = get_env_default("LOGO_URL","",)
-LOGO_ALT = get_env_default("LOGO_ALT", "CDH Stephanus Logo")
+LOGO_ALT = get_env_default("LOGO_ALT", "Your Logo Here")
 FAVICON_URL = os.getenv("FAVICON_URL", "").strip()
 FAVICON_TYPE = get_env_default("FAVICON_TYPE", "image/svg+xml")
-FOOTER_URL = get_env_default("FOOTER_URL", "https://cdh-stephanus.org/")
-FOOTER_TEXT = get_env_default("FOOTER_TEXT", "CDH Stephanus")
+FOOTER_URL = get_env_default("FOOTER_URL", "")
+FOOTER_TEXT = get_env_default("FOOTER_TEXT", "Your Footers Here")
 SCHEDULE_BASE_URL = get_env_default("SCHEDULE_BASE_URL", "/static/data")
 socketio = SocketIO(app, cors_allowed_origins="*")
 client_lock = Lock()
 client_count = 0
+client_sessions = {}
+sid_to_session = {}
 stats_lock = Lock()
 stats_task_started = False
 
 def render_index(debug_enabled: bool):
+    if "viewer_id" not in session:
+        session["viewer_id"] = secrets.token_urlsafe(16)
     audio_hls_url = None
     if AUDIO_HLS_URL:
         audio_hls_url = AUDIO_HLS_URL
@@ -206,8 +215,18 @@ def on_connect():
     global client_count
     ensure_stats_task()
     emit("status", {"live": is_live(), "audio_live": is_audio_live()})
+    session_cookie_name = app.config.get("SESSION_COOKIE_NAME", "session")
+    session_id = session.get("viewer_id") or request.cookies.get(session_cookie_name)
+    if not session_id:
+        session_id = f"sid:{request.sid}"
+    sid = request.sid
     with client_lock:
-        client_count += 1
+        sid_to_session[sid] = session_id
+        session_sockets = client_sessions.setdefault(session_id, set())
+        was_empty = len(session_sockets) == 0
+        session_sockets.add(sid)
+        if was_empty:
+            client_count += 1
         count = client_count
     socketio.emit("clients", {"count": count})
 
@@ -216,7 +235,14 @@ def on_connect():
 def on_disconnect():
     global client_count
     with client_lock:
-        client_count = max(0, client_count - 1)
+        sid = request.sid
+        session_id = sid_to_session.pop(sid, None)
+        if session_id in client_sessions:
+            session_sockets = client_sessions.get(session_id, set())
+            session_sockets.discard(sid)
+            if not session_sockets:
+                client_sessions.pop(session_id, None)
+                client_count = max(0, client_count - 1)
         count = client_count
     socketio.emit("clients", {"count": count})
 

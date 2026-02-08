@@ -56,6 +56,11 @@ const audioOnlyStorageKey = "audioOnly";
 const autostartAttemptsKey = "autostartAttempts";
 const autostartMaxAttempts = 10;
 const volumeStorageKey = "audioVolume";
+const tabIdStorageKey = "streamTabId";
+const tabBroadcastKey = "streamTabBroadcast";
+const tabChannelName = "stream-tabs";
+const startupBufferSeconds = 3;
+const startupBufferTimeoutMs = 6000;
 let allowAutoplay = true;
 const debugEnabled = document.body?.dataset?.debug === "1";
 let scheduleData = [];
@@ -63,6 +68,15 @@ let audioAvailable = false;
 let audioLive = null;
 let playbackActive = false;
 let autostartAttempts = 0;
+let tabSuppressed = false;
+let tabLocked = false;
+let lastLiveStatus = false;
+let lastAudioLiveStatus = null;
+let tabId = null;
+let tabChannel = null;
+let startupPlayToken = 0;
+let tabLockEl = null;
+let playerReplaced = false;
 
 const debugLog = (message) => {
   if (!debugPanel || !debugEnabled) return;
@@ -420,7 +434,7 @@ const loadSchedule = async () => {
 };
 
 const updatePlayerClass = () => {
-  if (!playerEl) return;
+  if (!playerEl || playerReplaced) return;
   const audioReady = audioLive && audioAvailable;
   const liveState = audioOnlyEnabled ? audioReady : isLive;
   playerEl.className = "player";
@@ -443,6 +457,14 @@ const updateAutostartUI = () => {
       autostartTextEl.textContent = `Autostart aus (${autostartAttempts}/${autostartMaxAttempts})`;
     } else {
       autostartTextEl.textContent = "Autostart";
+    }
+  }
+  if (autostartToggle) {
+    if (tabLocked || tabSuppressed) {
+      autostartToggle.checked = false;
+      autostartToggle.disabled = true;
+    } else {
+      autostartToggle.disabled = false;
     }
   }
 };
@@ -607,8 +629,10 @@ const forceReload = () => {
   window.location.replace(url.toString());
 };
 const url = new URL(window.location.href);
-if (url.searchParams.has("reload")) {
+const claimOnLoad = url.searchParams.get("claim") === "1";
+if (url.searchParams.has("reload") || claimOnLoad) {
   url.searchParams.delete("reload");
+  url.searchParams.delete("claim");
   history.replaceState(null, "", url.toString());
 }
 if (audioOnlyToggle) {
@@ -628,6 +652,7 @@ if (audioOnlyToggle) {
 }
 setActiveMedia();
 setInterval(() => {
+  if (tabSuppressed) return;
   const isPlaying = mediaEl && !mediaEl.paused && !mediaEl.ended && mediaEl.readyState > 2;
   if (!audioOnlyEnabled && autostartEnabled && isLive && !isPlaying) {
     forceReload();
@@ -906,9 +931,151 @@ const stopPlayer = () => {
   }
   started = false;
   playbackActive = false;
+  startupPlayToken += 1;
   stopAudioVisualizer();
   resetMediaElement(video);
   resetMediaElement(audio);
+};
+
+const replacePlayerWithLockMessage = () => {
+  if (!playerEl || playerReplaced) return;
+  tabLockEl = document.createElement("div");
+  tabLockEl.className = "player-locked";
+  tabLockEl.innerHTML = `
+    <div class="player-locked-card">
+      <h3>Stream läuft in einem anderen Tab</h3>
+      <p>Bitte nutze den neuen Tab oder lade erneut um hier weiter zu machen.</p>
+      <button type="button" class="ghost small">Neu laden</button>
+    </div>
+  `;
+  const btn = tabLockEl.querySelector("button");
+  if (btn) {
+    btn.addEventListener("click", () => {
+      try {
+        sessionStorage.removeItem(autostartAttemptsKey);
+      } catch (error) {
+        debugLog(`autostart reset failed: ${error?.message || error}`);
+      }
+      const reloadUrl = new URL(window.location.href);
+      reloadUrl.searchParams.set("claim", "1");
+      reloadUrl.searchParams.set("reload", Date.now().toString());
+      window.location.replace(reloadUrl.toString());
+    });
+  }
+  playerEl.replaceWith(tabLockEl);
+  playerReplaced = true;
+};
+
+const bufferedAheadSeconds = (element) => {
+  if (!element) return 0;
+  try {
+    const { buffered, currentTime } = element;
+    if (!buffered || buffered.length === 0) return 0;
+    for (let i = 0; i < buffered.length; i += 1) {
+      const start = buffered.start(i);
+      const end = buffered.end(i);
+      if (currentTime >= start && currentTime <= end) {
+        return Math.max(0, end - currentTime);
+      }
+    }
+  } catch (error) {
+    return 0;
+  }
+  return 0;
+};
+
+const waitForStartupBuffer = (element, onReady) => {
+  if (!element) return;
+  const token = ++startupPlayToken;
+  const startedAt = performance.now();
+  const check = () => {
+    if (token !== startupPlayToken) return;
+    if (!element || tabSuppressed) return;
+    const readyStateOk = element.readyState >= 3;
+    const bufferedAhead = bufferedAheadSeconds(element);
+    if (readyStateOk && bufferedAhead >= startupBufferSeconds) {
+      onReady();
+      return;
+    }
+    if (performance.now() - startedAt >= startupBufferTimeoutMs) {
+      onReady();
+      return;
+    }
+    requestAnimationFrame(check);
+  };
+  requestAnimationFrame(check);
+};
+
+const getTabId = () => {
+  let id = sessionStorage.getItem(tabIdStorageKey);
+  if (!id) {
+    id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    sessionStorage.setItem(tabIdStorageKey, id);
+  }
+  return id;
+};
+
+const setTabSuppressed = (suppressed, reason) => {
+  if (tabSuppressed === suppressed) return;
+  tabSuppressed = suppressed;
+  if (tabSuppressed && started) {
+    stopPlayer();
+  }
+  if (tabSuppressed) {
+    tabLocked = true;
+    autostartEnabled = false;
+    if (autostartToggle) autostartToggle.checked = false;
+    replacePlayerWithLockMessage();
+  }
+  if (!tabSuppressed) {
+    handleStatus(lastLiveStatus, lastAudioLiveStatus);
+  }
+  updateAutostartUI();
+  updateUnmute();
+  updateAudioControls();
+  debugLog(`tab ${tabSuppressed ? "suppressed" : "active"}${reason ? ` (${reason})` : ""}`);
+};
+
+const broadcastTabState = (payload) => {
+  if (tabChannel) {
+    tabChannel.postMessage(payload);
+    return;
+  }
+  try {
+    localStorage.setItem(tabBroadcastKey, JSON.stringify({ ...payload, ts: Date.now() }));
+    localStorage.removeItem(tabBroadcastKey);
+  } catch (error) {
+    debugLog(`tab broadcast failed: ${error?.message || error}`);
+  }
+};
+
+const claimActiveTab = (reason) => {
+  setTabSuppressed(false, reason);
+  broadcastTabState({ type: "claim", tabId, reason });
+};
+
+const handleTabMessage = (message) => {
+  if (!message || message.tabId === tabId) return;
+  if (message.type === "claim") {
+    setTabSuppressed(true, "remote");
+  }
+};
+
+const initTabControl = () => {
+  tabId = getTabId();
+  if ("BroadcastChannel" in window) {
+    tabChannel = new BroadcastChannel(tabChannelName);
+    tabChannel.onmessage = (event) => handleTabMessage(event.data);
+  } else {
+    window.addEventListener("storage", (event) => {
+      if (event.key !== tabBroadcastKey || !event.newValue) return;
+      try {
+        handleTabMessage(JSON.parse(event.newValue));
+      } catch (error) {
+        debugLog(`tab message parse failed: ${error?.message || error}`);
+      }
+    });
+  }
 };
 
 const startPlayer = () => {
@@ -917,6 +1084,19 @@ const startPlayer = () => {
 
 const startPlayerWithOptions = ({ forcePlay }) => {
   if (started) return;
+  if (tabLocked) {
+    debugLog("tab locked, skip start");
+    return;
+  }
+  if (tabSuppressed && !forcePlay) {
+    debugLog("tab suppressed, skip start");
+    return;
+  }
+  if (tabSuppressed && forcePlay) {
+    claimActiveTab("user-play");
+  } else {
+    claimActiveTab(forcePlay ? "play" : "autostart");
+  }
   setActiveMedia();
   if (!activeHlsUrl) {
     debugLog("no media source available");
@@ -935,7 +1115,11 @@ const startPlayerWithOptions = ({ forcePlay }) => {
       if (Number.isFinite(mediaEl.duration)) {
         mediaEl.currentTime = Math.max(0, mediaEl.duration - 0.5);
       }
-      attemptPlay(mediaEl);
+      if (forcePlay) {
+        attemptPlay(mediaEl);
+      } else {
+        waitForStartupBuffer(mediaEl, () => attemptPlay(mediaEl));
+      }
     }, { once: true });
     return;
   }
@@ -959,7 +1143,11 @@ const startPlayerWithOptions = ({ forcePlay }) => {
     }
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       jumpToLiveEdge(hls, mediaEl);
-      attemptPlay(mediaEl);
+      if (forcePlay) {
+        attemptPlay(mediaEl);
+      } else {
+        waitForStartupBuffer(mediaEl, () => attemptPlay(mediaEl));
+      }
       setTimeout(updateUnmute, 100);
     });
     hls.on(Hls.Events.ERROR, (event, data) => {
@@ -990,6 +1178,28 @@ const handleStatus = (live, audioLiveStatus) => {
     audioLive = audioLiveStatus;
     audioAvailable = audioLiveStatus;
   }
+  lastLiveStatus = !!live;
+  if (typeof audioLiveStatus === "boolean") {
+    lastAudioLiveStatus = audioLiveStatus;
+  }
+  if (tabLocked) {
+    if (audioOnlyEnabled) {
+      setStatus(!!audioLive);
+      updateAudioControls();
+      return;
+    }
+    setStatus(!!live);
+    return;
+  }
+  if (tabSuppressed) {
+    if (audioOnlyEnabled) {
+      setStatus(!!audioLive);
+      updateAudioControls();
+      return;
+    }
+    setStatus(!!live);
+    return;
+  }
   if (audioOnlyEnabled) {
     setStatus(!!audioLive);
     updateAudioControls();
@@ -1016,6 +1226,11 @@ const handleStatus = (live, audioLiveStatus) => {
     stopPlayer();
   }
 };
+
+initTabControl();
+if (claimOnLoad) {
+  claimActiveTab("manual-reload");
+}
 
 const socket = io({ transports: ["websocket"] });
 socket.on("status", (data) => {

@@ -222,6 +222,40 @@ body::before {
   aspect-ratio: 16 / 9;
 }
 .player.offline-mode { background: transparent; }
+.player-locked {
+  position: relative;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: #111;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  aspect-ratio: 16 / 9;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  color: #fff;
+  text-align: center;
+}
+.player-locked-card {
+  max-width: 360px;
+  padding: 20px 22px;
+  border-radius: 16px;
+  background: rgba(10, 10, 10, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: 0 16px 32px rgba(0, 0, 0, 0.35);
+  display: grid;
+  gap: 10px;
+  justify-items: center;
+}
+.player-locked-card h3 {
+  margin: 0;
+  font-family: "Fraunces", serif;
+  font-size: 18px;
+}
+.player-locked-card p {
+  margin: 0;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.78);
+}
 video {
   width: 100%;
   border-radius: var(--radius-md);
