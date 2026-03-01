@@ -32,6 +32,7 @@ const scheduleTheme = document.documentElement?.dataset?.theme || "ocean";
 const scheduleBaseUrl = (document.body?.dataset?.scheduleBaseUrl || "/data").replace(/\/$/, "");
 const scheduleUrl = document.body?.dataset?.scheduleUrl || `${scheduleBaseUrl}/schedule-${scheduleTheme}.json`;
 const audioStatusUrl = document.body?.dataset?.audioStatusUrl || "/audio-status";
+const clientLogUrl = document.body?.dataset?.clientLogUrl || "/client-log";
 const audioOnlyForced = document.body?.dataset?.audioOnly === "1";
 const timeFormatter = new Intl.DateTimeFormat(scheduleLocale, { hour: "2-digit", minute: "2-digit" });
 const dayFormatter = new Intl.DateTimeFormat(scheduleLocale, { day: "2-digit" });
@@ -77,6 +78,7 @@ let tabChannel = null;
 let startupPlayToken = 0;
 let tabLockEl = null;
 let playerReplaced = false;
+let socket = null;
 
 const debugLog = (message) => {
   if (!debugPanel || !debugEnabled) return;
@@ -87,6 +89,92 @@ const debugLog = (message) => {
 };
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+const clientLogHistory = new Map();
+
+const shouldThrottleClientLog = (key, throttleMs) => {
+  if (!throttleMs || throttleMs <= 0) return false;
+  const now = Date.now();
+  const last = clientLogHistory.get(key) || 0;
+  if (now - last < throttleMs) {
+    return true;
+  }
+  clientLogHistory.set(key, now);
+  return false;
+};
+
+const activeMediaState = () => {
+  const element = mediaEl;
+  const currentTime = element && Number.isFinite(element.currentTime)
+    ? Number(element.currentTime.toFixed(2))
+    : null;
+  return {
+    started,
+    live: isLive,
+    playbackActive,
+    audioOnlyEnabled,
+    hasSource: !!(element?.currentSrc || element?.src),
+    muted: element?.muted ?? null,
+    paused: element?.paused ?? null,
+    ended: element?.ended ?? null,
+    readyState: element?.readyState ?? null,
+    networkState: element?.networkState ?? null,
+    currentTime
+  };
+};
+
+const postClientLog = (event, details = {}) => {
+  if (!clientLogUrl) return;
+  const payload = {
+    event,
+    details,
+    media: activeMediaState(),
+    ts: new Date().toISOString()
+  };
+  const body = JSON.stringify(payload);
+  if (navigator.sendBeacon) {
+    try {
+      const ok = navigator.sendBeacon(
+        clientLogUrl,
+        new Blob([body], { type: "application/json" })
+      );
+      if (ok) return;
+    } catch (error) {
+      debugLog(`sendBeacon failed: ${error?.message || error}`);
+    }
+  }
+  fetch(clientLogUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+    keepalive: true
+  }).catch(() => {});
+};
+
+const emitClientDebug = (event, details = {}, options = {}) => {
+  const {
+    throttleMs = 0,
+    sendHttpFallback = false
+  } = options;
+  const key = `${event}:${details?.code ?? details?.name ?? details?.reason ?? details?.type ?? ""}`;
+  if (shouldThrottleClientLog(key, throttleMs)) {
+    return;
+  }
+  if (socket && socket.connected) {
+    try {
+      socket.emit("client_debug", {
+        event,
+        details,
+        media: activeMediaState()
+      });
+      return;
+    } catch (error) {
+      debugLog(`client_debug failed: ${error?.message || error}`);
+    }
+  }
+  if (sendHttpFallback) {
+    postClientLog(event, details);
+  }
+};
 
 const audioEq = document.querySelector(".audio-eq");
 const audioEqBars = audioEq ? Array.from(audioEq.querySelectorAll("span")) : [];
@@ -288,11 +376,29 @@ const fetchAudioStatus = async () => {
 window.addEventListener("error", (event) => {
   const msg = event?.message || "Unknown error";
   debugLog(`error: ${msg}`);
+  emitClientDebug(
+    "window_error",
+    {
+      message: msg,
+      source: event?.filename || "",
+      line: event?.lineno ?? null
+    },
+    { throttleMs: 10000, sendHttpFallback: true }
+  );
 });
 
 window.addEventListener("unhandledrejection", (event) => {
   const reason = event?.reason?.message || String(event?.reason || "Unknown rejection");
   debugLog(`promise: ${reason}`);
+  emitClientDebug(
+    "promise_rejection",
+    { reason },
+    { throttleMs: 10000, sendHttpFallback: true }
+  );
+});
+
+window.addEventListener("pagehide", (event) => {
+  postClientLog("pagehide", { persisted: !!event?.persisted });
 });
 
 const toDate = (entry) => {
@@ -742,6 +848,11 @@ const attemptPlay = (element) => {
   if (!element) return;
   element.play().catch((error) => {
     debugLog(`play() failed: ${error?.message || error}`);
+    emitClientDebug(
+      "play_failed",
+      { name: error?.name || "unknown", message: error?.message || String(error) },
+      { throttleMs: 10000 }
+    );
     updateAudioControls();
     const message = (error?.message || "").toLowerCase();
     if (audioOnlyEnabled && (error?.name === "NotSupportedError" || message.includes("no supported source"))) {
@@ -889,6 +1000,15 @@ if (volumeSlider) {
     const err = event?.currentTarget?.error;
     const code = err?.code ?? "unknown";
     debugLog(`media error: code=${code}`);
+    emitClientDebug(
+      "media_error",
+      {
+        code,
+        message: err?.message || "",
+        mediaType: event?.currentTarget?.tagName?.toLowerCase() || "unknown"
+      },
+      { throttleMs: 5000 }
+    );
     if (code === 4 && audioOnlyEnabled && started) {
       audioAvailable = false;
       stopPlayer();
@@ -901,6 +1021,7 @@ if (volumeSlider) {
   });
   element.addEventListener("stalled", (event) => {
     debugLog("media stalled");
+    emitClientDebug("media_stalled", {}, { throttleMs: 15000 });
     if (event.currentTarget === mediaEl) {
       playbackActive = false;
       updateUnmute();
@@ -908,6 +1029,7 @@ if (volumeSlider) {
   });
   element.addEventListener("waiting", (event) => {
     debugLog("media waiting");
+    emitClientDebug("media_waiting", {}, { throttleMs: 15000 });
     if (event.currentTarget === mediaEl) {
       playbackActive = false;
       updateUnmute();
@@ -1153,6 +1275,15 @@ const startPlayerWithOptions = ({ forcePlay }) => {
     hls.on(Hls.Events.ERROR, (event, data) => {
       const details = data?.details || "";
       debugLog(`hls error: ${details || data?.type || "unknown"}`);
+      emitClientDebug(
+        "hls_error",
+        {
+          type: data?.type || "unknown",
+          details: details || "unknown",
+          fatal: !!data?.fatal
+        },
+        { throttleMs: 5000 }
+      );
       if (details === "bufferStalledError" || details === "bufferSeekOverHole") {
         attemptMediaRecovery();
         return;
@@ -1174,6 +1305,8 @@ const startPlayerWithOptions = ({ forcePlay }) => {
 };
 
 const handleStatus = (live, audioLiveStatus) => {
+  const previousLiveStatus = lastLiveStatus;
+  const previousAudioStatus = lastAudioLiveStatus;
   if (typeof audioLiveStatus === "boolean") {
     audioLive = audioLiveStatus;
     audioAvailable = audioLiveStatus;
@@ -1181,6 +1314,9 @@ const handleStatus = (live, audioLiveStatus) => {
   lastLiveStatus = !!live;
   if (typeof audioLiveStatus === "boolean") {
     lastAudioLiveStatus = audioLiveStatus;
+  }
+  if (previousLiveStatus !== lastLiveStatus || previousAudioStatus !== lastAudioLiveStatus) {
+    emitClientDebug("status_update", { live: lastLiveStatus, audioLive: lastAudioLiveStatus });
   }
   if (tabLocked) {
     if (audioOnlyEnabled) {
@@ -1232,7 +1368,24 @@ if (claimOnLoad) {
   claimActiveTab("manual-reload");
 }
 
-const socket = io({ transports: ["websocket"] });
+socket = io({ transports: ["websocket"] });
+socket.on("connect", () => {
+  emitClientDebug(
+    "socket_connect",
+    {
+      socketId: socket?.id || "",
+      transport: socket?.io?.engine?.transport?.name || "unknown"
+    },
+    { throttleMs: 1000 }
+  );
+});
+socket.on("connect_error", (error) => {
+  emitClientDebug(
+    "socket_connect_error",
+    { message: error?.message || String(error) },
+    { throttleMs: 15000, sendHttpFallback: true }
+  );
+});
 socket.on("status", (data) => {
   handleStatus(!!data?.live, data?.audio_live);
 });
@@ -1241,7 +1394,8 @@ socket.on("clients", (data) => {
   const count = Number.isFinite(data?.count) ? data.count : 0;
   clientsEl.textContent = `Aktuell online: ${count}`;
 });
-socket.on("disconnect", () => {
+socket.on("disconnect", (reason) => {
+  postClientLog("socket_disconnect", { reason: reason || "unknown" });
   audioLive = false;
   audioAvailable = false;
   setStatus(false);

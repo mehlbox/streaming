@@ -3,6 +3,10 @@ import ipaddress
 import sqlite3
 import time
 import secrets
+import json
+import logging
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from threading import Lock
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -46,13 +50,39 @@ FAVICON_TYPE = get_env_default("FAVICON_TYPE", "image/svg+xml")
 FOOTER_URL = get_env_default("FOOTER_URL", "")
 FOOTER_TEXT = get_env_default("FOOTER_TEXT", "Your Footers Here")
 SCHEDULE_BASE_URL = get_env_default("SCHEDULE_BASE_URL", "/static/data")
+DISCONNECT_LOG_ENABLED = parse_bool(os.getenv("DISCONNECT_LOG_ENABLED", "1"))
+DISCONNECT_LOG_PATH = os.getenv(
+    "DISCONNECT_LOG_PATH",
+    "/docker/streaming/flask/disconnect-debug.log",
+).strip()
+DISCONNECT_LOG_MAX_BYTES = int(os.getenv("DISCONNECT_LOG_MAX_BYTES", "5242880"))
+DISCONNECT_LOG_BACKUP_COUNT = int(os.getenv("DISCONNECT_LOG_BACKUP_COUNT", "10"))
 socketio = SocketIO(app, cors_allowed_origins="*")
 client_lock = Lock()
 client_count = 0
 client_sessions = {}
 sid_to_session = {}
+sid_meta = {}
 stats_lock = Lock()
 stats_task_started = False
+
+disconnect_logger = logging.getLogger("disconnect_debug")
+disconnect_logger.setLevel(logging.INFO)
+disconnect_logger.propagate = False
+if DISCONNECT_LOG_ENABLED:
+    try:
+        log_path = Path(DISCONNECT_LOG_PATH)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        disconnect_handler = RotatingFileHandler(
+            log_path,
+            maxBytes=max(1024, DISCONNECT_LOG_MAX_BYTES),
+            backupCount=max(1, DISCONNECT_LOG_BACKUP_COUNT),
+            encoding="utf-8",
+        )
+        disconnect_handler.setFormatter(logging.Formatter("%(message)s"))
+        disconnect_logger.addHandler(disconnect_handler)
+    except Exception:
+        app.logger.exception("Failed to initialize disconnect debug logger")
 
 def render_index(debug_enabled: bool):
     if "viewer_id" not in session:
@@ -128,6 +158,69 @@ def is_private_addr(addr: str) -> bool:
     return ip.is_private or ip.is_loopback or ip.is_link_local
 
 
+def shorten(value, max_len: int = 240):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def client_ip() -> str:
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",", 1)[0].strip()
+    return request.headers.get("X-Real-IP", "") or request.remote_addr or ""
+
+
+def session_cookie_name() -> str:
+    return app.config.get("SESSION_COOKIE_NAME", "session")
+
+
+def current_session_id() -> str:
+    return session.get("viewer_id") or request.cookies.get(session_cookie_name()) or ""
+
+
+def sanitize_payload(payload, depth: int = 0):
+    if depth > 3:
+        return shorten(payload, 120)
+    if payload is None:
+        return None
+    if isinstance(payload, (bool, int, float)):
+        return payload
+    if isinstance(payload, str):
+        return shorten(payload, 500)
+    if isinstance(payload, dict):
+        cleaned = {}
+        for key in list(payload.keys())[:20]:
+            cleaned[shorten(key, 64)] = sanitize_payload(payload[key], depth + 1)
+        return cleaned
+    if isinstance(payload, list):
+        return [sanitize_payload(item, depth + 1) for item in payload[:20]]
+    return shorten(repr(payload), 500)
+
+
+def log_disconnect_event(event: str, sid: str = "", session_id: str = "", **fields) -> None:
+    if not DISCONNECT_LOG_ENABLED:
+        return
+    if not disconnect_logger.handlers:
+        return
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+    }
+    if sid:
+        record["sid"] = sid
+    if session_id:
+        record["session_id"] = session_id
+    record.update({k: sanitize_payload(v) for k, v in fields.items()})
+    try:
+        disconnect_logger.info(json.dumps(record, sort_keys=True, separators=(",", ":")))
+    except Exception:
+        app.logger.exception("Failed to write disconnect debug log")
+
+
 @app.get("/status")
 def status():
     return jsonify({"live": is_live(), "audio_live": is_audio_live()})
@@ -196,17 +289,63 @@ def auth():
 
     if call == "connect":
         if not STREAM_KEY or token == STREAM_KEY:
+            log_disconnect_event(
+                "auth_connect_ok",
+                call=call,
+                stream=stream_name,
+                remote_ip=client_ip(),
+                addr=shorten(request.values.get("addr", ""), 100),
+            )
             return "OK"
         addr = request.values.get("addr", "")
         if is_private_addr(addr):
+            log_disconnect_event(
+                "auth_connect_ok_private",
+                call=call,
+                stream=stream_name,
+                remote_ip=client_ip(),
+                addr=shorten(addr, 100),
+            )
             return "OK"
+        log_disconnect_event(
+            "auth_connect_rejected",
+            call=call,
+            stream=stream_name,
+            remote_ip=client_ip(),
+            addr=shorten(addr, 100),
+            user_agent=shorten(request.headers.get("User-Agent", ""), 200),
+        )
         abort(403)
     if call == "publish":
         if stream_name == STREAM_NAME:
+            log_disconnect_event(
+                "auth_publish_ok",
+                call=call,
+                stream=stream_name,
+                remote_ip=client_ip(),
+            )
             return "OK"
+        log_disconnect_event(
+            "auth_publish_rejected",
+            call=call,
+            stream=stream_name,
+            remote_ip=client_ip(),
+        )
         abort(403)
     if not STREAM_KEY or token == STREAM_KEY:
+        log_disconnect_event(
+            "auth_generic_ok",
+            call=call,
+            stream=stream_name,
+            remote_ip=client_ip(),
+        )
         return "OK"
+    log_disconnect_event(
+        "auth_generic_rejected",
+        call=call,
+        stream=stream_name,
+        remote_ip=client_ip(),
+    )
     abort(403)
 
 
@@ -215,28 +354,57 @@ def on_connect():
     global client_count
     ensure_stats_task()
     emit("status", {"live": is_live(), "audio_live": is_audio_live()})
-    session_cookie_name = app.config.get("SESSION_COOKIE_NAME", "session")
-    session_id = session.get("viewer_id") or request.cookies.get(session_cookie_name)
+    session_id = current_session_id()
     if not session_id:
         session_id = f"sid:{request.sid}"
     sid = request.sid
     with client_lock:
         sid_to_session[sid] = session_id
+        sid_meta[sid] = {
+            "connected_at": time.time(),
+            "remote_ip": client_ip(),
+            "user_agent": shorten(request.headers.get("User-Agent", ""), 200),
+            "origin": shorten(request.headers.get("Origin", ""), 160),
+            "referer": shorten(request.headers.get("Referer", ""), 200),
+            "transport": shorten(request.args.get("transport", ""), 64),
+            "last_client_event": None,
+            "last_client_event_at": None,
+        }
         session_sockets = client_sessions.setdefault(session_id, set())
         was_empty = len(session_sockets) == 0
         session_sockets.add(sid)
         if was_empty:
             client_count += 1
         count = client_count
+    log_disconnect_event(
+        "socket_connect",
+        sid=sid,
+        session_id=session_id,
+        remote_ip=sid_meta[sid].get("remote_ip", ""),
+        user_agent=sid_meta[sid].get("user_agent", ""),
+        transport=sid_meta[sid].get("transport", ""),
+        clients=count,
+    )
     socketio.emit("clients", {"count": count})
 
 
 @socketio.on("disconnect")
-def on_disconnect():
+def on_disconnect(reason=None):
     global client_count
+    session_id = ""
+    event_meta = {}
+    duration_seconds = None
+    seconds_since_client_event = None
     with client_lock:
         sid = request.sid
         session_id = sid_to_session.pop(sid, None)
+        event_meta = sid_meta.pop(sid, {})
+        connected_at = event_meta.get("connected_at")
+        last_client_event_at = event_meta.get("last_client_event_at")
+        if isinstance(connected_at, (float, int)):
+            duration_seconds = round(max(0.0, time.time() - connected_at), 3)
+        if isinstance(last_client_event_at, (float, int)):
+            seconds_since_client_event = round(max(0.0, time.time() - last_client_event_at), 3)
         if session_id in client_sessions:
             session_sockets = client_sessions.get(session_id, set())
             session_sockets.discard(sid)
@@ -244,7 +412,58 @@ def on_disconnect():
                 client_sessions.pop(session_id, None)
                 client_count = max(0, client_count - 1)
         count = client_count
+    log_disconnect_event(
+        "socket_disconnect",
+        sid=sid,
+        session_id=session_id or "",
+        reason=shorten(reason, 80),
+        duration_seconds=duration_seconds,
+        last_client_event=event_meta.get("last_client_event"),
+        seconds_since_client_event=seconds_since_client_event,
+        transport=event_meta.get("transport"),
+        remote_ip=event_meta.get("remote_ip"),
+        user_agent=event_meta.get("user_agent"),
+        clients=count,
+    )
     socketio.emit("clients", {"count": count})
+
+
+@socketio.on("client_debug")
+def on_client_debug(payload):
+    if not isinstance(payload, dict):
+        return
+    sid = request.sid
+    with client_lock:
+        session_id = sid_to_session.get(sid, "")
+        meta = sid_meta.get(sid)
+        if meta is not None:
+            meta["last_client_event"] = shorten(payload.get("event", "unknown"), 80)
+            meta["last_client_event_at"] = time.time()
+    log_disconnect_event(
+        "client_debug",
+        sid=sid,
+        session_id=session_id,
+        client_event=shorten(payload.get("event", "unknown"), 80),
+        details=sanitize_payload(payload.get("details", {})),
+        media=sanitize_payload(payload.get("media", {})),
+    )
+
+
+@app.post("/client-log")
+def client_log():
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    log_disconnect_event(
+        "client_http_log",
+        session_id=current_session_id(),
+        client_event=shorten(payload.get("event", "unknown"), 80),
+        details=sanitize_payload(payload.get("details", {})),
+        media=sanitize_payload(payload.get("media", {})),
+        remote_ip=client_ip(),
+        user_agent=shorten(request.headers.get("User-Agent", ""), 200),
+    )
+    return ("", 204)
 
 
 @app.get("/stats")
@@ -276,6 +495,13 @@ def status_watcher():
         live = is_live()
         audio_live = is_audio_live()
         if live != last_live or audio_live != last_audio:
+            log_disconnect_event(
+                "status_change",
+                live=live,
+                audio_live=audio_live,
+                stream=STREAM_NAME,
+                audio_stream=AUDIO_STREAM_NAME,
+            )
             socketio.emit("status", {"live": live, "audio_live": audio_live})
             last_live = live
             last_audio = audio_live
