@@ -32,6 +32,8 @@ STREAM_KEY = os.getenv("STREAM_KEY", "").strip()
 HLS_DIR = os.getenv("HLS_DIR", "/var/www/hls")
 HLS_STALE_SECONDS = int(os.getenv("HLS_STALE_SECONDS", "15"))
 SOCKETIO_POLL_SECONDS = float(os.getenv("SOCKETIO_POLL_SECONDS", "2"))
+SOCKETIO_PING_INTERVAL = float(os.getenv("SOCKETIO_PING_INTERVAL", "25"))
+SOCKETIO_PING_TIMEOUT = float(os.getenv("SOCKETIO_PING_TIMEOUT", "60"))
 STATS_DB = os.getenv("STATS_DB", "/docker/streaming/flask/stats.db")
 STATS_SAMPLE_SECONDS = int(os.getenv("STATS_SAMPLE_SECONDS", "60"))
 AUDIO_STREAM_NAME = os.getenv("AUDIO_STREAM_NAME", "").strip()
@@ -57,7 +59,15 @@ DISCONNECT_LOG_PATH = os.getenv(
 ).strip()
 DISCONNECT_LOG_MAX_BYTES = int(os.getenv("DISCONNECT_LOG_MAX_BYTES", "5242880"))
 DISCONNECT_LOG_BACKUP_COUNT = int(os.getenv("DISCONNECT_LOG_BACKUP_COUNT", "10"))
-socketio = SocketIO(app, cors_allowed_origins="*")
+APP_DEBUG = parse_bool(os.getenv("APP_DEBUG", "0"))
+SOCKETIO_PING_INTERVAL = max(5.0, SOCKETIO_PING_INTERVAL)
+SOCKETIO_PING_TIMEOUT = max(SOCKETIO_PING_INTERVAL + 5.0, SOCKETIO_PING_TIMEOUT)
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    ping_interval=SOCKETIO_PING_INTERVAL,
+    ping_timeout=SOCKETIO_PING_TIMEOUT,
+)
 client_lock = Lock()
 client_count = 0
 client_sessions = {}
@@ -470,4 +480,4 @@ def status_watcher():
 if __name__ == "__main__":
     socketio.start_background_task(status_watcher)
     ensure_stats_task()
-    socketio.run(app, host="0.0.0.0", port=5000, debug=True, use_reloader=False)
+    socketio.run(app, host="0.0.0.0", port=5000, debug=APP_DEBUG, use_reloader=False)

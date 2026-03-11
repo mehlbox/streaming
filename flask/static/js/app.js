@@ -1435,7 +1435,17 @@ if (claimOnLoad) {
   claimActiveTab("manual-reload");
 }
 
-socket = io({ transports: ["websocket"] });
+const socketOptions = {
+  transports: ["websocket", "polling"],
+  upgrade: true,
+  timeout: 30000,
+  reconnection: true,
+  reconnectionAttempts: Infinity,
+  reconnectionDelay: 1000,
+  reconnectionDelayMax: 10000,
+  randomizationFactor: 0.5
+};
+socket = io(socketOptions);
 socket.on("connect", () => {
   emitClientDebug(
     "socket_connect",
