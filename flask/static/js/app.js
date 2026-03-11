@@ -128,31 +128,9 @@ const activeMediaState = () => {
 };
 
 const postClientLog = (event, details = {}) => {
-  if (!clientLogUrl) return;
-  const payload = {
-    event,
-    details,
-    media: activeMediaState(),
-    ts: new Date().toISOString()
-  };
-  const body = JSON.stringify(payload);
-  if (navigator.sendBeacon) {
-    try {
-      const ok = navigator.sendBeacon(
-        clientLogUrl,
-        new Blob([body], { type: "application/json" })
-      );
-      if (ok) return;
-    } catch (error) {
-      debugLog(`sendBeacon failed: ${error?.message || error}`);
-    }
-  }
-  fetch(clientLogUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body,
-    keepalive: true
-  }).catch(() => {});
+  // HTTP logging is intentionally disabled.
+  void event;
+  void details;
 };
 
 const emitClientDebug = (event, details = {}, options = {}) => {

@@ -34,6 +34,9 @@ HLS_STALE_SECONDS = int(os.getenv("HLS_STALE_SECONDS", "15"))
 SOCKETIO_POLL_SECONDS = float(os.getenv("SOCKETIO_POLL_SECONDS", "2"))
 SOCKETIO_PING_INTERVAL = float(os.getenv("SOCKETIO_PING_INTERVAL", "25"))
 SOCKETIO_PING_TIMEOUT = float(os.getenv("SOCKETIO_PING_TIMEOUT", "60"))
+DISCONNECT_RECONNECT_WINDOW_SECONDS = float(
+    os.getenv("DISCONNECT_RECONNECT_WINDOW_SECONDS", "10")
+)
 STATS_DB = os.getenv("STATS_DB", "/docker/streaming/flask/stats.db")
 STATS_SAMPLE_SECONDS = int(os.getenv("STATS_SAMPLE_SECONDS", "60"))
 AUDIO_STREAM_NAME = os.getenv("AUDIO_STREAM_NAME", "").strip()
@@ -62,6 +65,11 @@ DISCONNECT_LOG_BACKUP_COUNT = int(os.getenv("DISCONNECT_LOG_BACKUP_COUNT", "10")
 APP_DEBUG = parse_bool(os.getenv("APP_DEBUG", "0"))
 SOCKETIO_PING_INTERVAL = max(5.0, SOCKETIO_PING_INTERVAL)
 SOCKETIO_PING_TIMEOUT = max(SOCKETIO_PING_INTERVAL + 5.0, SOCKETIO_PING_TIMEOUT)
+DISCONNECT_RECONNECT_WINDOW_SECONDS = max(0.5, DISCONNECT_RECONNECT_WINDOW_SECONDS)
+PENDING_DISCONNECT_TTL_SECONDS = max(
+    30.0,
+    DISCONNECT_RECONNECT_WINDOW_SECONDS * 6,
+)
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
@@ -73,6 +81,7 @@ client_count = 0
 client_sessions = {}
 sid_to_session = {}
 sid_meta = {}
+pending_disconnects = {}
 stats_lock = Lock()
 stats_task_started = False
 
@@ -211,23 +220,6 @@ def sanitize_payload(payload, depth: int = 0):
     return shorten(repr(payload), 500)
 
 
-DISCONNECT_CLIENT_EVENTS = {
-    "socket_disconnect",
-    "socket_connect_error",
-    "pagehide",
-    "beforeunload",
-}
-
-
-def is_disconnect_related_client_event(event_name: str) -> bool:
-    normalized = (event_name or "").strip().lower()
-    if not normalized:
-        return False
-    if normalized in DISCONNECT_CLIENT_EVENTS:
-        return True
-    return "disconnect" in normalized
-
-
 def log_disconnect_event(event: str, sid: str = "", session_id: str = "", **fields) -> None:
     if not DISCONNECT_LOG_ENABLED:
         return
@@ -246,6 +238,17 @@ def log_disconnect_event(event: str, sid: str = "", session_id: str = "", **fiel
         disconnect_logger.info(json.dumps(record, sort_keys=True, separators=(",", ":")))
     except Exception:
         app.logger.exception("Failed to write disconnect debug log")
+
+
+def prune_pending_disconnects_locked(now: float) -> None:
+    cutoff = now - PENDING_DISCONNECT_TTL_SECONDS
+    stale_keys = []
+    for session_id, payload in pending_disconnects.items():
+        disconnected_at = payload.get("disconnected_at") if isinstance(payload, dict) else None
+        if not isinstance(disconnected_at, (float, int)) or disconnected_at < cutoff:
+            stale_keys.append(session_id)
+    for session_id in stale_keys:
+        pending_disconnects.pop(session_id, None)
 
 
 @app.get("/status")
@@ -339,10 +342,14 @@ def on_connect():
     if not session_id:
         session_id = f"sid:{request.sid}"
     sid = request.sid
+    connected_at = time.time()
+    pending_disconnect = None
     with client_lock:
+        prune_pending_disconnects_locked(connected_at)
+        pending_disconnect = pending_disconnects.pop(session_id, None)
         sid_to_session[sid] = session_id
         sid_meta[sid] = {
-            "connected_at": time.time(),
+            "connected_at": connected_at,
             "remote_ip": client_ip(),
             "user_agent": shorten(request.headers.get("User-Agent", ""), 200),
             "origin": shorten(request.headers.get("Origin", ""), 160),
@@ -357,6 +364,22 @@ def on_connect():
         if was_empty:
             client_count += 1
         count = client_count
+    if isinstance(pending_disconnect, dict):
+        disconnected_at = pending_disconnect.get("disconnected_at")
+        old_sid = pending_disconnect.get("sid", "")
+        fields = pending_disconnect.get("fields", {})
+        if isinstance(disconnected_at, (float, int)) and isinstance(fields, dict):
+            reconnect_seconds = round(max(0.0, connected_at - disconnected_at), 3)
+            if reconnect_seconds <= DISCONNECT_RECONNECT_WINDOW_SECONDS:
+                log_fields = dict(fields)
+                log_fields["reconnect_seconds"] = reconnect_seconds
+                log_fields["reconnected_sid"] = sid
+                log_disconnect_event(
+                    "socket_disconnect",
+                    sid=shorten(old_sid, 120) or sid,
+                    session_id=session_id,
+                    **log_fields,
+                )
     socketio.emit("clients", {"count": count})
 
 
@@ -367,6 +390,7 @@ def on_disconnect(reason=None):
     event_meta = {}
     duration_seconds = None
     seconds_since_client_event = None
+    disconnected_at = time.time()
     with client_lock:
         sid = request.sid
         session_id = sid_to_session.pop(sid, None)
@@ -374,9 +398,9 @@ def on_disconnect(reason=None):
         connected_at = event_meta.get("connected_at")
         last_client_event_at = event_meta.get("last_client_event_at")
         if isinstance(connected_at, (float, int)):
-            duration_seconds = round(max(0.0, time.time() - connected_at), 3)
+            duration_seconds = round(max(0.0, disconnected_at - connected_at), 3)
         if isinstance(last_client_event_at, (float, int)):
-            seconds_since_client_event = round(max(0.0, time.time() - last_client_event_at), 3)
+            seconds_since_client_event = round(max(0.0, disconnected_at - last_client_event_at), 3)
         if session_id in client_sessions:
             session_sockets = client_sessions.get(session_id, set())
             session_sockets.discard(sid)
@@ -384,19 +408,22 @@ def on_disconnect(reason=None):
                 client_sessions.pop(session_id, None)
                 client_count = max(0, client_count - 1)
         count = client_count
-    log_disconnect_event(
-        "socket_disconnect",
-        sid=sid,
-        session_id=session_id or "",
-        reason=shorten(reason, 80),
-        duration_seconds=duration_seconds,
-        last_client_event=event_meta.get("last_client_event"),
-        seconds_since_client_event=seconds_since_client_event,
-        transport=event_meta.get("transport"),
-        remote_ip=event_meta.get("remote_ip"),
-        user_agent=event_meta.get("user_agent"),
-        clients=count,
-    )
+        if session_id:
+            prune_pending_disconnects_locked(disconnected_at)
+            pending_disconnects[session_id] = {
+                "sid": sid,
+                "disconnected_at": disconnected_at,
+                "fields": {
+                    "reason": shorten(reason, 80),
+                    "duration_seconds": duration_seconds,
+                    "last_client_event": event_meta.get("last_client_event"),
+                    "seconds_since_client_event": seconds_since_client_event,
+                    "transport": event_meta.get("transport"),
+                    "remote_ip": event_meta.get("remote_ip"),
+                    "user_agent": event_meta.get("user_agent"),
+                    "clients": count,
+                },
+            }
     socketio.emit("clients", {"count": count})
 
 
@@ -412,33 +439,10 @@ def on_client_debug(payload):
         if meta is not None:
             meta["last_client_event"] = client_event
             meta["last_client_event_at"] = time.time()
-    if is_disconnect_related_client_event(client_event):
-        log_disconnect_event(
-            "client_debug",
-            sid=sid,
-            session_id=session_id,
-            client_event=client_event,
-            details=sanitize_payload(payload.get("details", {})),
-            media=sanitize_payload(payload.get("media", {})),
-        )
 
 
 @app.post("/client-log")
 def client_log():
-    payload = request.get_json(silent=True) or {}
-    if not isinstance(payload, dict):
-        payload = {}
-    client_event = shorten(payload.get("event", "unknown"), 80)
-    if is_disconnect_related_client_event(client_event):
-        log_disconnect_event(
-            "client_http_log",
-            session_id=current_session_id(),
-            client_event=client_event,
-            details=sanitize_payload(payload.get("details", {})),
-            media=sanitize_payload(payload.get("media", {})),
-            remote_ip=client_ip(),
-            user_agent=shorten(request.headers.get("User-Agent", ""), 200),
-        )
     return ("ok", 200)
 
 
