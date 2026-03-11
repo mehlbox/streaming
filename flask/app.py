@@ -201,6 +201,23 @@ def sanitize_payload(payload, depth: int = 0):
     return shorten(repr(payload), 500)
 
 
+DISCONNECT_CLIENT_EVENTS = {
+    "socket_disconnect",
+    "socket_connect_error",
+    "pagehide",
+    "beforeunload",
+}
+
+
+def is_disconnect_related_client_event(event_name: str) -> bool:
+    normalized = (event_name or "").strip().lower()
+    if not normalized:
+        return False
+    if normalized in DISCONNECT_CLIENT_EVENTS:
+        return True
+    return "disconnect" in normalized
+
+
 def log_disconnect_event(event: str, sid: str = "", session_id: str = "", **fields) -> None:
     if not DISCONNECT_LOG_ENABLED:
         return
@@ -289,63 +306,17 @@ def auth():
 
     if call == "connect":
         if not STREAM_KEY or token == STREAM_KEY:
-            log_disconnect_event(
-                "auth_connect_ok",
-                call=call,
-                stream=stream_name,
-                remote_ip=client_ip(),
-                addr=shorten(request.values.get("addr", ""), 100),
-            )
             return "OK"
         addr = request.values.get("addr", "")
         if is_private_addr(addr):
-            log_disconnect_event(
-                "auth_connect_ok_private",
-                call=call,
-                stream=stream_name,
-                remote_ip=client_ip(),
-                addr=shorten(addr, 100),
-            )
             return "OK"
-        log_disconnect_event(
-            "auth_connect_rejected",
-            call=call,
-            stream=stream_name,
-            remote_ip=client_ip(),
-            addr=shorten(addr, 100),
-            user_agent=shorten(request.headers.get("User-Agent", ""), 200),
-        )
         abort(403)
     if call == "publish":
         if stream_name == STREAM_NAME:
-            log_disconnect_event(
-                "auth_publish_ok",
-                call=call,
-                stream=stream_name,
-                remote_ip=client_ip(),
-            )
             return "OK"
-        log_disconnect_event(
-            "auth_publish_rejected",
-            call=call,
-            stream=stream_name,
-            remote_ip=client_ip(),
-        )
         abort(403)
     if not STREAM_KEY or token == STREAM_KEY:
-        log_disconnect_event(
-            "auth_generic_ok",
-            call=call,
-            stream=stream_name,
-            remote_ip=client_ip(),
-        )
         return "OK"
-    log_disconnect_event(
-        "auth_generic_rejected",
-        call=call,
-        stream=stream_name,
-        remote_ip=client_ip(),
-    )
     abort(403)
 
 
@@ -376,15 +347,6 @@ def on_connect():
         if was_empty:
             client_count += 1
         count = client_count
-    log_disconnect_event(
-        "socket_connect",
-        sid=sid,
-        session_id=session_id,
-        remote_ip=sid_meta[sid].get("remote_ip", ""),
-        user_agent=sid_meta[sid].get("user_agent", ""),
-        transport=sid_meta[sid].get("transport", ""),
-        clients=count,
-    )
     socketio.emit("clients", {"count": count})
 
 
@@ -433,20 +395,22 @@ def on_client_debug(payload):
     if not isinstance(payload, dict):
         return
     sid = request.sid
+    client_event = shorten(payload.get("event", "unknown"), 80)
     with client_lock:
         session_id = sid_to_session.get(sid, "")
         meta = sid_meta.get(sid)
         if meta is not None:
-            meta["last_client_event"] = shorten(payload.get("event", "unknown"), 80)
+            meta["last_client_event"] = client_event
             meta["last_client_event_at"] = time.time()
-    log_disconnect_event(
-        "client_debug",
-        sid=sid,
-        session_id=session_id,
-        client_event=shorten(payload.get("event", "unknown"), 80),
-        details=sanitize_payload(payload.get("details", {})),
-        media=sanitize_payload(payload.get("media", {})),
-    )
+    if is_disconnect_related_client_event(client_event):
+        log_disconnect_event(
+            "client_debug",
+            sid=sid,
+            session_id=session_id,
+            client_event=client_event,
+            details=sanitize_payload(payload.get("details", {})),
+            media=sanitize_payload(payload.get("media", {})),
+        )
 
 
 @app.post("/client-log")
@@ -454,16 +418,18 @@ def client_log():
     payload = request.get_json(silent=True) or {}
     if not isinstance(payload, dict):
         payload = {}
-    log_disconnect_event(
-        "client_http_log",
-        session_id=current_session_id(),
-        client_event=shorten(payload.get("event", "unknown"), 80),
-        details=sanitize_payload(payload.get("details", {})),
-        media=sanitize_payload(payload.get("media", {})),
-        remote_ip=client_ip(),
-        user_agent=shorten(request.headers.get("User-Agent", ""), 200),
-    )
-    return ("", 204)
+    client_event = shorten(payload.get("event", "unknown"), 80)
+    if is_disconnect_related_client_event(client_event):
+        log_disconnect_event(
+            "client_http_log",
+            session_id=current_session_id(),
+            client_event=client_event,
+            details=sanitize_payload(payload.get("details", {})),
+            media=sanitize_payload(payload.get("media", {})),
+            remote_ip=client_ip(),
+            user_agent=shorten(request.headers.get("User-Agent", ""), 200),
+        )
+    return ("ok", 200)
 
 
 @app.get("/stats")
@@ -495,13 +461,6 @@ def status_watcher():
         live = is_live()
         audio_live = is_audio_live()
         if live != last_live or audio_live != last_audio:
-            log_disconnect_event(
-                "status_change",
-                live=live,
-                audio_live=audio_live,
-                stream=STREAM_NAME,
-                audio_stream=AUDIO_STREAM_NAME,
-            )
             socketio.emit("status", {"live": live, "audio_live": audio_live})
             last_live = live
             last_audio = audio_live

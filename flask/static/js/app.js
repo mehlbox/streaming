@@ -62,6 +62,9 @@ const tabBroadcastKey = "streamTabBroadcast";
 const tabChannelName = "stream-tabs";
 const startupBufferSeconds = 3;
 const startupBufferTimeoutMs = 6000;
+const liveStartOffsetSeconds = 4.5;
+const stallReloadGraceMs = 60000;
+const stallRecoveryCooldownMs = 4000;
 let allowAutoplay = true;
 const debugEnabled = document.body?.dataset?.debug === "1";
 let scheduleData = [];
@@ -79,6 +82,8 @@ let startupPlayToken = 0;
 let tabLockEl = null;
 let playerReplaced = false;
 let socket = null;
+let stallStartedAt = 0;
+let lastStallRecoveryAt = 0;
 
 const debugLog = (message) => {
   if (!debugPanel || !debugEnabled) return;
@@ -705,28 +710,62 @@ const initStats = () => {
   setInterval(fetchStats, 60000);
 };
 
+const markStall = () => {
+  if (!stallStartedAt) {
+    stallStartedAt = Date.now();
+  }
+};
+
+const clearStallState = () => {
+  stallStartedAt = 0;
+  lastStallRecoveryAt = 0;
+  mediaRecoveryAttempts = 0;
+};
+
+const tryInlineStallRecovery = (reason) => {
+  if (!isLive || !mediaEl || mediaEl.ended) return;
+  const now = Date.now();
+  if (now - lastStallRecoveryAt < stallRecoveryCooldownMs) return;
+  lastStallRecoveryAt = now;
+  debugLog(`recovering playback (${reason})`);
+  emitClientDebug(
+    "media_recover_attempt",
+    { reason, withHls: !!hls, attempts: mediaRecoveryAttempts },
+    { throttleMs: 5000 }
+  );
+  try {
+    if (hls) {
+      if (mediaRecoveryAttempts <= 2) {
+        hls.recoverMediaError();
+      } else if (typeof hls.startLoad === "function") {
+        hls.startLoad(-1);
+      }
+      jumpToLiveEdge(hls, mediaEl);
+    } else {
+      seekToNearLiveStart(mediaEl);
+    }
+    attemptPlay(mediaEl);
+  } catch (error) {
+    console.log("Inline media recovery failed:", error);
+  }
+};
+
 const attemptMediaRecovery = () => {
-  if (!hls || !isLive) return;
+  if (!isLive) return;
+  markStall();
   const now = Date.now();
   if (now - lastMediaRecoveryAt > 30000) {
     mediaRecoveryAttempts = 0;
   }
   lastMediaRecoveryAt = now;
   mediaRecoveryAttempts += 1;
-  if (mediaRecoveryAttempts <= 2) {
-    try {
-      hls.recoverMediaError();
-      jumpToLiveEdge(hls, mediaEl);
-      mediaEl?.play().catch(() => {});
-    } catch (error) {
-      console.log("HLS recovery failed:", error);
+  tryInlineStallRecovery("hls-error");
+  if (stallStartedAt && now - stallStartedAt >= stallReloadGraceMs) {
+    if (autostartEnabled) {
+      forceReload();
     }
-    return;
+    clearStallState();
   }
-  if (autostartEnabled) {
-    forceReload();
-  }
-  mediaRecoveryAttempts = 0;
 };
 
 const forceReload = () => {
@@ -758,11 +797,23 @@ if (audioOnlyToggle) {
 }
 setActiveMedia();
 setInterval(() => {
-  if (tabSuppressed) return;
-  const isPlaying = mediaEl && !mediaEl.paused && !mediaEl.ended && mediaEl.readyState > 2;
-  if (!audioOnlyEnabled && autostartEnabled && isLive && !isPlaying) {
-    forceReload();
+  if (tabSuppressed || audioOnlyEnabled || !autostartEnabled || !isLive) return;
+  const element = mediaEl;
+  if (!element || !started || element.ended) return;
+  const isPlaying = !element.paused && !element.ended && element.readyState > 2;
+  if (isPlaying) {
+    clearStallState();
+    return;
   }
+  if (element.paused) return;
+  markStall();
+  const stallAge = Date.now() - stallStartedAt;
+  if (stallAge < stallReloadGraceMs) {
+    tryInlineStallRecovery("watchdog");
+    return;
+  }
+  forceReload();
+  clearStallState();
 }, 10000);
 loadSchedule();
 setInterval(refreshScheduleUI, 60000);
@@ -822,12 +873,21 @@ if (reloadBtn) {
   });
 }
 
+const seekToNearLiveStart = (element, livePosition = null) => {
+  if (!element) return;
+  const basePosition = Number.isFinite(livePosition)
+    ? livePosition
+    : (Number.isFinite(element.duration) ? element.duration : null);
+  if (!Number.isFinite(basePosition)) return;
+  const target = Math.max(0, basePosition - liveStartOffsetSeconds);
+  if (!Number.isFinite(element.currentTime) || Math.abs(element.currentTime - target) > 1) {
+    element.currentTime = target;
+  }
+};
+
 const jumpToLiveEdge = (hlsInstance, element) => {
   const livePos = hlsInstance?.liveSyncPosition;
-  if (!element || !livePos) return;
-  if (Math.abs(element.currentTime - livePos) > 2) {
-    element.currentTime = livePos;
-  }
+  seekToNearLiveStart(element, livePos);
 };
 
 const updateUnmute = () => {
@@ -899,6 +959,9 @@ const updateAudioControls = () => {
 const setStatus = (live) => {
   if (!statusEl) return;
   isLive = live;
+  if (!live) {
+    clearStallState();
+  }
   statusEl.textContent = live ? "Online" : "Offline";
   statusEl.className = live ? "status status-online" : "status status-offline";
   updatePlayerClass();
@@ -978,6 +1041,7 @@ if (volumeSlider) {
   element.addEventListener("play", updateUnmute);
   element.addEventListener("playing", (event) => {
     if (event.currentTarget !== mediaEl) return;
+    clearStallState();
     playbackActive = true;
     if (autostartAttempts > 0) {
       setAutostartAttempts(0, "reset");
@@ -1023,6 +1087,8 @@ if (volumeSlider) {
     debugLog("media stalled");
     emitClientDebug("media_stalled", {}, { throttleMs: 15000 });
     if (event.currentTarget === mediaEl) {
+      markStall();
+      tryInlineStallRecovery("stalled");
       playbackActive = false;
       updateUnmute();
     }
@@ -1031,6 +1097,8 @@ if (volumeSlider) {
     debugLog("media waiting");
     emitClientDebug("media_waiting", {}, { throttleMs: 15000 });
     if (event.currentTarget === mediaEl) {
+      markStall();
+      tryInlineStallRecovery("waiting");
       playbackActive = false;
       updateUnmute();
     }
@@ -1051,6 +1119,7 @@ const stopPlayer = () => {
     hls.destroy();
     hls = null;
   }
+  clearStallState();
   started = false;
   playbackActive = false;
   startupPlayToken += 1;
@@ -1234,9 +1303,7 @@ const startPlayerWithOptions = ({ forcePlay }) => {
       attemptPlay(mediaEl);
     }
     mediaEl.addEventListener("loadedmetadata", () => {
-      if (Number.isFinite(mediaEl.duration)) {
-        mediaEl.currentTime = Math.max(0, mediaEl.duration - 0.5);
-      }
+      seekToNearLiveStart(mediaEl);
       if (forcePlay) {
         attemptPlay(mediaEl);
       } else {
