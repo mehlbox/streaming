@@ -66,6 +66,8 @@ const startupBufferTimeoutMs = 6000;
 const liveStartOffsetSeconds = 4.5;
 const stallReloadGraceMs = 60000;
 const stallRecoveryCooldownMs = 4000;
+const playbackProgressEpsilonSeconds = 0.12;
+const playbackProgressGraceMs = 15000;
 let allowAutoplay = true;
 const debugEnabled = document.body?.dataset?.debug === "1";
 let scheduleData = [];
@@ -85,6 +87,8 @@ let playerReplaced = false;
 let socket = null;
 let stallStartedAt = 0;
 let lastStallRecoveryAt = 0;
+let lastPlaybackProgressAt = 0;
+let lastPlaybackPosition = null;
 
 const debugLog = (message) => {
   if (!debugPanel || !debugEnabled) return;
@@ -590,6 +594,7 @@ const setActiveMedia = () => {
   } else {
     activeHlsUrl = hlsUrl;
   }
+  resetPlaybackProgressTracking();
   updatePlayerClass();
   updateAutostartUI();
   applyVolume();
@@ -711,6 +716,37 @@ const clearStallState = () => {
   mediaRecoveryAttempts = 0;
 };
 
+const resetPlaybackProgressTracking = () => {
+  lastPlaybackProgressAt = 0;
+  lastPlaybackPosition = null;
+};
+
+const capturePlaybackProgress = (element, now = Date.now()) => {
+  if (!element) return;
+  const currentTime = element.currentTime;
+  if (!Number.isFinite(currentTime)) return;
+  if (!Number.isFinite(lastPlaybackPosition)) {
+    lastPlaybackPosition = currentTime;
+    lastPlaybackProgressAt = now;
+    return;
+  }
+  if (Math.abs(currentTime - lastPlaybackPosition) >= playbackProgressEpsilonSeconds) {
+    lastPlaybackPosition = currentTime;
+    lastPlaybackProgressAt = now;
+  }
+};
+
+const isPlaybackRunning = (element, now = Date.now()) => {
+  if (!element || element.paused || element.ended) return false;
+  if (element.readyState < 2) return false;
+  capturePlaybackProgress(element, now);
+  if (!lastPlaybackProgressAt) {
+    lastPlaybackProgressAt = now;
+    return true;
+  }
+  return (now - lastPlaybackProgressAt) <= playbackProgressGraceMs;
+};
+
 const tryInlineStallRecovery = (reason) => {
   if (!isLive || !mediaEl || mediaEl.ended) return;
   const now = Date.now();
@@ -789,7 +825,7 @@ setInterval(() => {
   if (tabSuppressed || audioOnlyEnabled || !autostartEnabled || !isLive) return;
   const element = mediaEl;
   if (!element || !started || element.ended) return;
-  const isPlaying = !element.paused && !element.ended && element.readyState > 2;
+  const isPlaying = isPlaybackRunning(element);
   if (isPlaying) {
     clearStallState();
     return;
@@ -1026,12 +1062,17 @@ if (volumeSlider) {
 
 [video, audio].forEach((element) => {
   if (!element) return;
+  element.addEventListener("timeupdate", (event) => {
+    if (event.currentTarget !== mediaEl) return;
+    capturePlaybackProgress(event.currentTarget);
+  });
   element.addEventListener("volumechange", updateUnmute);
   element.addEventListener("play", updateUnmute);
   element.addEventListener("playing", (event) => {
     if (event.currentTarget !== mediaEl) return;
     clearStallState();
     playbackActive = true;
+    capturePlaybackProgress(event.currentTarget);
     if (autostartAttempts > 0) {
       setAutostartAttempts(0, "reset");
     }
@@ -1109,6 +1150,7 @@ const stopPlayer = () => {
     hls = null;
   }
   clearStallState();
+  resetPlaybackProgressTracking();
   started = false;
   playbackActive = false;
   startupPlayToken += 1;
