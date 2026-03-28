@@ -19,6 +19,7 @@ const autostartTextEl = autostartLabel?.querySelector(".autostart-text");
 const audioOnlyToggle = document.getElementById("audio-only");
 const clientsEl = document.getElementById("clients");
 const reloadBtn = document.getElementById("reload");
+const scheduleCardEl = document.getElementById("schedule-card");
 const scheduleEl = document.getElementById("schedule");
 const scheduleEmptyEl = document.getElementById("schedule-empty");
 const offlineTitleEl = document.getElementById("offline-title");
@@ -415,13 +416,20 @@ const normalizeSchedule = (entries) => (
     .sort((a, b) => a.start - b.start)
 );
 
-const renderSchedule = () => {
+const getVisibleScheduleEntries = (now = new Date()) => (
+  scheduleData.filter((entry) => entry.end >= now)
+);
+
+const updateScheduleCardVisibility = (visibleEntries) => {
+  if (!scheduleCardEl) return;
+  scheduleCardEl.classList.toggle("hidden", visibleEntries.length === 0);
+};
+
+const renderSchedule = (visibleEntries, now = new Date()) => {
   if (!scheduleEl) return;
   scheduleEl.innerHTML = "";
-  const now = new Date();
-  const visibleEntries = scheduleData.filter((entry) => entry.end >= now);
   if (!visibleEntries.length) {
-    if (scheduleEmptyEl) scheduleEmptyEl.hidden = false;
+    if (scheduleEmptyEl) scheduleEmptyEl.hidden = true;
     return;
   }
   if (scheduleEmptyEl) scheduleEmptyEl.hidden = true;
@@ -496,7 +504,10 @@ const updateOfflineMessage = () => {
 };
 
 const refreshScheduleUI = () => {
-  renderSchedule();
+  const now = new Date();
+  const visibleEntries = getVisibleScheduleEntries(now);
+  updateScheduleCardVisibility(visibleEntries);
+  renderSchedule(visibleEntries, now);
   updateOfflineMessage();
 };
 
