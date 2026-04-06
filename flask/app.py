@@ -54,7 +54,7 @@ FAVICON_URL = os.getenv("FAVICON_URL", "").strip()
 FAVICON_TYPE = get_env_default("FAVICON_TYPE", "image/svg+xml")
 FOOTER_URL = get_env_default("FOOTER_URL", "")
 FOOTER_TEXT = get_env_default("FOOTER_TEXT", "Your Footers Here")
-SCHEDULE_BASE_URL = get_env_default("SCHEDULE_BASE_URL", "/static/data")
+SCHEDULE_BASE_URL = get_env_default("SCHEDULE_BASE_URL", "")
 DISCONNECT_LOG_ENABLED = parse_bool(os.getenv("DISCONNECT_LOG_ENABLED", "1"))
 DISCONNECT_LOG_PATH = os.getenv(
     "DISCONNECT_LOG_PATH",
@@ -128,6 +128,7 @@ def render_index(debug_enabled: bool):
         footer_url=FOOTER_URL,
         footer_text=FOOTER_TEXT,
         schedule_base_url=SCHEDULE_BASE_URL,
+        show_schedule=bool(SCHEDULE_BASE_URL),
     )
 
 
