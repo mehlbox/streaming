@@ -59,7 +59,7 @@ services:
     env_file:
       - .env
     environment:
-      - FLASK_ENV=development
+      - FLASK_ENV=production
       - FLASK_APP=app.py
       - DISCONNECT_LOG_PATH=/app/disconnect-debug.log
     expose:

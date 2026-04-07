@@ -325,7 +325,7 @@ def auth():
             return "OK"
         abort(403)
     if call == "publish":
-        if stream_name == STREAM_NAME:
+        if stream_name == STREAM_NAME and (not STREAM_KEY or token == STREAM_KEY):
             return "OK"
         abort(403)
     if not STREAM_KEY or token == STREAM_KEY:

@@ -1476,8 +1476,13 @@ const socketOptions = {
   reconnectionDelayMax: 10000,
   randomizationFactor: 0.5
 };
+let socketDisconnectTimer = null;
 socket = io(socketOptions);
 socket.on("connect", () => {
+  if (socketDisconnectTimer !== null) {
+    clearTimeout(socketDisconnectTimer);
+    socketDisconnectTimer = null;
+  }
   emitClientDebug(
     "socket_connect",
     {
@@ -1504,10 +1509,14 @@ socket.on("clients", (data) => {
 });
 socket.on("disconnect", (reason) => {
   postClientLog("socket_disconnect", { reason: reason || "unknown" });
-  audioLive = false;
-  audioAvailable = false;
-  setStatus(false);
-  if (started) {
-    stopPlayer();
-  }
+  if (socketDisconnectTimer !== null) return;
+  socketDisconnectTimer = setTimeout(() => {
+    socketDisconnectTimer = null;
+    audioLive = false;
+    audioAvailable = false;
+    setStatus(false);
+    if (started) {
+      stopPlayer();
+    }
+  }, 8000);
 });
