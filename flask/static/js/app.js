@@ -28,6 +28,8 @@ const statsCanvas = document.getElementById("stats-canvas");
 const statsEmptyEl = document.getElementById("stats-empty");
 const statsRangeEl = document.querySelector(".stats-range");
 const statsSection = document.getElementById("stats-section");
+const satelliteSection = document.getElementById("satellite-section");
+const satelliteBody = document.getElementById("satellite-body");
 const scheduleLocale = "de-DE";
 const scheduleTheme = document.documentElement?.dataset?.theme || "ocean";
 const scheduleBaseUrl = (document.body?.dataset?.scheduleBaseUrl || "/data").replace(/\/$/, "");
@@ -54,6 +56,8 @@ let mediaEl = video;
 let activeHlsUrl = hlsUrl;
 let mediaRecoveryAttempts = 0;
 let lastMediaRecoveryAt = 0;
+let satelliteUrl = null;
+let satelliteAssigned = false;
 const audioOnlyStorageKey = "audioOnly";
 const autostartAttemptsKey = "autostartAttempts";
 const autostartMaxAttempts = 10;
@@ -96,6 +100,42 @@ const debugLog = (message) => {
   const ts = new Date().toLocaleTimeString();
   debugPanel.textContent += `[${ts}] ${message}\n`;
   debugPanel.scrollTop = debugPanel.scrollHeight;
+};
+
+const resolveHlsUrl = (baseUrl) => {
+  if (!satelliteUrl) return baseUrl;
+  const filename = baseUrl.split("/").pop();
+  return `${satelliteUrl.replace(/\/$/, "")}/${filename}`;
+};
+
+const fetchSatelliteAssignment = async () => {
+  try {
+    const resp = await fetch("/api/satellite/assign", { cache: "no-store" });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (data.satellite_url) {
+      satelliteUrl = data.satellite_url.replace(/\/$/, "");
+      satelliteAssigned = true;
+      debugLog(`satellite assigned: ${satelliteUrl}`);
+    } else {
+      satelliteUrl = null;
+      satelliteAssigned = false;
+      debugLog("no satellite available, streaming direct");
+    }
+    setActiveMedia();
+  } catch (error) {
+    satelliteUrl = null;
+    satelliteAssigned = false;
+    debugLog(`satellite assign failed, streaming direct: ${error?.message || error}`);
+  }
+};
+
+const fallbackToMainServer = () => {
+  if (!satelliteAssigned) return;
+  debugLog("satellite fallback: reverting to main server");
+  satelliteUrl = null;
+  satelliteAssigned = false;
+  setActiveMedia();
 };
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
@@ -590,9 +630,9 @@ const setActiveMedia = () => {
   }
   mediaEl = audioOnlyEnabled ? audio : video;
   if (audioOnlyEnabled) {
-    activeHlsUrl = audioHlsUrl || "";
+    activeHlsUrl = resolveHlsUrl(audioHlsUrl || "");
   } else {
-    activeHlsUrl = hlsUrl;
+    activeHlsUrl = resolveHlsUrl(hlsUrl);
   }
   resetPlaybackProgressTracking();
   updatePlayerClass();
@@ -702,6 +742,48 @@ const initStats = () => {
     fetchStats();
   });
   setInterval(fetchStats, 60000);
+};
+
+const renderSatelliteTable = (satellites) => {
+  if (!satelliteBody) return;
+  if (!satellites || satellites.length === 0) {
+    satelliteBody.innerHTML = '<tr><td colspan="6" class="satellite-empty">Keine Satelliten verbunden.</td></tr>';
+    return;
+  }
+  satelliteBody.innerHTML = satellites.map((sat) => {
+    const healthClass = sat.healthy ? "sat-healthy" : "sat-unhealthy";
+    const healthLabel = sat.healthy ? "OK" : "Offline";
+    const hbAge = sat.last_heartbeat_age < 60
+      ? `${Math.round(sat.last_heartbeat_age)}s`
+      : `${Math.round(sat.last_heartbeat_age / 60)}m`;
+    return `<tr>
+      <td>${sat.name || sat.id.slice(0, 8)}</td>
+      <td>${sat.viewer_count} / ${sat.capacity_max_viewers}</td>
+      <td>${sat.cpu_percent.toFixed(1)}%</td>
+      <td>${sat.bandwidth_mbps.toFixed(1)} Mbps</td>
+      <td><span class="sat-health ${healthClass}">${healthLabel}</span></td>
+      <td>${hbAge}</td>
+    </tr>`;
+  }).join("");
+};
+
+const fetchSatellites = async () => {
+  if (!satelliteSection) return;
+  try {
+    const resp = await fetch("/api/satellites", { cache: "no-store" });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    renderSatelliteTable(data.satellites || []);
+  } catch (error) {
+    debugLog(`satellite fetch failed: ${error?.message || error}`);
+  }
+};
+
+const initSatellites = () => {
+  if (!satelliteSection) return;
+  satelliteSection.classList.remove("hidden");
+  fetchSatellites();
+  setInterval(fetchSatellites, 10000);
 };
 
 const markStall = () => {
@@ -821,6 +903,7 @@ if (audioOnlyToggle) {
   }
 }
 setActiveMedia();
+fetchSatelliteAssignment();
 setInterval(() => {
   if (tabSuppressed || audioOnlyEnabled || !autostartEnabled || !isLive) return;
   const element = mediaEl;
@@ -845,6 +928,7 @@ setInterval(refreshScheduleUI, 60000);
 if (debugEnabled) {
   if (statsSection) statsSection.classList.remove("hidden");
   initStats();
+  initSatellites();
 } else if (statsSection) {
   statsSection.classList.add("hidden");
 }
@@ -1387,6 +1471,16 @@ const startPlayerWithOptions = ({ forcePlay }) => {
         return;
       }
       if (details === "manifestLoadError" || details === "levelLoadError") {
+        if (satelliteAssigned) {
+          fallbackToMainServer();
+          if (hls) {
+            hls.destroy();
+            hls = null;
+          }
+          started = false;
+          startPlayer();
+          return;
+        }
         if (hls) {
           hls.destroy();
           hls = null;

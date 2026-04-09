@@ -149,6 +149,31 @@
       </div>
     </section>
 
+    <section class="stats{% if not debug_enabled %} hidden{% endif %}" id="satellite-section">
+      <div class="info-card stats-card">
+        <div class="stats-head">
+          <h3>Satelliten</h3>
+        </div>
+        <div class="satellite-table-wrap">
+          <table class="satellite-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Zuschauer</th>
+                <th>CPU</th>
+                <th>Bandbreite</th>
+                <th>Status</th>
+                <th>Heartbeat</th>
+              </tr>
+            </thead>
+            <tbody id="satellite-body">
+              <tr><td colspan="6" class="satellite-empty">Keine Satelliten verbunden.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
     <footer class="footer">
       <a href="{{ footer_url }}" target="_blank" rel="noopener noreferrer">{{ footer_text }}</a> &middot; Streaming
     </footer>

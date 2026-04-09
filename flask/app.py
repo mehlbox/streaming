@@ -5,6 +5,7 @@ import time
 import secrets
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from threading import Lock
@@ -55,6 +56,10 @@ FAVICON_TYPE = get_env_default("FAVICON_TYPE", "image/svg+xml")
 FOOTER_URL = get_env_default("FOOTER_URL", "")
 FOOTER_TEXT = get_env_default("FOOTER_TEXT", "Your Footers Here")
 SCHEDULE_BASE_URL = get_env_default("SCHEDULE_BASE_URL", "/static/data")
+SATELLITE_API_KEY = os.getenv("SATELLITE_API_KEY", "").strip()
+SATELLITE_HEARTBEAT_INTERVAL = int(os.getenv("SATELLITE_HEARTBEAT_INTERVAL", "10"))
+SATELLITE_UNHEALTHY_SECONDS = int(os.getenv("SATELLITE_UNHEALTHY_SECONDS", "30"))
+SATELLITE_PRUNE_SECONDS = int(os.getenv("SATELLITE_PRUNE_SECONDS", "120"))
 DISCONNECT_LOG_ENABLED = parse_bool(os.getenv("DISCONNECT_LOG_ENABLED", "1"))
 DISCONNECT_LOG_PATH = os.getenv(
     "DISCONNECT_LOG_PATH",
@@ -84,6 +89,9 @@ sid_meta = {}
 pending_disconnects = {}
 stats_lock = Lock()
 stats_task_started = False
+satellite_lock = Lock()
+satellites = {}
+satellite_pruner_started = False
 
 disconnect_logger = logging.getLogger("disconnect_debug")
 disconnect_logger.setLevel(logging.INFO)
@@ -270,11 +278,20 @@ def init_stats_db() -> None:
         conn.commit()
 
 
+def total_viewer_count() -> int:
+    with client_lock:
+        count = client_count
+    with satellite_lock:
+        for sat in satellites.values():
+            if time.time() - sat.get("last_heartbeat", 0) <= SATELLITE_UNHEALTHY_SECONDS:
+                count += sat.get("viewer_count", 0)
+    return count
+
+
 def record_stats() -> None:
     init_stats_db()
     while True:
-        with client_lock:
-            count = client_count
+        count = total_viewer_count()
         ts = int(time.time())
         with stats_lock, sqlite3.connect(STATS_DB) as conn:
             conn.execute(
@@ -481,7 +498,154 @@ def status_watcher():
         socketio.sleep(SOCKETIO_POLL_SECONDS)
 
 
+# ---------------------------------------------------------------------------
+# Satellite management
+# ---------------------------------------------------------------------------
+
+def validate_satellite_api_key():
+    if not SATELLITE_API_KEY:
+        abort(403, "Satellite API not configured")
+    data = request.get_json(silent=True) or {}
+    key = data.get("api_key", "")
+    if not isinstance(key, str) or not secrets.compare_digest(key, SATELLITE_API_KEY):
+        abort(403, "Invalid API key")
+    return data
+
+
+def satellite_score(sat):
+    now = time.time()
+    if now - sat.get("last_heartbeat", 0) > SATELLITE_UNHEALTHY_SECONDS:
+        return -1
+    capacity = sat.get("capacity_max_viewers", 100)
+    viewers = sat.get("viewer_count", 0)
+    cpu = sat.get("cpu_percent", 0)
+    headroom = max(0, capacity - viewers)
+    return headroom * (1 - min(cpu, 100) / 100)
+
+
+def satellite_info(sat, now=None):
+    if now is None:
+        now = time.time()
+    age = round(now - sat.get("last_heartbeat", now), 1)
+    healthy = age <= SATELLITE_UNHEALTHY_SECONDS
+    return {
+        "id": sat["id"],
+        "name": sat.get("name", ""),
+        "url": sat.get("url", ""),
+        "viewer_count": sat.get("viewer_count", 0),
+        "cpu_percent": sat.get("cpu_percent", 0),
+        "bandwidth_mbps": sat.get("bandwidth_mbps", 0),
+        "capacity_max_viewers": sat.get("capacity_max_viewers", 100),
+        "last_heartbeat_age": age,
+        "healthy": healthy,
+    }
+
+
+def prune_stale_satellites():
+    while True:
+        now = time.time()
+        cutoff = now - SATELLITE_PRUNE_SECONDS
+        with satellite_lock:
+            stale = [sid for sid, s in satellites.items()
+                     if s.get("last_heartbeat", 0) < cutoff]
+            for sid in stale:
+                satellites.pop(sid, None)
+                app.logger.info("Pruned stale satellite %s", sid)
+        socketio.sleep(15)
+
+
+def ensure_satellite_pruner():
+    global satellite_pruner_started
+    if satellite_pruner_started:
+        return
+    with satellite_lock:
+        if satellite_pruner_started:
+            return
+        satellite_pruner_started = True
+        socketio.start_background_task(prune_stale_satellites)
+
+
+@app.post("/api/satellite/register")
+def satellite_register():
+    data = validate_satellite_api_key()
+    name = shorten(data.get("name", ""), 120)
+    url = shorten(data.get("url", ""), 500)
+    if not url:
+        abort(400, "Missing satellite url")
+    sat_id = str(uuid.uuid4())
+    now = time.time()
+    sat = {
+        "id": sat_id,
+        "name": name,
+        "url": url,
+        "cpu_percent": 0,
+        "bandwidth_mbps": 0,
+        "viewer_count": 0,
+        "capacity_max_viewers": int(data.get("capacity_max_viewers", 100)),
+        "last_heartbeat": now,
+        "registered_at": now,
+    }
+    with satellite_lock:
+        satellites[sat_id] = sat
+    ensure_satellite_pruner()
+    app.logger.info("Satellite registered: %s (%s) at %s", sat_id, name, url)
+    return jsonify({
+        "id": sat_id,
+        "heartbeat_interval": SATELLITE_HEARTBEAT_INTERVAL,
+    })
+
+
+@app.post("/api/satellite/<sat_id>/heartbeat")
+def satellite_heartbeat(sat_id):
+    data = validate_satellite_api_key()
+    with satellite_lock:
+        sat = satellites.get(sat_id)
+        if not sat:
+            abort(404, "Unknown satellite")
+        sat["cpu_percent"] = min(100, max(0, float(data.get("cpu_percent", 0))))
+        sat["bandwidth_mbps"] = max(0, float(data.get("bandwidth_mbps", 0)))
+        sat["viewer_count"] = max(0, int(data.get("viewer_count", 0)))
+        sat["capacity_max_viewers"] = max(1, int(data.get("capacity_max_viewers", sat["capacity_max_viewers"])))
+        sat["last_heartbeat"] = time.time()
+    return jsonify({"ok": True, "stream_active": is_live()})
+
+
+@app.delete("/api/satellite/<sat_id>")
+def satellite_deregister(sat_id):
+    data = validate_satellite_api_key()
+    with satellite_lock:
+        removed = satellites.pop(sat_id, None)
+    if removed:
+        app.logger.info("Satellite deregistered: %s (%s)", sat_id, removed.get("name", ""))
+    return jsonify({"ok": True})
+
+
+@app.get("/api/satellite/assign")
+def satellite_assign():
+    now = time.time()
+    best = None
+    best_score = -1
+    with satellite_lock:
+        for sat in satellites.values():
+            s = satellite_score(sat)
+            if s > best_score:
+                best_score = s
+                best = sat
+    if best and best_score > 0:
+        return jsonify({"satellite_url": best["url"]})
+    return jsonify({"satellite_url": None})
+
+
+@app.get("/api/satellites")
+def satellite_list():
+    now = time.time()
+    with satellite_lock:
+        result = [satellite_info(s, now) for s in satellites.values()]
+    return jsonify({"satellites": result})
+
+
 if __name__ == "__main__":
     socketio.start_background_task(status_watcher)
     ensure_stats_task()
+    ensure_satellite_pruner()
     socketio.run(app, host="0.0.0.0", port=5000, debug=APP_DEBUG, use_reloader=False)
