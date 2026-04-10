@@ -18,7 +18,7 @@
         <div class="brand-meta">
           <div class="kicker">Live Stream</div>
           <h1>{{ site_title }}</h1>
-          <p class="sub">Live aus Speyer.</p>
+          {% if site_subtitle %}<p class="sub">{{ site_subtitle }}</p>{% endif %}
         </div>
       </div>
     </header>

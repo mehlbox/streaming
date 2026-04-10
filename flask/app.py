@@ -48,6 +48,7 @@ SUPPORTED_THEMES = {"stephanus", "ocean", "midnight", "bethaus"}
 if THEME not in SUPPORTED_THEMES:
     THEME = "ocean"
 SITE_TITLE = get_env_default("SITE_TITLE", "docker streaming")
+SITE_SUBTITLE = get_env_default("SITE_SUBTITLE", "")
 PAGE_TITLE = get_env_default("PAGE_TITLE", f"Live Stream - {SITE_TITLE}")
 LOGO_URL = get_env_default("LOGO_URL","",)
 LOGO_ALT = get_env_default("LOGO_ALT", "Your Logo Here")
@@ -126,6 +127,7 @@ def render_index(debug_enabled: bool):
         audio_hls_url=audio_hls_url,
         theme=THEME,
         site_title=SITE_TITLE,
+        site_subtitle=SITE_SUBTITLE,
         page_title=PAGE_TITLE,
         logo_url=LOGO_URL,
         logo_alt=LOGO_ALT,

@@ -21,13 +21,13 @@ services:
       - "traefik.enable=true"
       - "traefik.docker.network=traefik"
       # HTTP router with redirect to HTTPS
-      - "traefik.http.routers.streaming-http.rule=Host(`streaming.bethaus-speyer.de`)"
+      - "traefik.http.routers.streaming-http.rule=Host(`${STREAMING_HOST:-streaming.example.com}`)"
       - "traefik.http.routers.streaming-http.entrypoints=web"
       - "traefik.http.routers.streaming-http.middlewares=redirect-https"
       - "traefik.http.middlewares.redirect-https.redirectscheme.scheme=https"
       - "traefik.http.middlewares.redirect-https.redirectscheme.permanent=true"
       # HTTPS router
-      - "traefik.http.routers.streaming.rule=Host(`streaming.bethaus-speyer.de`)"
+      - "traefik.http.routers.streaming.rule=Host(`${STREAMING_HOST:-streaming.example.com}`)"
       - "traefik.http.routers.streaming.entrypoints=websecure"
       - "traefik.http.routers.streaming.tls.certresolver=myresolver"
       - "traefik.http.services.streaming.loadbalancer.server.port=80"

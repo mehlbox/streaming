@@ -1,4 +1,4 @@
-# Bethaus Speyer Live Stream
+# Live Stream
 
 Simple Flask + Socket.IO frontend for a live HLS stream with viewer count, schedule, and a 1‑hour stats graph.
 
@@ -24,7 +24,7 @@ In OBS Studio:
 
 Settings in OBS:
 
-- **Server**: `rtmp://streaming.bethaus-speyer.de/live?key=YOUR_SECRET`
+- **Server**: `rtmp://streaming.example.com/live?key=YOUR_SECRET`
 - **Stream Key**: `live`
 
 ### 3) Start streaming
@@ -33,6 +33,9 @@ Click **Start Streaming** in OBS. The page will show **Online** once HLS segment
 
 ## Environment variables
 
+- `STREAMING_HOST` (default: `streaming.example.com`; used in Traefik labels)
+- `SITE_TITLE` (default: `docker streaming`)
+- `SITE_SUBTITLE` (optional: subtitle shown below the site title)
 - `STREAM_NAME` (default: `live`)
 - `STREAM_KEY` (default: empty; if set, must match the `key` in OBS)
 - `HLS_DIR` (default: `/var/www/hls`)
