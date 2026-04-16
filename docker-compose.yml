@@ -21,13 +21,13 @@ services:
       - "traefik.enable=true"
       - "traefik.docker.network=traefik"
       # HTTP router with redirect to HTTPS
-      - "traefik.http.routers.streaming-http.rule=Host(`${STREAMING_HOST:-streaming.example.com}`)"
+      - "traefik.http.routers.streaming-http.rule=Host(`${STREAMING_HOST}`)"
       - "traefik.http.routers.streaming-http.entrypoints=web"
       - "traefik.http.routers.streaming-http.middlewares=redirect-https"
       - "traefik.http.middlewares.redirect-https.redirectscheme.scheme=https"
       - "traefik.http.middlewares.redirect-https.redirectscheme.permanent=true"
       # HTTPS router
-      - "traefik.http.routers.streaming.rule=Host(`${STREAMING_HOST:-streaming.example.com}`)"
+      - "traefik.http.routers.streaming.rule=Host(`${STREAMING_HOST}`)"
       - "traefik.http.routers.streaming.entrypoints=websecure"
       - "traefik.http.routers.streaming.tls.certresolver=myresolver"
       - "traefik.http.services.streaming.loadbalancer.server.port=80"
@@ -93,7 +93,7 @@ services:
     volumes:
       - ./satellite/nginx.conf:/etc/nginx/nginx.conf.template:ro
     environment:
-      - MAIN_SERVER_INTERNAL_URL=${MAIN_SERVER_INTERNAL_URL:-http://host.docker.internal}
+      - MAIN_SERVER_INTERNAL_URL=${MAIN_SERVER_INTERNAL_URL}
     ports:
       - "${SATELLITE_PORT:-8080}:80"
     command: >

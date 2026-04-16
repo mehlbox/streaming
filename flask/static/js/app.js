@@ -521,7 +521,6 @@ const updateOfflineMessage = () => {
   if (!offlineTitleEl || !offlineSubEl) return;
   if (!scheduleData.length) {
     offlineTitleEl.textContent = "Stream offline";
-    offlineSubEl.textContent = "Derzeit ist kein Stream geplant.";
     return;
   }
   const now = new Date();
@@ -544,7 +543,6 @@ const updateOfflineMessage = () => {
     return;
   }
   offlineTitleEl.textContent = "Stream offline";
-  offlineSubEl.textContent = "Derzeit ist kein weiterer Stream geplant.";
 };
 
 const refreshScheduleUI = () => {
