@@ -1,6 +1,5 @@
 import os
 import ipaddress
-import sqlite3
 import time
 import secrets
 import json
@@ -38,7 +37,6 @@ SOCKETIO_PING_TIMEOUT = float(os.getenv("SOCKETIO_PING_TIMEOUT", "60"))
 DISCONNECT_RECONNECT_WINDOW_SECONDS = float(
     os.getenv("DISCONNECT_RECONNECT_WINDOW_SECONDS", "10")
 )
-STATS_DB = os.getenv("STATS_DB", "/docker/streaming/flask/stats.db")
 STATS_SAMPLE_SECONDS = int(os.getenv("STATS_SAMPLE_SECONDS", "60"))
 AUDIO_STREAM_NAME = os.getenv("AUDIO_STREAM_NAME", "").strip()
 AUDIO_HLS_URL = os.getenv("AUDIO_HLS_URL", "").strip()
@@ -89,6 +87,7 @@ sid_to_session = {}
 sid_meta = {}
 pending_disconnects = {}
 stats_lock = Lock()
+stats_data: dict[int, int] = {}
 stats_task_started = False
 satellite_lock = Lock()
 satellites = {}
@@ -270,16 +269,6 @@ def audio_status():
     return jsonify({"live": is_audio_live()})
 
 
-def init_stats_db() -> None:
-    db_path = Path(STATS_DB)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS stats (ts INTEGER PRIMARY KEY, count INTEGER NOT NULL)"
-        )
-        conn.commit()
-
-
 def total_viewer_count() -> int:
     with client_lock:
         count = client_count
@@ -291,18 +280,14 @@ def total_viewer_count() -> int:
 
 
 def record_stats() -> None:
-    init_stats_db()
     while True:
         count = total_viewer_count()
         ts = int(time.time())
-        with stats_lock, sqlite3.connect(STATS_DB) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO stats (ts, count) VALUES (?, ?)",
-                (ts, count),
-            )
-            cutoff = ts - 60 * 60 * 24
-            conn.execute("DELETE FROM stats WHERE ts < ?", (cutoff,))
-            conn.commit()
+        cutoff = ts - 60 * 60 * 24
+        with stats_lock:
+            stats_data[ts] = count
+            for old_ts in [k for k in stats_data if k < cutoff]:
+                del stats_data[old_ts]
         socketio.sleep(STATS_SAMPLE_SECONDS)
 
 
@@ -467,18 +452,14 @@ def client_log():
 
 @app.get("/stats")
 def stats():
-    init_stats_db()
     minutes = request.args.get("minutes", "60")
     try:
         minutes_int = max(1, min(240, int(minutes)))
     except ValueError:
         minutes_int = 60
     cutoff = int(time.time()) - minutes_int * 60
-    with stats_lock, sqlite3.connect(STATS_DB) as conn:
-        rows = conn.execute(
-            "SELECT ts, count FROM stats WHERE ts >= ? ORDER BY ts",
-            (cutoff,),
-        ).fetchall()
+    with stats_lock:
+        rows = sorted((ts, count) for ts, count in stats_data.items() if ts >= cutoff)
     return jsonify(
         {
             "points": [{"ts": ts, "count": count} for ts, count in rows],
