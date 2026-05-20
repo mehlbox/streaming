@@ -8,7 +8,7 @@ from pathlib import Path
 from threading import Lock, Thread
 from urllib.parse import parse_qs, urlparse
 
-from flask import Flask, abort, jsonify, render_template, request, session, url_for
+from flask import Flask, abort, jsonify, render_template, request, url_for
 
 def get_env_default(key: str, default: str) -> str:
     value = os.getenv(key, "").strip()
@@ -45,14 +45,6 @@ STATE_CACHE_SECONDS = max(
     5.0,
     float(os.getenv("STATE_CACHE_SECONDS", "10")),
 )
-PRESENCE_UPDATE_SECONDS = max(
-    30.0,
-    float(os.getenv("PRESENCE_UPDATE_SECONDS", "60")),
-)
-PRESENCE_REQUEST_MIN_SECONDS = max(
-    2.0,
-    float(os.getenv("PRESENCE_REQUEST_MIN_SECONDS", "5")),
-)
 STATS_SAMPLE_SECONDS = int(os.getenv("STATS_SAMPLE_SECONDS", "60"))
 AUDIO_STREAM_NAME = os.getenv("AUDIO_STREAM_NAME", "").strip()
 AUDIO_HLS_URL = os.getenv("AUDIO_HLS_URL", "").strip()
@@ -75,10 +67,6 @@ SATELLITE_API_KEY = os.getenv("SATELLITE_API_KEY", "").strip()
 SATELLITE_HEARTBEAT_INTERVAL = int(os.getenv("SATELLITE_HEARTBEAT_INTERVAL", "10"))
 SATELLITE_UNHEALTHY_SECONDS = int(os.getenv("SATELLITE_UNHEALTHY_SECONDS", "30"))
 SATELLITE_PRUNE_SECONDS = int(os.getenv("SATELLITE_PRUNE_SECONDS", "120"))
-VIEWER_PRESENCE_TTL_SECONDS = max(
-    120.0,
-    float(os.getenv("VIEWER_PRESENCE_TTL_SECONDS", "180")),
-)
 APP_DEBUG = parse_bool(os.getenv("APP_DEBUG", "0"))
 
 db_lock = Lock()
@@ -88,12 +76,9 @@ state_snapshot = {
     "live": False,
     "audio_live": False,
     "count": 0,
-    "local_count": 0,
 }
 state_task_started = False
 maintenance_task_started = False
-presence_request_lock = Lock()
-presence_request_tracker: dict[str, float] = {}
 
 
 def connect_db() -> sqlite3.Connection:
@@ -158,20 +143,7 @@ def init_db() -> None:
         db_ready = True
 
 
-def ensure_viewer_context() -> tuple[str, str]:
-    viewer_id = session.get("viewer_id", "").strip()
-    if not viewer_id:
-        viewer_id = secrets.token_urlsafe(16)
-        session["viewer_id"] = viewer_id
-    presence_token = session.get("presence_token", "").strip()
-    if not presence_token:
-        presence_token = secrets.token_urlsafe(24)
-        session["presence_token"] = presence_token
-    return viewer_id, presence_token
-
-
 def render_index(debug_enabled: bool):
-    _, presence_token = ensure_viewer_context()
     audio_hls_url = None
     if AUDIO_HLS_URL:
         audio_hls_url = AUDIO_HLS_URL
@@ -195,7 +167,6 @@ def render_index(debug_enabled: bool):
         footer_url=FOOTER_URL,
         footer_text=FOOTER_TEXT,
         schedule_base_url=SCHEDULE_BASE_URL,
-        presence_token=presence_token,
     )
 
 
@@ -229,13 +200,6 @@ def is_audio_live() -> bool:
     return age <= HLS_STALE_SECONDS
 
 
-def client_ip() -> str:
-    xff = request.headers.get("X-Forwarded-For", "")
-    if xff:
-        return xff.split(",", 1)[0].strip()
-    return request.headers.get("X-Real-IP", "") or request.remote_addr or ""
-
-
 def is_private_addr(addr: str) -> bool:
     if not addr:
         return False
@@ -262,85 +226,6 @@ def shorten(value, max_len: int = 240):
     return text[: max_len - 3] + "..."
 
 
-def prune_presence_requests(now: float) -> None:
-    cutoff = now - max(PRESENCE_UPDATE_SECONDS * 2, 300.0)
-    stale_keys = [key for key, seen_at in presence_request_tracker.items() if seen_at < cutoff]
-    for key in stale_keys:
-        presence_request_tracker.pop(key, None)
-
-
-def allow_presence_request(session_id: str, remote_ip: str) -> bool:
-    now = time.time()
-    key = f"{session_id}:{remote_ip}"
-    with presence_request_lock:
-        prune_presence_requests(now)
-        last_seen = presence_request_tracker.get(key, 0.0)
-        if now - last_seen < PRESENCE_REQUEST_MIN_SECONDS:
-            return False
-        presence_request_tracker[key] = now
-        return True
-
-
-def validate_same_origin() -> None:
-    origin = request.headers.get("Origin", "").strip()
-    if origin and urlparse(origin).netloc != request.host:
-        abort(403)
-    referer = request.headers.get("Referer", "").strip()
-    if referer and urlparse(referer).netloc and urlparse(referer).netloc != request.host:
-        abort(403)
-
-
-def validate_presence_token() -> str:
-    session_id, session_token = ensure_viewer_context()
-    submitted_token = request.headers.get("X-Presence-Token", "").strip()
-    if not submitted_token:
-        payload = request.get_json(silent=True) or {}
-        submitted_token = str(payload.get("token", "")).strip()
-    if not submitted_token or not secrets.compare_digest(submitted_token, session_token):
-        abort(403)
-    return session_id
-
-
-def prune_stale_viewers(conn: sqlite3.Connection, now: int) -> None:
-    cutoff = now - int(VIEWER_PRESENCE_TTL_SECONDS)
-    conn.execute("DELETE FROM viewer_presence WHERE last_seen < ?", (cutoff,))
-
-
-def local_viewer_count(now: int | None = None) -> int:
-    init_db()
-    current = int(time.time()) if now is None else int(now)
-    with connect_db() as conn:
-        with conn:
-            prune_stale_viewers(conn, current)
-            row = conn.execute("SELECT COUNT(*) AS count FROM viewer_presence").fetchone()
-    return int(row["count"]) if row else 0
-
-
-def mark_viewer_present(session_id: str, remote_ip: str) -> bool:
-    init_db()
-    now = int(time.time())
-    cutoff = now - int(PRESENCE_UPDATE_SECONDS)
-    with connect_db() as conn:
-        row = conn.execute(
-            "SELECT last_seen FROM viewer_presence WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
-        if row and int(row["last_seen"]) >= cutoff:
-            return False
-        with conn:
-            conn.execute(
-                """
-                INSERT INTO viewer_presence(session_id, last_seen, remote_ip)
-                VALUES(?, ?, ?)
-                ON CONFLICT(session_id) DO UPDATE SET
-                    last_seen = excluded.last_seen,
-                    remote_ip = excluded.remote_ip
-                """,
-                (session_id, now, remote_ip),
-            )
-    return True
-
-
 def healthy_satellite_viewer_count(now: float | None = None) -> int:
     init_db()
     current = time.time() if now is None else now
@@ -357,9 +242,8 @@ def healthy_satellite_viewer_count(now: float | None = None) -> int:
     return int(row["count"]) if row else 0
 
 
-def total_viewer_count(local_count: int | None = None) -> int:
-    count = local_count if local_count is not None else local_viewer_count()
-    return count + healthy_satellite_viewer_count()
+def total_viewer_count() -> int:
+    return healthy_satellite_viewer_count()
 
 
 def current_state_snapshot() -> dict[str, int | bool]:
@@ -368,12 +252,10 @@ def current_state_snapshot() -> dict[str, int | bool]:
 
 
 def refresh_state_snapshot() -> None:
-    local_count = local_viewer_count()
     snapshot = {
         "live": is_live(),
         "audio_live": is_audio_live(),
-        "count": total_viewer_count(local_count=local_count),
-        "local_count": local_count,
+        "count": total_viewer_count(),
     }
     with state_lock:
         state_snapshot.update(snapshot)
@@ -441,6 +323,7 @@ def ensure_maintenance_tasks() -> None:
 @app.get("/status")
 def status():
     ensure_state_task()
+    ensure_maintenance_tasks()
     return jsonify(current_state_snapshot())
 
 
@@ -448,21 +331,6 @@ def status():
 def audio_status():
     ensure_state_task()
     return jsonify({"live": current_state_snapshot()["audio_live"]})
-
-
-@app.post("/presence")
-def presence():
-    validate_same_origin()
-    session_id = validate_presence_token()
-    remote_ip = client_ip()
-    ensure_state_task()
-    ensure_maintenance_tasks()
-    if not allow_presence_request(session_id, remote_ip):
-        return jsonify({"ok": True, "updated": False, **current_state_snapshot()})
-    updated = mark_viewer_present(session_id, remote_ip)
-    if updated:
-        refresh_state_snapshot()
-    return jsonify({"ok": True, "updated": updated, **current_state_snapshot()})
 
 
 @app.post("/auth")

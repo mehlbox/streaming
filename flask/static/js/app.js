@@ -31,13 +31,11 @@ const statsSection = document.getElementById("stats-section");
 const satelliteSection = document.getElementById("satellite-section");
 const satelliteBody = document.getElementById("satellite-body");
 const statusUrl = document.body?.dataset?.statusUrl || "/status";
-const presenceUrl = document.body?.dataset?.presenceUrl || "/presence";
-const presenceToken = document.body?.dataset?.presenceToken || "";
-const scheduleLocale = "de-DE";
+const audioStatusUrl = document.body?.dataset?.audioStatusUrl || "/audio-status";
 const scheduleTheme = document.documentElement?.dataset?.theme || "ocean";
 const scheduleBaseUrl = (document.body?.dataset?.scheduleBaseUrl || "/data").replace(/\/$/, "");
 const scheduleUrl = document.body?.dataset?.scheduleUrl || `${scheduleBaseUrl}/schedule-${scheduleTheme}.json`;
-const audioStatusUrl = document.body?.dataset?.audioStatusUrl || "/audio-status";
+const scheduleLocale = "de-DE";
 const clientLogUrl = document.body?.dataset?.clientLogUrl || "/client-log";
 const audioOnlyForced = document.body?.dataset?.audioOnly === "1";
 const timeFormatter = new Intl.DateTimeFormat(scheduleLocale, { hour: "2-digit", minute: "2-digit" });
@@ -61,6 +59,9 @@ let mediaRecoveryAttempts = 0;
 let lastMediaRecoveryAt = 0;
 let satelliteUrl = null;
 let satelliteAssigned = false;
+let satelliteAssignAttempts = 0;
+const satelliteAssignMaxAttempts = 5;
+const satelliteAssignRetryMs = 15000;
 const audioOnlyStorageKey = "audioOnly";
 const autostartAttemptsKey = "autostartAttempts";
 const autostartStorageKey = "autostartEnabled";
@@ -77,7 +78,6 @@ const stallRecoveryCooldownMs = 4000;
 const playbackProgressEpsilonSeconds = 0.12;
 const playbackProgressGraceMs = 15000;
 const statusPollIntervalMs = 10000;
-const presenceHeartbeatIntervalMs = 60000;
 const statusFailureGraceMs = 20000;
 let allowAutoplay = true;
 const debugEnabled = document.body?.dataset?.debug === "1";
@@ -121,15 +121,29 @@ const fetchSatelliteAssignment = async () => {
     if (!resp.ok) return;
     const data = await resp.json();
     if (data.satellite_url) {
-      satelliteUrl = data.satellite_url.replace(/\/$/, "");
-      satelliteAssigned = true;
-      debugLog(`satellite assigned: ${satelliteUrl}`);
+      const assignedUrl = data.satellite_url.replace(/\/$/, "");
+      satelliteAssignAttempts = satelliteAssignMaxAttempts;
+      if (assignedUrl === window.location.origin) {
+        satelliteUrl = null;
+        satelliteAssigned = false;
+        debugLog("using main server (local satellite)");
+      } else {
+        satelliteUrl = assignedUrl;
+        satelliteAssigned = true;
+        debugLog(`satellite assigned: ${satelliteUrl}`);
+      }
+      setActiveMedia();
     } else {
-      satelliteUrl = null;
-      satelliteAssigned = false;
-      debugLog("no satellite available, streaming direct");
+      satelliteAssignAttempts++;
+      if (satelliteAssignAttempts < satelliteAssignMaxAttempts) {
+        debugLog(`no satellite yet, retry ${satelliteAssignAttempts}/${satelliteAssignMaxAttempts} in ${satelliteAssignRetryMs / 1000}s`);
+        setTimeout(fetchSatelliteAssignment, satelliteAssignRetryMs);
+      } else {
+        satelliteUrl = null;
+        satelliteAssigned = false;
+        debugLog("no satellite available, streaming direct");
+      }
     }
-    setActiveMedia();
   } catch (error) {
     satelliteUrl = null;
     satelliteAssigned = false;
@@ -747,11 +761,13 @@ const initStats = () => {
 };
 
 const renderSatelliteTable = (satellites) => {
-  if (!satelliteBody) return;
+  if (!satelliteBody || !debugEnabled) return;
   if (!satellites || satellites.length === 0) {
-    satelliteBody.innerHTML = '<tr><td colspan="6" class="satellite-empty">Keine Satelliten verbunden.</td></tr>';
+    if (satelliteSection) satelliteSection.classList.remove("hidden");
+    satelliteBody.innerHTML = '<tr><td colspan="6" class="satellite-empty">Keine Server verbunden.</td></tr>';
     return;
   }
+  if (satelliteSection) satelliteSection.classList.remove("hidden");
   satelliteBody.innerHTML = satellites.map((sat) => {
     const healthClass = sat.healthy ? "sat-healthy" : "sat-unhealthy";
     const healthLabel = sat.healthy ? "OK" : "Offline";
@@ -782,8 +798,7 @@ const fetchSatellites = async () => {
 };
 
 const initSatellites = () => {
-  if (!satelliteSection) return;
-  satelliteSection.classList.remove("hidden");
+  if (!satelliteSection || !debugEnabled) return;
   fetchSatellites();
   setInterval(fetchSatellites, 10000);
 };
@@ -931,10 +946,10 @@ setInterval(refreshScheduleUI, 60000);
 if (debugEnabled) {
   if (statsSection) statsSection.classList.remove("hidden");
   initStats();
-  initSatellites();
 } else if (statsSection) {
   statsSection.classList.add("hidden");
 }
+initSatellites();
 document.addEventListener("visibilitychange", syncAudioVisualizer);
 
 if (autostartToggle) {
@@ -1616,32 +1631,5 @@ const pollStatus = async () => {
   }
 };
 
-const sendPresenceHeartbeat = async () => {
-  if (!presenceToken) return;
-  try {
-    const response = await fetch(presenceUrl, {
-      method: "POST",
-      cache: "no-store",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Presence-Token": presenceToken
-      },
-      body: JSON.stringify({})
-    });
-    if (!response.ok) {
-      throw new Error(`presence heartbeat failed: ${response.status}`);
-    }
-  } catch (error) {
-    debugLog(`presence heartbeat failed: ${error?.message || error}`);
-    emitClientDebug(
-      "presence_heartbeat_failed",
-      { message: error?.message || String(error) },
-      { throttleMs: 30000, sendHttpFallback: true }
-    );
-  }
-};
-
 pollStatus();
-sendPresenceHeartbeat();
 setInterval(pollStatus, statusPollIntervalMs);
-setInterval(sendPresenceHeartbeat, presenceHeartbeatIntervalMs);

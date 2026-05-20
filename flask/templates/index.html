@@ -11,7 +11,7 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}" />
   <link rel="icon" href="{{ favicon_url }}" type="{{ favicon_type }}" />
 </head>
-<body{% if not audio_only %} data-hls-url="{{ hls_url }}"{% endif %}{% if audio_hls_url %} data-audio-hls-url="{{ audio_hls_url }}"{% endif %} data-audio-only="{{ '1' if audio_only else '0' }}" data-status-url="{{ url_for('status') }}" data-audio-status-url="{{ url_for('audio_status') }}" data-presence-url="{{ url_for('presence') }}" data-presence-token="{{ presence_token }}" data-client-log-url="{{ url_for('client_log') }}" data-debug="{{ '1' if debug_enabled else '0' }}" data-schedule-base-url="{{ schedule_base_url }}">
+<body{% if not audio_only %} data-hls-url="{{ hls_url }}"{% endif %}{% if audio_hls_url %} data-audio-hls-url="{{ audio_hls_url }}"{% endif %} data-audio-only="{{ '1' if audio_only else '0' }}" data-status-url="{{ url_for('status') }}" data-audio-status-url="{{ url_for('audio_status') }}" data-client-log-url="{{ url_for('client_log') }}" data-debug="{{ '1' if debug_enabled else '0' }}" data-schedule-base-url="{{ schedule_base_url }}">
 
   <!-- Skip to main content -->
   <a href="#main" class="sr-only">Zum Hauptinhalt springen</a>
@@ -168,7 +168,7 @@
     </section>
 
     <!-- Satellites Section (Debug) -->
-    <section class="satellites-section{% if not debug_enabled %} hidden{% endif %}" id="satellite-section">
+    <section class="satellites-section hidden" id="satellite-section">
       <div class="container">
         <h2 class="section-title">Server-Status</h2>
         <div class="table-wrapper">

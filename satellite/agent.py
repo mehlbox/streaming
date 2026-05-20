@@ -10,6 +10,8 @@ Env vars:
   SATELLITE_MAX_VIEWERS    Max viewer capacity (default 200)
   HEARTBEAT_INTERVAL       Seconds between heartbeats (overridden by server)
   NGINX_STATUS_URL         Local nginx stub_status URL (default http://127.0.0.1:80/nginx-status)
+  HLS_ACCESS_LOG           Path to nginx HLS access log (IP + msec format); if set, used instead of stub_status
+  HLS_VIEWER_WINDOW        Seconds of rolling window for unique-IP counting (default 15)
 """
 
 import os
@@ -36,6 +38,8 @@ SATELLITE_PUBLIC_URL = os.environ.get("SATELLITE_PUBLIC_URL", "")
 MAX_VIEWERS = int(os.environ.get("SATELLITE_MAX_VIEWERS", "200"))
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "10"))
 NGINX_STATUS_URL = os.environ.get("NGINX_STATUS_URL", "http://127.0.0.1:80/nginx-status")
+HLS_ACCESS_LOG = os.environ.get("HLS_ACCESS_LOG", "").strip()
+HLS_VIEWER_WINDOW = int(os.environ.get("HLS_VIEWER_WINDOW", "15"))
 
 satellite_id = None
 running = True
@@ -52,6 +56,36 @@ def get_active_connections():
     except Exception:
         pass
     return 0
+
+
+def get_hls_viewer_count():
+    """Count unique IPs in HLS access log within rolling window. Falls back to stub_status."""
+    if not HLS_ACCESS_LOG or not os.path.exists(HLS_ACCESS_LOG):
+        return get_active_connections()
+    now = time.time()
+    cutoff = now - HLS_VIEWER_WINDOW
+    unique_ips = set()
+    try:
+        with open(HLS_ACCESS_LOG, "rb") as f:
+            f.seek(0, 2)
+            file_size = f.tell()
+            offset = max(0, file_size - 65536)  # read last 64 KB
+            f.seek(offset)
+            data = f.read().decode("utf-8", errors="ignore")
+        lines = data.splitlines()
+        if offset > 0:
+            lines = lines[1:]  # skip potentially incomplete first line
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    if float(parts[1]) >= cutoff:
+                        unique_ips.add(parts[0])
+                except ValueError:
+                    pass
+    except Exception:
+        return get_active_connections()
+    return len(unique_ips)
 
 
 def get_bandwidth_mbps():
@@ -95,7 +129,7 @@ def heartbeat(sat_id, interval):
     url = f"{MAIN_SERVER_URL}/api/satellite/{sat_id}/heartbeat"
     while running:
         cpu = psutil.cpu_percent(interval=0)
-        viewers = get_active_connections()
+        viewers = get_hls_viewer_count()
         bandwidth = get_bandwidth_mbps()
         payload = {
             "api_key": API_KEY,

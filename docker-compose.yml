@@ -11,6 +11,7 @@ services:
       - ./flask/static:/var/www/static:ro
       - ./data:/var/www/data:ro
       - hls_data:/var/www/hls
+      - hls_logs:/tmp/hls-logs
     depends_on:
       web:
         condition: service_healthy
@@ -106,6 +107,34 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  main-agent:
+    image: python:3.12-slim
+    container_name: main-satellite-agent
+    profiles: ["main"]
+    env_file:
+      - .env
+    environment:
+      - MAIN_SERVER_URL=http://web:5000
+      - NGINX_STATUS_URL=http://nginx/nginx-status
+      - SATELLITE_PUBLIC_URL=https://${STREAMING_HOST}
+      - SATELLITE_NAME=main
+      - HLS_ACCESS_LOG=/hls-logs/hls.log
+    working_dir: /agent
+    volumes:
+      - ./satellite:/agent:ro
+      - hls_logs:/hls-logs:ro
+    command: >
+      sh -c "
+        pip install --no-cache-dir -r requirements.txt &&
+        python agent.py
+      "
+    depends_on:
+      web:
+        condition: service_healthy
+      nginx:
+        condition: service_healthy
+    restart: unless-stopped
+
   satellite-agent:
     image: python:3.12-slim
     container_name: satellite-agent
@@ -127,6 +156,7 @@ services:
 
 volumes:
   hls_data:
+  hls_logs:
 
 networks:
   traefik:
