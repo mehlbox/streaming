@@ -1,6 +1,7 @@
 import ipaddress
 import os
 import secrets
+import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -29,6 +30,19 @@ STREAM_NAME = os.getenv("STREAM_NAME", "live")
 STREAM_KEY = os.getenv("STREAM_KEY", "").strip()
 HLS_DIR = os.getenv("HLS_DIR", "/var/www/hls")
 HLS_STALE_SECONDS = int(os.getenv("HLS_STALE_SECONDS", "15"))
+STATE_DB = os.getenv("STATE_DB", "/app/state.db").strip() or "/app/state.db"
+STATE_CACHE_SECONDS = max(
+    5.0,
+    float(os.getenv("STATE_CACHE_SECONDS", "10")),
+)
+PRESENCE_UPDATE_SECONDS = max(
+    30.0,
+    float(os.getenv("PRESENCE_UPDATE_SECONDS", "60")),
+)
+PRESENCE_REQUEST_MIN_SECONDS = max(
+    2.0,
+    float(os.getenv("PRESENCE_REQUEST_MIN_SECONDS", "5")),
+)
 STATS_SAMPLE_SECONDS = int(os.getenv("STATS_SAMPLE_SECONDS", "60"))
 AUDIO_STREAM_NAME = os.getenv("AUDIO_STREAM_NAME", "").strip()
 AUDIO_HLS_URL = os.getenv("AUDIO_HLS_URL", "").strip()
@@ -52,31 +66,102 @@ SATELLITE_HEARTBEAT_INTERVAL = int(os.getenv("SATELLITE_HEARTBEAT_INTERVAL", "10
 SATELLITE_UNHEALTHY_SECONDS = int(os.getenv("SATELLITE_UNHEALTHY_SECONDS", "30"))
 SATELLITE_PRUNE_SECONDS = int(os.getenv("SATELLITE_PRUNE_SECONDS", "120"))
 VIEWER_PRESENCE_TTL_SECONDS = max(
-    30.0,
-    float(os.getenv("VIEWER_PRESENCE_TTL_SECONDS", "45")),
+    120.0,
+    float(os.getenv("VIEWER_PRESENCE_TTL_SECONDS", "180")),
 )
 APP_DEBUG = parse_bool(os.getenv("APP_DEBUG", "0"))
 
-viewer_lock = Lock()
-viewer_sessions: dict[str, float] = {}
-stats_lock = Lock()
-stats_data: dict[int, int] = {}
-stats_task_started = False
-satellite_lock = Lock()
-satellites = {}
-satellite_pruner_started = False
+db_lock = Lock()
+db_ready = False
+state_lock = Lock()
+state_snapshot = {
+    "live": False,
+    "audio_live": False,
+    "count": 0,
+    "local_count": 0,
+}
+state_task_started = False
+maintenance_task_started = False
+presence_request_lock = Lock()
+presence_request_tracker: dict[str, float] = {}
 
 
-def ensure_viewer_id() -> str:
+def connect_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(STATE_DB, timeout=5)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    return conn
+
+
+def init_db() -> None:
+    global db_ready
+    if db_ready:
+        return
+    with db_lock:
+        if db_ready:
+            return
+        db_path = Path(STATE_DB)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        with connect_db() as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS viewer_presence (
+                    session_id TEXT PRIMARY KEY,
+                    last_seen INTEGER NOT NULL,
+                    remote_ip TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_viewer_presence_last_seen "
+                "ON viewer_presence(last_seen)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS viewer_stats (
+                    ts INTEGER PRIMARY KEY,
+                    count INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS satellites (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL DEFAULT '',
+                    url TEXT NOT NULL,
+                    cpu_percent REAL NOT NULL DEFAULT 0,
+                    bandwidth_mbps REAL NOT NULL DEFAULT 0,
+                    viewer_count INTEGER NOT NULL DEFAULT 0,
+                    capacity_max_viewers INTEGER NOT NULL DEFAULT 100,
+                    last_heartbeat REAL NOT NULL,
+                    registered_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_satellites_last_heartbeat "
+                "ON satellites(last_heartbeat)"
+            )
+        db_ready = True
+
+
+def ensure_viewer_context() -> tuple[str, str]:
     viewer_id = session.get("viewer_id", "").strip()
     if not viewer_id:
         viewer_id = secrets.token_urlsafe(16)
         session["viewer_id"] = viewer_id
-    return viewer_id
+    presence_token = session.get("presence_token", "").strip()
+    if not presence_token:
+        presence_token = secrets.token_urlsafe(24)
+        session["presence_token"] = presence_token
+    return viewer_id, presence_token
 
 
 def render_index(debug_enabled: bool):
-    ensure_viewer_id()
+    _, presence_token = ensure_viewer_context()
     audio_hls_url = None
     if AUDIO_HLS_URL:
         audio_hls_url = AUDIO_HLS_URL
@@ -100,6 +185,7 @@ def render_index(debug_enabled: bool):
         footer_url=FOOTER_URL,
         footer_text=FOOTER_TEXT,
         schedule_base_url=SCHEDULE_BASE_URL,
+        presence_token=presence_token,
     )
 
 
@@ -133,6 +219,13 @@ def is_audio_live() -> bool:
     return age <= HLS_STALE_SECONDS
 
 
+def client_ip() -> str:
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",", 1)[0].strip()
+    return request.headers.get("X-Real-IP", "") or request.remote_addr or ""
+
+
 def is_private_addr(addr: str) -> bool:
     if not addr:
         return False
@@ -159,83 +252,207 @@ def shorten(value, max_len: int = 240):
     return text[: max_len - 3] + "..."
 
 
-def prune_viewers_locked(now: float) -> None:
-    cutoff = now - VIEWER_PRESENCE_TTL_SECONDS
-    stale = [session_id for session_id, last_seen in viewer_sessions.items() if last_seen < cutoff]
-    for session_id in stale:
-        viewer_sessions.pop(session_id, None)
+def prune_presence_requests(now: float) -> None:
+    cutoff = now - max(PRESENCE_UPDATE_SECONDS * 2, 300.0)
+    stale_keys = [key for key, seen_at in presence_request_tracker.items() if seen_at < cutoff]
+    for key in stale_keys:
+        presence_request_tracker.pop(key, None)
 
 
-def local_viewer_count(now: float | None = None) -> int:
-    current = time.time() if now is None else now
-    with viewer_lock:
-        prune_viewers_locked(current)
-        return len(viewer_sessions)
-
-
-def mark_viewer_present() -> int:
+def allow_presence_request(session_id: str, remote_ip: str) -> bool:
     now = time.time()
-    session_id = ensure_viewer_id()
-    with viewer_lock:
-        prune_viewers_locked(now)
-        viewer_sessions[session_id] = now
-        return len(viewer_sessions)
+    key = f"{session_id}:{remote_ip}"
+    with presence_request_lock:
+        prune_presence_requests(now)
+        last_seen = presence_request_tracker.get(key, 0.0)
+        if now - last_seen < PRESENCE_REQUEST_MIN_SECONDS:
+            return False
+        presence_request_tracker[key] = now
+        return True
 
 
-@app.get("/status")
-def status():
-    return jsonify({"live": is_live(), "audio_live": is_audio_live()})
+def validate_same_origin() -> None:
+    origin = request.headers.get("Origin", "").strip()
+    if origin and urlparse(origin).netloc != request.host:
+        abort(403)
+    referer = request.headers.get("Referer", "").strip()
+    if referer and urlparse(referer).netloc and urlparse(referer).netloc != request.host:
+        abort(403)
 
 
-@app.get("/audio-status")
-def audio_status():
-    return jsonify({"live": is_audio_live()})
+def validate_presence_token() -> str:
+    session_id, session_token = ensure_viewer_context()
+    submitted_token = request.headers.get("X-Presence-Token", "").strip()
+    if not submitted_token:
+        payload = request.get_json(silent=True) or {}
+        submitted_token = str(payload.get("token", "")).strip()
+    if not submitted_token or not secrets.compare_digest(submitted_token, session_token):
+        abort(403)
+    return session_id
 
 
-@app.get("/presence")
-def presence():
-    local_count = mark_viewer_present()
-    return jsonify(
-        {
-            "live": is_live(),
-            "audio_live": is_audio_live(),
-            "count": total_viewer_count(local_count=local_count),
-            "local_count": local_count,
-        }
-    )
+def prune_stale_viewers(conn: sqlite3.Connection, now: int) -> None:
+    cutoff = now - int(VIEWER_PRESENCE_TTL_SECONDS)
+    conn.execute("DELETE FROM viewer_presence WHERE last_seen < ?", (cutoff,))
+
+
+def local_viewer_count(now: int | None = None) -> int:
+    init_db()
+    current = int(time.time()) if now is None else int(now)
+    with connect_db() as conn:
+        with conn:
+            prune_stale_viewers(conn, current)
+            row = conn.execute("SELECT COUNT(*) AS count FROM viewer_presence").fetchone()
+    return int(row["count"]) if row else 0
+
+
+def mark_viewer_present(session_id: str, remote_ip: str) -> bool:
+    init_db()
+    now = int(time.time())
+    cutoff = now - int(PRESENCE_UPDATE_SECONDS)
+    with connect_db() as conn:
+        row = conn.execute(
+            "SELECT last_seen FROM viewer_presence WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if row and int(row["last_seen"]) >= cutoff:
+            return False
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO viewer_presence(session_id, last_seen, remote_ip)
+                VALUES(?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    last_seen = excluded.last_seen,
+                    remote_ip = excluded.remote_ip
+                """,
+                (session_id, now, remote_ip),
+            )
+    return True
+
+
+def healthy_satellite_viewer_count(now: float | None = None) -> int:
+    init_db()
+    current = time.time() if now is None else now
+    cutoff = current - SATELLITE_UNHEALTHY_SECONDS
+    with connect_db() as conn:
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(viewer_count), 0) AS count
+            FROM satellites
+            WHERE last_heartbeat >= ?
+            """,
+            (cutoff,),
+        ).fetchone()
+    return int(row["count"]) if row else 0
 
 
 def total_viewer_count(local_count: int | None = None) -> int:
     count = local_count if local_count is not None else local_viewer_count()
-    now = time.time()
-    with satellite_lock:
-        for sat in satellites.values():
-            if now - sat.get("last_heartbeat", 0) <= SATELLITE_UNHEALTHY_SECONDS:
-                count += sat.get("viewer_count", 0)
-    return count
+    return count + healthy_satellite_viewer_count()
+
+
+def current_state_snapshot() -> dict[str, int | bool]:
+    with state_lock:
+        return dict(state_snapshot)
+
+
+def refresh_state_snapshot() -> None:
+    local_count = local_viewer_count()
+    snapshot = {
+        "live": is_live(),
+        "audio_live": is_audio_live(),
+        "count": total_viewer_count(local_count=local_count),
+        "local_count": local_count,
+    }
+    with state_lock:
+        state_snapshot.update(snapshot)
+
+
+def state_refresher() -> None:
+    while True:
+        refresh_state_snapshot()
+        time.sleep(STATE_CACHE_SECONDS)
+
+
+def ensure_state_task() -> None:
+    global state_task_started
+    if state_task_started:
+        return
+    init_db()
+    refresh_state_snapshot()
+    with state_lock:
+        if state_task_started:
+            return
+        state_task_started = True
+    Thread(target=state_refresher, daemon=True).start()
 
 
 def record_stats() -> None:
+    init_db()
     while True:
         count = total_viewer_count()
-        ts = int(time.time())
+        now = int(time.time())
+        ts = (now // STATS_SAMPLE_SECONDS) * STATS_SAMPLE_SECONDS
         cutoff = ts - 60 * 60 * 24
-        with stats_lock:
-            stats_data[ts] = count
-            for old_ts in [k for k in stats_data if k < cutoff]:
-                del stats_data[old_ts]
+        with connect_db() as conn:
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO viewer_stats(ts, count) VALUES(?, ?)",
+                    (ts, count),
+                )
+                conn.execute("DELETE FROM viewer_stats WHERE ts < ?", (cutoff,))
         time.sleep(STATS_SAMPLE_SECONDS)
 
 
-def ensure_stats_task() -> None:
-    global stats_task_started
-    if stats_task_started:
+def prune_stale_satellites() -> None:
+    init_db()
+    while True:
+        cutoff = time.time() - SATELLITE_PRUNE_SECONDS
+        with connect_db() as conn:
+            with conn:
+                conn.execute("DELETE FROM satellites WHERE last_heartbeat < ?", (cutoff,))
+        time.sleep(15)
+
+
+def ensure_maintenance_tasks() -> None:
+    global maintenance_task_started
+    if maintenance_task_started:
         return
-    with stats_lock:
-        if stats_task_started:
+    init_db()
+    with state_lock:
+        if maintenance_task_started:
             return
-        stats_task_started = True
-        Thread(target=record_stats, daemon=True).start()
+        maintenance_task_started = True
+    Thread(target=record_stats, daemon=True).start()
+    Thread(target=prune_stale_satellites, daemon=True).start()
+
+
+@app.get("/status")
+def status():
+    ensure_state_task()
+    return jsonify(current_state_snapshot())
+
+
+@app.get("/audio-status")
+def audio_status():
+    ensure_state_task()
+    return jsonify({"live": current_state_snapshot()["audio_live"]})
+
+
+@app.post("/presence")
+def presence():
+    validate_same_origin()
+    session_id = validate_presence_token()
+    remote_ip = client_ip()
+    ensure_state_task()
+    ensure_maintenance_tasks()
+    if not allow_presence_request(session_id, remote_ip):
+        return jsonify({"ok": True, "updated": False, **current_state_snapshot()})
+    updated = mark_viewer_present(session_id, remote_ip)
+    if updated:
+        refresh_state_snapshot()
+    return jsonify({"ok": True, "updated": updated, **current_state_snapshot()})
 
 
 @app.post("/auth")
@@ -280,25 +497,24 @@ def client_log():
 
 @app.get("/stats")
 def stats():
+    init_db()
     minutes = request.args.get("minutes", "60")
     try:
         minutes_int = max(1, min(240, int(minutes)))
     except ValueError:
         minutes_int = 60
     cutoff = int(time.time()) - minutes_int * 60
-    with stats_lock:
-        rows = sorted((ts, count) for ts, count in stats_data.items() if ts >= cutoff)
+    with connect_db() as conn:
+        rows = conn.execute(
+            "SELECT ts, count FROM viewer_stats WHERE ts >= ? ORDER BY ts ASC",
+            (cutoff,),
+        ).fetchall()
     return jsonify(
         {
-            "points": [{"ts": ts, "count": count} for ts, count in rows],
+            "points": [{"ts": int(row["ts"]), "count": int(row["count"])} for row in rows],
             "minutes": minutes_int,
         }
     )
-
-
-# ---------------------------------------------------------------------------
-# Satellite management
-# ---------------------------------------------------------------------------
 
 
 def validate_satellite_api_key():
@@ -311,60 +527,39 @@ def validate_satellite_api_key():
     return data
 
 
-def satellite_score(sat):
+def satellite_score(row: sqlite3.Row) -> float:
     now = time.time()
-    if now - sat.get("last_heartbeat", 0) > SATELLITE_UNHEALTHY_SECONDS:
+    last_heartbeat = float(row["last_heartbeat"])
+    if now - last_heartbeat > SATELLITE_UNHEALTHY_SECONDS:
         return -1
-    capacity = sat.get("capacity_max_viewers", 100)
-    viewers = sat.get("viewer_count", 0)
-    cpu = sat.get("cpu_percent", 0)
+    capacity = int(row["capacity_max_viewers"])
+    viewers = int(row["viewer_count"])
+    cpu = float(row["cpu_percent"])
     headroom = max(0, capacity - viewers)
-    return headroom * (1 - min(cpu, 100) / 100)
+    return headroom * (1 - min(cpu, 100.0) / 100.0)
 
 
-def satellite_info(sat, now=None):
-    if now is None:
-        now = time.time()
-    age = round(now - sat.get("last_heartbeat", now), 1)
+def satellite_info(row: sqlite3.Row, now: float | None = None) -> dict[str, str | int | float | bool]:
+    current = time.time() if now is None else now
+    last_heartbeat = float(row["last_heartbeat"])
+    age = round(current - last_heartbeat, 1)
     healthy = age <= SATELLITE_UNHEALTHY_SECONDS
     return {
-        "id": sat["id"],
-        "name": sat.get("name", ""),
-        "url": sat.get("url", ""),
-        "viewer_count": sat.get("viewer_count", 0),
-        "cpu_percent": sat.get("cpu_percent", 0),
-        "bandwidth_mbps": sat.get("bandwidth_mbps", 0),
-        "capacity_max_viewers": sat.get("capacity_max_viewers", 100),
+        "id": row["id"],
+        "name": row["name"],
+        "url": row["url"],
+        "viewer_count": int(row["viewer_count"]),
+        "cpu_percent": float(row["cpu_percent"]),
+        "bandwidth_mbps": float(row["bandwidth_mbps"]),
+        "capacity_max_viewers": int(row["capacity_max_viewers"]),
         "last_heartbeat_age": age,
         "healthy": healthy,
     }
 
 
-def prune_stale_satellites():
-    while True:
-        now = time.time()
-        cutoff = now - SATELLITE_PRUNE_SECONDS
-        with satellite_lock:
-            stale = [sid for sid, s in satellites.items() if s.get("last_heartbeat", 0) < cutoff]
-            for sid in stale:
-                satellites.pop(sid, None)
-                app.logger.info("Pruned stale satellite %s", sid)
-        time.sleep(15)
-
-
-def ensure_satellite_pruner():
-    global satellite_pruner_started
-    if satellite_pruner_started:
-        return
-    with satellite_lock:
-        if satellite_pruner_started:
-            return
-        satellite_pruner_started = True
-        Thread(target=prune_stale_satellites, daemon=True).start()
-
-
 @app.post("/api/satellite/register")
 def satellite_register():
+    init_db()
     data = validate_satellite_api_key()
     name = shorten(data.get("name", ""), 120)
     url = shorten(data.get("url", ""), 500)
@@ -372,20 +567,18 @@ def satellite_register():
         abort(400, "Missing satellite url")
     sat_id = str(uuid.uuid4())
     now = time.time()
-    sat = {
-        "id": sat_id,
-        "name": name,
-        "url": url,
-        "cpu_percent": 0,
-        "bandwidth_mbps": 0,
-        "viewer_count": 0,
-        "capacity_max_viewers": int(data.get("capacity_max_viewers", 100)),
-        "last_heartbeat": now,
-        "registered_at": now,
-    }
-    with satellite_lock:
-        satellites[sat_id] = sat
-    ensure_satellite_pruner()
+    with connect_db() as conn:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO satellites(
+                    id, name, url, cpu_percent, bandwidth_mbps,
+                    viewer_count, capacity_max_viewers, last_heartbeat, registered_at
+                ) VALUES(?, ?, ?, 0, 0, 0, ?, ?, ?)
+                """,
+                (sat_id, name, url, int(data.get("capacity_max_viewers", 100)), now, now),
+            )
+    ensure_maintenance_tasks()
     app.logger.info("Satellite registered: %s (%s) at %s", sat_id, name, url)
     return jsonify(
         {
@@ -397,53 +590,74 @@ def satellite_register():
 
 @app.post("/api/satellite/<sat_id>/heartbeat")
 def satellite_heartbeat(sat_id):
+    init_db()
     data = validate_satellite_api_key()
-    with satellite_lock:
-        sat = satellites.get(sat_id)
-        if not sat:
+    updated_at = time.time()
+    with connect_db() as conn:
+        with conn:
+            cur = conn.execute(
+                """
+                UPDATE satellites
+                SET cpu_percent = ?, bandwidth_mbps = ?, viewer_count = ?,
+                    capacity_max_viewers = ?, last_heartbeat = ?
+                WHERE id = ?
+                """,
+                (
+                    min(100.0, max(0.0, float(data.get("cpu_percent", 0)))),
+                    max(0.0, float(data.get("bandwidth_mbps", 0))),
+                    max(0, int(data.get("viewer_count", 0))),
+                    max(1, int(data.get("capacity_max_viewers", 100))),
+                    updated_at,
+                    sat_id,
+                ),
+            )
+        if cur.rowcount == 0:
             abort(404, "Unknown satellite")
-        sat["cpu_percent"] = min(100, max(0, float(data.get("cpu_percent", 0))))
-        sat["bandwidth_mbps"] = max(0, float(data.get("bandwidth_mbps", 0)))
-        sat["viewer_count"] = max(0, int(data.get("viewer_count", 0)))
-        sat["capacity_max_viewers"] = max(1, int(data.get("capacity_max_viewers", sat["capacity_max_viewers"])))
-        sat["last_heartbeat"] = time.time()
     return jsonify({"ok": True, "stream_active": is_live()})
 
 
 @app.delete("/api/satellite/<sat_id>")
 def satellite_deregister(sat_id):
+    init_db()
     validate_satellite_api_key()
-    with satellite_lock:
-        removed = satellites.pop(sat_id, None)
+    removed = 0
+    with connect_db() as conn:
+        with conn:
+            cur = conn.execute("DELETE FROM satellites WHERE id = ?", (sat_id,))
+            removed = cur.rowcount
     if removed:
-        app.logger.info("Satellite deregistered: %s (%s)", sat_id, removed.get("name", ""))
+        app.logger.info("Satellite deregistered: %s", sat_id)
     return jsonify({"ok": True})
 
 
 @app.get("/api/satellite/assign")
 def satellite_assign():
-    best = None
-    best_score = -1
-    with satellite_lock:
-        for sat in satellites.values():
-            score = satellite_score(sat)
-            if score > best_score:
-                best_score = score
-                best = sat
-    if best and best_score > 0:
-        return jsonify({"satellite_url": best["url"]})
+    init_db()
+    with connect_db() as conn:
+        rows = conn.execute("SELECT * FROM satellites").fetchall()
+    best_row = None
+    best_score = -1.0
+    for row in rows:
+        score = satellite_score(row)
+        if score > best_score:
+            best_score = score
+            best_row = row
+    if best_row and best_score > 0:
+        return jsonify({"satellite_url": best_row["url"]})
     return jsonify({"satellite_url": None})
 
 
 @app.get("/api/satellites")
 def satellite_list():
+    init_db()
     now = time.time()
-    with satellite_lock:
-        result = [satellite_info(s, now) for s in satellites.values()]
-    return jsonify({"satellites": result})
+    with connect_db() as conn:
+        rows = conn.execute("SELECT * FROM satellites ORDER BY name ASC, id ASC").fetchall()
+    return jsonify({"satellites": [satellite_info(row, now) for row in rows]})
 
 
 if __name__ == "__main__":
-    ensure_stats_task()
-    ensure_satellite_pruner()
+    init_db()
+    ensure_state_task()
+    ensure_maintenance_tasks()
     app.run(host="0.0.0.0", port=5000, debug=APP_DEBUG, use_reloader=False, threaded=True)

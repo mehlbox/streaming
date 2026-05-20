@@ -2,3 +2,6 @@
 data/
 flask/disconnect-debug.log*
 __pycache__
+*.db
+*.db-shm
+*.db-wal

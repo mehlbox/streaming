@@ -30,7 +30,9 @@ const statsRangeEl = document.querySelector(".stats-range");
 const statsSection = document.getElementById("stats-section");
 const satelliteSection = document.getElementById("satellite-section");
 const satelliteBody = document.getElementById("satellite-body");
+const statusUrl = document.body?.dataset?.statusUrl || "/status";
 const presenceUrl = document.body?.dataset?.presenceUrl || "/presence";
+const presenceToken = document.body?.dataset?.presenceToken || "";
 const scheduleLocale = "de-DE";
 const scheduleTheme = document.documentElement?.dataset?.theme || "ocean";
 const scheduleBaseUrl = (document.body?.dataset?.scheduleBaseUrl || "/data").replace(/\/$/, "");
@@ -74,8 +76,9 @@ const stallReloadGraceMs = 60000;
 const stallRecoveryCooldownMs = 4000;
 const playbackProgressEpsilonSeconds = 0.12;
 const playbackProgressGraceMs = 15000;
-const presencePollIntervalMs = 5000;
-const presenceFailureGraceMs = 8000;
+const statusPollIntervalMs = 10000;
+const presenceHeartbeatIntervalMs = 60000;
+const statusFailureGraceMs = 20000;
 let allowAutoplay = true;
 const debugEnabled = document.body?.dataset?.debug === "1";
 let scheduleData = [];
@@ -1569,19 +1572,19 @@ if (claimOnLoad) {
   claimActiveTab("manual-reload");
 }
 
-let presenceFailureTimer = null;
+let statusFailureTimer = null;
 
-const clearPresenceFailure = () => {
-  if (presenceFailureTimer === null) return;
-  clearTimeout(presenceFailureTimer);
-  presenceFailureTimer = null;
+const clearStatusFailure = () => {
+  if (statusFailureTimer === null) return;
+  clearTimeout(statusFailureTimer);
+  statusFailureTimer = null;
 };
 
-const handlePresenceFailure = (reason) => {
-  postClientLog("presence_poll_failed", { reason });
-  if (presenceFailureTimer !== null) return;
-  presenceFailureTimer = setTimeout(() => {
-    presenceFailureTimer = null;
+const handleStatusFailure = (reason) => {
+  postClientLog("status_poll_failed", { reason });
+  if (statusFailureTimer !== null) return;
+  statusFailureTimer = setTimeout(() => {
+    statusFailureTimer = null;
     audioLive = false;
     audioAvailable = false;
     setStatus(false);
@@ -1589,29 +1592,56 @@ const handlePresenceFailure = (reason) => {
     if (started) {
       stopPlayer();
     }
-  }, presenceFailureGraceMs);
+  }, statusFailureGraceMs);
 };
 
-const pollPresence = async () => {
+const pollStatus = async () => {
   try {
-    const response = await fetch(presenceUrl, { cache: "no-store" });
+    const response = await fetch(statusUrl, { cache: "no-store" });
     if (!response.ok) {
-      throw new Error(`presence fetch failed: ${response.status}`);
+      throw new Error(`status fetch failed: ${response.status}`);
     }
     const data = await response.json();
-    clearPresenceFailure();
+    clearStatusFailure();
     handleStatus(!!data?.live, data?.audio_live);
     updateViewerCount(data?.count);
   } catch (error) {
-    debugLog(`presence poll failed: ${error?.message || error}`);
+    debugLog(`status poll failed: ${error?.message || error}`);
     emitClientDebug(
-      "presence_poll_failed",
+      "status_poll_failed",
       { message: error?.message || String(error) },
       { throttleMs: 15000, sendHttpFallback: true }
     );
-    handlePresenceFailure(error?.message || String(error));
+    handleStatusFailure(error?.message || String(error));
   }
 };
 
-pollPresence();
-setInterval(pollPresence, presencePollIntervalMs);
+const sendPresenceHeartbeat = async () => {
+  if (!presenceToken) return;
+  try {
+    const response = await fetch(presenceUrl, {
+      method: "POST",
+      cache: "no-store",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Presence-Token": presenceToken
+      },
+      body: JSON.stringify({})
+    });
+    if (!response.ok) {
+      throw new Error(`presence heartbeat failed: ${response.status}`);
+    }
+  } catch (error) {
+    debugLog(`presence heartbeat failed: ${error?.message || error}`);
+    emitClientDebug(
+      "presence_heartbeat_failed",
+      { message: error?.message || String(error) },
+      { throttleMs: 30000, sendHttpFallback: true }
+    );
+  }
+};
+
+pollStatus();
+sendPresenceHeartbeat();
+setInterval(pollStatus, statusPollIntervalMs);
+setInterval(sendPresenceHeartbeat, presenceHeartbeatIntervalMs);
