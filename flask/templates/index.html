@@ -56,6 +56,7 @@
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4v.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
               </svg>
               <h2 id="offline-title">Stream offline</h2>
+              <p id="offline-sub"></p>
             </div>
           </div>
 
@@ -96,16 +97,16 @@
             <span id="clients" class="viewer-count">👥 0 Online</span>
           </div>
           <div class="control-right">
-            <label class="control-toggle">
-              <input type="checkbox" id="autostart" checked />
+            <label id="autostart-label" class="control-toggle">
+              <input type="checkbox" id="autostart" />
               <span class="toggle-box"></span>
-              <span class="toggle-label">Autostart</span>
+              <span class="toggle-label"><span class="autostart-text">Autostart</span></span>
             </label>
             {% if audio_hls_url and not audio_only %}
             <label class="control-toggle">
               <input type="checkbox" id="audio-only" />
               <span class="toggle-box"></span>
-              <span class="toggle-label">Audio</span>
+              <span class="toggle-label">nur Audio</span>
             </label>
             {% endif %}
           </div>
@@ -122,12 +123,6 @@
           
           <!-- Quick Info Card -->
           <div class="info-card card-primary">
-            <div class="card-icon">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <circle cx="12" cy="12" r="10"></circle>
-                <polyline points="12 6 12 12 16 14"></polyline>
-              </svg>
-            </div>
             <h2 class="card-title">So funktioniert's</h2>
             <ul class="card-list">
               <li><span>Sobald der Stream online ist kannst du Audio aktivieren.</span></li>
@@ -163,6 +158,7 @@
       <div class="container">
         <div class="stats-card">
           <h2 class="stats-title">Online-Statistik</h2>
+          <span class="stats-range"></span>
           <div class="stats-content">
             <canvas id="stats-canvas" width="600" height="120" aria-label="Online-Verlauf"></canvas>
             <p id="stats-empty" class="stats-empty" hidden>Noch keine Daten verfügbar.</p>

@@ -60,6 +60,7 @@ let satelliteUrl = null;
 let satelliteAssigned = false;
 const audioOnlyStorageKey = "audioOnly";
 const autostartAttemptsKey = "autostartAttempts";
+const autostartStorageKey = "autostartEnabled";
 const autostartMaxAttempts = 10;
 const volumeStorageKey = "audioVolume";
 const tabIdStorageKey = "streamTabId";
@@ -91,6 +92,7 @@ let playerReplaced = false;
 let socket = null;
 let stallStartedAt = 0;
 let lastStallRecoveryAt = 0;
+let playerStartedAt = 0;
 let lastPlaybackProgressAt = 0;
 let lastPlaybackPosition = null;
 
@@ -383,6 +385,15 @@ autostartAttempts = loadAutostartAttempts();
 if (autostartAttempts >= autostartMaxAttempts) {
   autostartEnabled = false;
   if (autostartToggle) autostartToggle.checked = false;
+} else {
+  const storedAutostart = sessionStorage.getItem(autostartStorageKey);
+  if (storedAutostart === "0") {
+    autostartEnabled = false;
+    if (autostartToggle) autostartToggle.checked = false;
+  } else if (storedAutostart === "1") {
+    autostartEnabled = true;
+    if (autostartToggle) autostartToggle.checked = true;
+  }
 }
 logAutostartStatus("init");
 
@@ -579,11 +590,11 @@ const updatePlayerClass = () => {
   if (!playerEl || playerReplaced) return;
   const audioReady = audioLive && audioAvailable;
   const liveState = audioOnlyEnabled ? audioReady : isLive;
-  playerEl.className = "player";
+  playerEl.className = "player-wrapper";
   if (!liveState) playerEl.classList.add("offline-mode");
   if (audioOnlyEnabled) playerEl.classList.add("audio-only");
   if (offlineEl) {
-    offlineEl.className = liveState ? "offline hidden" : "offline";
+    offlineEl.className = liveState ? "offline-overlay hidden" : "offline-overlay";
   }
 };
 
@@ -831,6 +842,7 @@ const tryInlineStallRecovery = (reason) => {
   if (!isLive || !mediaEl || mediaEl.ended) return;
   const now = Date.now();
   if (now - lastStallRecoveryAt < stallRecoveryCooldownMs) return;
+  if (playerStartedAt && now - playerStartedAt < startupBufferTimeoutMs) return;
   lastStallRecoveryAt = now;
   debugLog(`recovering playback (${reason})`);
   emitClientDebug(
@@ -935,6 +947,7 @@ document.addEventListener("visibilitychange", syncAudioVisualizer);
 if (autostartToggle) {
   autostartToggle.addEventListener("change", () => {
     autostartEnabled = autostartToggle.checked;
+    sessionStorage.setItem(autostartStorageKey, autostartEnabled ? "1" : "0");
     if (autostartEnabled) {
       setAutostartAttempts(0, "user-enable");
     } else {
@@ -1001,13 +1014,13 @@ const updateUnmute = () => {
   if (!unmuteEl) return;
   if (!mediaEl) return;
   if (audioOnlyEnabled) {
-    unmuteEl.className = "unmute hidden";
+    unmuteEl.className = "unmute-overlay hidden";
     updateAudioControls();
     return;
   }
   const isPlaying = started && playbackActive;
   const show = isLive && isPlaying && mediaEl.muted;
-  unmuteEl.className = show ? "unmute" : "unmute hidden";
+  unmuteEl.className = show ? "unmute-overlay" : "unmute-overlay hidden";
   updateAudioControls();
 };
 
@@ -1069,8 +1082,8 @@ const setStatus = (live) => {
   if (!live) {
     clearStallState();
   }
-  statusEl.textContent = live ? "Online" : "Offline";
-  statusEl.className = live ? "status status-online" : "status status-offline";
+  statusEl.textContent = live ? "● Online" : "● Offline";
+  statusEl.className = live ? "status-badge status-online" : "status-badge status-offline";
   updatePlayerClass();
   updateAutostartUI();
   updateOfflineMessage();
@@ -1233,6 +1246,7 @@ const stopPlayer = () => {
   }
   clearStallState();
   resetPlaybackProgressTracking();
+  playerStartedAt = 0;
   started = false;
   playbackActive = false;
   startupPlayToken += 1;
@@ -1408,6 +1422,7 @@ const startPlayerWithOptions = ({ forcePlay }) => {
     return;
   }
   started = true;
+  playerStartedAt = Date.now();
   setStatus(true);
 
   if (mediaEl && mediaEl.canPlayType("application/vnd.apple.mpegurl")) {
@@ -1597,7 +1612,7 @@ socket.on("status", (data) => {
 socket.on("clients", (data) => {
   if (!clientsEl) return;
   const count = Number.isFinite(data?.count) ? data.count : 0;
-  clientsEl.textContent = `Aktuell online: ${count}`;
+  clientsEl.textContent = `👥 ${count} Online`;
 });
 socket.on("disconnect", (reason) => {
   postClientLog("socket_disconnect", { reason: reason || "unknown" });
