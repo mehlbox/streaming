@@ -64,7 +64,6 @@ services:
     environment:
       - FLASK_ENV=production
       - FLASK_APP=app.py
-      - DISCONNECT_LOG_PATH=/app/disconnect-debug.log
     expose:
       - "5000"
     working_dir: /app

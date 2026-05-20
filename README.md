@@ -1,6 +1,6 @@
 # Live Stream
 
-Simple Flask + Socket.IO frontend for a live HLS stream with viewer count, schedule, and a 1‑hour stats graph.
+Simple Flask frontend for a live HLS stream with polling-based viewer count, schedule, and a 1‑hour stats graph.
 
 ## Quick start
 

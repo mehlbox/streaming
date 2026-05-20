@@ -11,7 +11,7 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}" />
   <link rel="icon" href="{{ favicon_url }}" type="{{ favicon_type }}" />
 </head>
-<body{% if not audio_only %} data-hls-url="{{ hls_url }}"{% endif %}{% if audio_hls_url %} data-audio-hls-url="{{ audio_hls_url }}"{% endif %} data-audio-only="{{ '1' if audio_only else '0' }}" data-audio-status-url="{{ url_for('audio_status') }}" data-client-log-url="{{ url_for('client_log') }}" data-debug="{{ '1' if debug_enabled else '0' }}" data-schedule-base-url="{{ schedule_base_url }}">
+<body{% if not audio_only %} data-hls-url="{{ hls_url }}"{% endif %}{% if audio_hls_url %} data-audio-hls-url="{{ audio_hls_url }}"{% endif %} data-audio-only="{{ '1' if audio_only else '0' }}" data-audio-status-url="{{ url_for('audio_status') }}" data-presence-url="{{ url_for('presence') }}" data-client-log-url="{{ url_for('client_log') }}" data-debug="{{ '1' if debug_enabled else '0' }}" data-schedule-base-url="{{ schedule_base_url }}">
 
   <!-- Skip to main content -->
   <a href="#main" class="sr-only">Zum Hauptinhalt springen</a>
@@ -205,7 +205,6 @@
   </footer>
 
   <!-- Scripts -->
-  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js"></script>
   <script src="{{ url_for('static', filename='js/app.js') }}" defer></script>
 </body>

@@ -1,18 +1,13 @@
-import os
 import ipaddress
-import time
+import os
 import secrets
-import json
-import logging
+import time
 import uuid
-from datetime import datetime, timezone
-from logging.handlers import RotatingFileHandler
-from threading import Lock
 from pathlib import Path
+from threading import Lock, Thread
 from urllib.parse import parse_qs, urlparse
 
 from flask import Flask, abort, jsonify, render_template, request, session, url_for
-from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
 SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
@@ -20,23 +15,20 @@ if not SECRET_KEY:
     SECRET_KEY = secrets.token_hex(32)
 app.config["SECRET_KEY"] = SECRET_KEY
 
+
 def get_env_default(key: str, default: str) -> str:
     value = os.getenv(key, "").strip()
     return value or default
 
+
 def parse_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
 
 STREAM_NAME = os.getenv("STREAM_NAME", "live")
 STREAM_KEY = os.getenv("STREAM_KEY", "").strip()
 HLS_DIR = os.getenv("HLS_DIR", "/var/www/hls")
 HLS_STALE_SECONDS = int(os.getenv("HLS_STALE_SECONDS", "15"))
-SOCKETIO_POLL_SECONDS = float(os.getenv("SOCKETIO_POLL_SECONDS", "2"))
-SOCKETIO_PING_INTERVAL = float(os.getenv("SOCKETIO_PING_INTERVAL", "25"))
-SOCKETIO_PING_TIMEOUT = float(os.getenv("SOCKETIO_PING_TIMEOUT", "60"))
-DISCONNECT_RECONNECT_WINDOW_SECONDS = float(
-    os.getenv("DISCONNECT_RECONNECT_WINDOW_SECONDS", "10")
-)
 STATS_SAMPLE_SECONDS = int(os.getenv("STATS_SAMPLE_SECONDS", "60"))
 AUDIO_STREAM_NAME = os.getenv("AUDIO_STREAM_NAME", "").strip()
 AUDIO_HLS_URL = os.getenv("AUDIO_HLS_URL", "").strip()
@@ -48,7 +40,7 @@ if THEME not in SUPPORTED_THEMES:
 SITE_TITLE = get_env_default("SITE_TITLE", "docker streaming")
 SITE_SUBTITLE = get_env_default("SITE_SUBTITLE", "")
 PAGE_TITLE = get_env_default("PAGE_TITLE", f"Live Stream - {SITE_TITLE}")
-LOGO_URL = get_env_default("LOGO_URL","",)
+LOGO_URL = get_env_default("LOGO_URL", "")
 LOGO_ALT = get_env_default("LOGO_ALT", "Your Logo Here")
 FAVICON_URL = os.getenv("FAVICON_URL", "").strip()
 FAVICON_TYPE = get_env_default("FAVICON_TYPE", "image/svg+xml")
@@ -59,33 +51,14 @@ SATELLITE_API_KEY = os.getenv("SATELLITE_API_KEY", "").strip()
 SATELLITE_HEARTBEAT_INTERVAL = int(os.getenv("SATELLITE_HEARTBEAT_INTERVAL", "10"))
 SATELLITE_UNHEALTHY_SECONDS = int(os.getenv("SATELLITE_UNHEALTHY_SECONDS", "30"))
 SATELLITE_PRUNE_SECONDS = int(os.getenv("SATELLITE_PRUNE_SECONDS", "120"))
-DISCONNECT_LOG_ENABLED = parse_bool(os.getenv("DISCONNECT_LOG_ENABLED", "1"))
-DISCONNECT_LOG_PATH = os.getenv(
-    "DISCONNECT_LOG_PATH",
-    "/docker/streaming/flask/disconnect-debug.log",
-).strip()
-DISCONNECT_LOG_MAX_BYTES = int(os.getenv("DISCONNECT_LOG_MAX_BYTES", "5242880"))
-DISCONNECT_LOG_BACKUP_COUNT = int(os.getenv("DISCONNECT_LOG_BACKUP_COUNT", "10"))
-APP_DEBUG = parse_bool(os.getenv("APP_DEBUG", "0"))
-SOCKETIO_PING_INTERVAL = max(5.0, SOCKETIO_PING_INTERVAL)
-SOCKETIO_PING_TIMEOUT = max(SOCKETIO_PING_INTERVAL + 5.0, SOCKETIO_PING_TIMEOUT)
-DISCONNECT_RECONNECT_WINDOW_SECONDS = max(0.5, DISCONNECT_RECONNECT_WINDOW_SECONDS)
-PENDING_DISCONNECT_TTL_SECONDS = max(
+VIEWER_PRESENCE_TTL_SECONDS = max(
     30.0,
-    DISCONNECT_RECONNECT_WINDOW_SECONDS * 6,
+    float(os.getenv("VIEWER_PRESENCE_TTL_SECONDS", "45")),
 )
-socketio = SocketIO(
-    app,
-    cors_allowed_origins="*",
-    ping_interval=SOCKETIO_PING_INTERVAL,
-    ping_timeout=SOCKETIO_PING_TIMEOUT,
-)
-client_lock = Lock()
-client_count = 0
-client_sessions = {}
-sid_to_session = {}
-sid_meta = {}
-pending_disconnects = {}
+APP_DEBUG = parse_bool(os.getenv("APP_DEBUG", "0"))
+
+viewer_lock = Lock()
+viewer_sessions: dict[str, float] = {}
 stats_lock = Lock()
 stats_data: dict[int, int] = {}
 stats_task_started = False
@@ -93,27 +66,17 @@ satellite_lock = Lock()
 satellites = {}
 satellite_pruner_started = False
 
-disconnect_logger = logging.getLogger("disconnect_debug")
-disconnect_logger.setLevel(logging.INFO)
-disconnect_logger.propagate = False
-if DISCONNECT_LOG_ENABLED:
-    try:
-        log_path = Path(DISCONNECT_LOG_PATH)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        disconnect_handler = RotatingFileHandler(
-            log_path,
-            maxBytes=max(1024, DISCONNECT_LOG_MAX_BYTES),
-            backupCount=max(1, DISCONNECT_LOG_BACKUP_COUNT),
-            encoding="utf-8",
-        )
-        disconnect_handler.setFormatter(logging.Formatter("%(message)s"))
-        disconnect_logger.addHandler(disconnect_handler)
-    except Exception:
-        app.logger.exception("Failed to initialize disconnect debug logger")
+
+def ensure_viewer_id() -> str:
+    viewer_id = session.get("viewer_id", "").strip()
+    if not viewer_id:
+        viewer_id = secrets.token_urlsafe(16)
+        session["viewer_id"] = viewer_id
+    return viewer_id
+
 
 def render_index(debug_enabled: bool):
-    if "viewer_id" not in session:
-        session["viewer_id"] = secrets.token_urlsafe(16)
+    ensure_viewer_id()
     audio_hls_url = None
     if AUDIO_HLS_URL:
         audio_hls_url = AUDIO_HLS_URL
@@ -157,6 +120,7 @@ def is_live() -> bool:
     age = time.time() - hls_path.stat().st_mtime
     return age <= HLS_STALE_SECONDS
 
+
 def is_audio_live() -> bool:
     if AUDIO_HLS_URL:
         return True
@@ -195,86 +159,58 @@ def shorten(value, max_len: int = 240):
     return text[: max_len - 3] + "..."
 
 
-def client_ip() -> str:
-    xff = request.headers.get("X-Forwarded-For", "")
-    if xff:
-        return xff.split(",", 1)[0].strip()
-    return request.headers.get("X-Real-IP", "") or request.remote_addr or ""
+def prune_viewers_locked(now: float) -> None:
+    cutoff = now - VIEWER_PRESENCE_TTL_SECONDS
+    stale = [session_id for session_id, last_seen in viewer_sessions.items() if last_seen < cutoff]
+    for session_id in stale:
+        viewer_sessions.pop(session_id, None)
 
 
-def session_cookie_name() -> str:
-    return app.config.get("SESSION_COOKIE_NAME", "session")
+def local_viewer_count(now: float | None = None) -> int:
+    current = time.time() if now is None else now
+    with viewer_lock:
+        prune_viewers_locked(current)
+        return len(viewer_sessions)
 
 
-def current_session_id() -> str:
-    return session.get("viewer_id") or request.cookies.get(session_cookie_name()) or ""
-
-
-def sanitize_payload(payload, depth: int = 0):
-    if depth > 3:
-        return shorten(payload, 120)
-    if payload is None:
-        return None
-    if isinstance(payload, (bool, int, float)):
-        return payload
-    if isinstance(payload, str):
-        return shorten(payload, 500)
-    if isinstance(payload, dict):
-        cleaned = {}
-        for key in list(payload.keys())[:20]:
-            cleaned[shorten(key, 64)] = sanitize_payload(payload[key], depth + 1)
-        return cleaned
-    if isinstance(payload, list):
-        return [sanitize_payload(item, depth + 1) for item in payload[:20]]
-    return shorten(repr(payload), 500)
-
-
-def log_disconnect_event(event: str, sid: str = "", session_id: str = "", **fields) -> None:
-    if not DISCONNECT_LOG_ENABLED:
-        return
-    if not disconnect_logger.handlers:
-        return
-    record = {
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "event": event,
-    }
-    if sid:
-        record["sid"] = sid
-    if session_id:
-        record["session_id"] = session_id
-    record.update({k: sanitize_payload(v) for k, v in fields.items()})
-    try:
-        disconnect_logger.info(json.dumps(record, sort_keys=True, separators=(",", ":")))
-    except Exception:
-        app.logger.exception("Failed to write disconnect debug log")
-
-
-def prune_pending_disconnects_locked(now: float) -> None:
-    cutoff = now - PENDING_DISCONNECT_TTL_SECONDS
-    stale_keys = []
-    for session_id, payload in pending_disconnects.items():
-        disconnected_at = payload.get("disconnected_at") if isinstance(payload, dict) else None
-        if not isinstance(disconnected_at, (float, int)) or disconnected_at < cutoff:
-            stale_keys.append(session_id)
-    for session_id in stale_keys:
-        pending_disconnects.pop(session_id, None)
+def mark_viewer_present() -> int:
+    now = time.time()
+    session_id = ensure_viewer_id()
+    with viewer_lock:
+        prune_viewers_locked(now)
+        viewer_sessions[session_id] = now
+        return len(viewer_sessions)
 
 
 @app.get("/status")
 def status():
     return jsonify({"live": is_live(), "audio_live": is_audio_live()})
 
+
 @app.get("/audio-status")
 def audio_status():
     return jsonify({"live": is_audio_live()})
 
 
-def total_viewer_count() -> int:
-    with client_lock:
-        count = client_count
+@app.get("/presence")
+def presence():
+    local_count = mark_viewer_present()
+    return jsonify(
+        {
+            "live": is_live(),
+            "audio_live": is_audio_live(),
+            "count": total_viewer_count(local_count=local_count),
+            "local_count": local_count,
+        }
+    )
+
+
+def total_viewer_count(local_count: int | None = None) -> int:
+    count = local_count if local_count is not None else local_viewer_count()
+    now = time.time()
     with satellite_lock:
         for sat in satellites.values():
-            if time.time() - sat.get("last_heartbeat", 0) <= SATELLITE_UNHEALTHY_SECONDS:
+            if now - sat.get("last_heartbeat", 0) <= SATELLITE_UNHEALTHY_SECONDS:
                 count += sat.get("viewer_count", 0)
     return count
 
@@ -288,7 +224,7 @@ def record_stats() -> None:
             stats_data[ts] = count
             for old_ts in [k for k in stats_data if k < cutoff]:
                 del stats_data[old_ts]
-        socketio.sleep(STATS_SAMPLE_SECONDS)
+        time.sleep(STATS_SAMPLE_SECONDS)
 
 
 def ensure_stats_task() -> None:
@@ -299,7 +235,7 @@ def ensure_stats_task() -> None:
         if stats_task_started:
             return
         stats_task_started = True
-        socketio.start_background_task(record_stats)
+        Thread(target=record_stats, daemon=True).start()
 
 
 @app.post("/auth")
@@ -337,114 +273,6 @@ def auth():
     abort(403)
 
 
-@socketio.on("connect")
-def on_connect():
-    global client_count
-    ensure_stats_task()
-    emit("status", {"live": is_live(), "audio_live": is_audio_live()})
-    session_id = current_session_id()
-    if not session_id:
-        session_id = f"sid:{request.sid}"
-    sid = request.sid
-    connected_at = time.time()
-    pending_disconnect = None
-    with client_lock:
-        prune_pending_disconnects_locked(connected_at)
-        pending_disconnect = pending_disconnects.pop(session_id, None)
-        sid_to_session[sid] = session_id
-        sid_meta[sid] = {
-            "connected_at": connected_at,
-            "remote_ip": client_ip(),
-            "user_agent": shorten(request.headers.get("User-Agent", ""), 200),
-            "origin": shorten(request.headers.get("Origin", ""), 160),
-            "referer": shorten(request.headers.get("Referer", ""), 200),
-            "transport": shorten(request.args.get("transport", ""), 64),
-            "last_client_event": None,
-            "last_client_event_at": None,
-        }
-        session_sockets = client_sessions.setdefault(session_id, set())
-        was_empty = len(session_sockets) == 0
-        session_sockets.add(sid)
-        if was_empty:
-            client_count += 1
-        count = client_count
-    if isinstance(pending_disconnect, dict):
-        disconnected_at = pending_disconnect.get("disconnected_at")
-        old_sid = pending_disconnect.get("sid", "")
-        fields = pending_disconnect.get("fields", {})
-        if isinstance(disconnected_at, (float, int)) and isinstance(fields, dict):
-            reconnect_seconds = round(max(0.0, connected_at - disconnected_at), 3)
-            if reconnect_seconds <= DISCONNECT_RECONNECT_WINDOW_SECONDS:
-                log_fields = dict(fields)
-                log_fields["reconnect_seconds"] = reconnect_seconds
-                log_fields["reconnected_sid"] = sid
-                log_disconnect_event(
-                    "socket_disconnect",
-                    sid=shorten(old_sid, 120) or sid,
-                    session_id=session_id,
-                    **log_fields,
-                )
-    socketio.emit("clients", {"count": count})
-
-
-@socketio.on("disconnect")
-def on_disconnect(reason=None):
-    global client_count
-    session_id = ""
-    event_meta = {}
-    duration_seconds = None
-    seconds_since_client_event = None
-    disconnected_at = time.time()
-    with client_lock:
-        sid = request.sid
-        session_id = sid_to_session.pop(sid, None)
-        event_meta = sid_meta.pop(sid, {})
-        connected_at = event_meta.get("connected_at")
-        last_client_event_at = event_meta.get("last_client_event_at")
-        if isinstance(connected_at, (float, int)):
-            duration_seconds = round(max(0.0, disconnected_at - connected_at), 3)
-        if isinstance(last_client_event_at, (float, int)):
-            seconds_since_client_event = round(max(0.0, disconnected_at - last_client_event_at), 3)
-        if session_id in client_sessions:
-            session_sockets = client_sessions.get(session_id, set())
-            session_sockets.discard(sid)
-            if not session_sockets:
-                client_sessions.pop(session_id, None)
-                client_count = max(0, client_count - 1)
-        count = client_count
-        if session_id:
-            prune_pending_disconnects_locked(disconnected_at)
-            pending_disconnects[session_id] = {
-                "sid": sid,
-                "disconnected_at": disconnected_at,
-                "fields": {
-                    "reason": shorten(reason, 80),
-                    "duration_seconds": duration_seconds,
-                    "last_client_event": event_meta.get("last_client_event"),
-                    "seconds_since_client_event": seconds_since_client_event,
-                    "transport": event_meta.get("transport"),
-                    "remote_ip": event_meta.get("remote_ip"),
-                    "user_agent": event_meta.get("user_agent"),
-                    "clients": count,
-                },
-            }
-    socketio.emit("clients", {"count": count})
-
-
-@socketio.on("client_debug")
-def on_client_debug(payload):
-    if not isinstance(payload, dict):
-        return
-    sid = request.sid
-    client_event = shorten(payload.get("event", "unknown"), 80)
-    with client_lock:
-        session_id = sid_to_session.get(sid, "")
-        meta = sid_meta.get(sid)
-        if meta is not None:
-            meta["last_client_event"] = client_event
-            meta["last_client_event_at"] = time.time()
-
-
 @app.post("/client-log")
 def client_log():
     return ("ok", 200)
@@ -468,22 +296,10 @@ def stats():
     )
 
 
-def status_watcher():
-    last_live = None
-    last_audio = None
-    while True:
-        live = is_live()
-        audio_live = is_audio_live()
-        if live != last_live or audio_live != last_audio:
-            socketio.emit("status", {"live": live, "audio_live": audio_live})
-            last_live = live
-            last_audio = audio_live
-        socketio.sleep(SOCKETIO_POLL_SECONDS)
-
-
 # ---------------------------------------------------------------------------
 # Satellite management
 # ---------------------------------------------------------------------------
+
 
 def validate_satellite_api_key():
     if not SATELLITE_API_KEY:
@@ -529,12 +345,11 @@ def prune_stale_satellites():
         now = time.time()
         cutoff = now - SATELLITE_PRUNE_SECONDS
         with satellite_lock:
-            stale = [sid for sid, s in satellites.items()
-                     if s.get("last_heartbeat", 0) < cutoff]
+            stale = [sid for sid, s in satellites.items() if s.get("last_heartbeat", 0) < cutoff]
             for sid in stale:
                 satellites.pop(sid, None)
                 app.logger.info("Pruned stale satellite %s", sid)
-        socketio.sleep(15)
+        time.sleep(15)
 
 
 def ensure_satellite_pruner():
@@ -545,7 +360,7 @@ def ensure_satellite_pruner():
         if satellite_pruner_started:
             return
         satellite_pruner_started = True
-        socketio.start_background_task(prune_stale_satellites)
+        Thread(target=prune_stale_satellites, daemon=True).start()
 
 
 @app.post("/api/satellite/register")
@@ -572,10 +387,12 @@ def satellite_register():
         satellites[sat_id] = sat
     ensure_satellite_pruner()
     app.logger.info("Satellite registered: %s (%s) at %s", sat_id, name, url)
-    return jsonify({
-        "id": sat_id,
-        "heartbeat_interval": SATELLITE_HEARTBEAT_INTERVAL,
-    })
+    return jsonify(
+        {
+            "id": sat_id,
+            "heartbeat_interval": SATELLITE_HEARTBEAT_INTERVAL,
+        }
+    )
 
 
 @app.post("/api/satellite/<sat_id>/heartbeat")
@@ -595,7 +412,7 @@ def satellite_heartbeat(sat_id):
 
 @app.delete("/api/satellite/<sat_id>")
 def satellite_deregister(sat_id):
-    data = validate_satellite_api_key()
+    validate_satellite_api_key()
     with satellite_lock:
         removed = satellites.pop(sat_id, None)
     if removed:
@@ -605,14 +422,13 @@ def satellite_deregister(sat_id):
 
 @app.get("/api/satellite/assign")
 def satellite_assign():
-    now = time.time()
     best = None
     best_score = -1
     with satellite_lock:
         for sat in satellites.values():
-            s = satellite_score(sat)
-            if s > best_score:
-                best_score = s
+            score = satellite_score(sat)
+            if score > best_score:
+                best_score = score
                 best = sat
     if best and best_score > 0:
         return jsonify({"satellite_url": best["url"]})
@@ -628,7 +444,6 @@ def satellite_list():
 
 
 if __name__ == "__main__":
-    socketio.start_background_task(status_watcher)
     ensure_stats_task()
     ensure_satellite_pruner()
-    socketio.run(app, host="0.0.0.0", port=5000, debug=APP_DEBUG, use_reloader=False)
+    app.run(host="0.0.0.0", port=5000, debug=APP_DEBUG, use_reloader=False, threaded=True)

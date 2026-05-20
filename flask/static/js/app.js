@@ -30,6 +30,7 @@ const statsRangeEl = document.querySelector(".stats-range");
 const statsSection = document.getElementById("stats-section");
 const satelliteSection = document.getElementById("satellite-section");
 const satelliteBody = document.getElementById("satellite-body");
+const presenceUrl = document.body?.dataset?.presenceUrl || "/presence";
 const scheduleLocale = "de-DE";
 const scheduleTheme = document.documentElement?.dataset?.theme || "ocean";
 const scheduleBaseUrl = (document.body?.dataset?.scheduleBaseUrl || "/data").replace(/\/$/, "");
@@ -73,6 +74,8 @@ const stallReloadGraceMs = 60000;
 const stallRecoveryCooldownMs = 4000;
 const playbackProgressEpsilonSeconds = 0.12;
 const playbackProgressGraceMs = 15000;
+const presencePollIntervalMs = 5000;
+const presenceFailureGraceMs = 8000;
 let allowAutoplay = true;
 const debugEnabled = document.body?.dataset?.debug === "1";
 let scheduleData = [];
@@ -89,7 +92,6 @@ let tabChannel = null;
 let startupPlayToken = 0;
 let tabLockEl = null;
 let playerReplaced = false;
-let socket = null;
 let stallStartedAt = 0;
 let lastStallRecoveryAt = 0;
 let playerStartedAt = 0;
@@ -188,18 +190,6 @@ const emitClientDebug = (event, details = {}, options = {}) => {
   const key = `${event}:${details?.code ?? details?.name ?? details?.reason ?? details?.type ?? ""}`;
   if (shouldThrottleClientLog(key, throttleMs)) {
     return;
-  }
-  if (socket && socket.connected) {
-    try {
-      socket.emit("client_debug", {
-        event,
-        details,
-        media: activeMediaState()
-      });
-      return;
-    } catch (error) {
-      debugLog(`client_debug failed: ${error?.message || error}`);
-    }
   }
   if (sendHttpFallback) {
     postClientLog(event, details);
@@ -1091,6 +1081,12 @@ const setStatus = (live) => {
   updateAudioControls();
 };
 
+const updateViewerCount = (count) => {
+  if (!clientsEl) return;
+  const normalized = Number.isFinite(count) ? count : 0;
+  clientsEl.textContent = `👥 ${normalized} Online`;
+};
+
 if (unmuteBtn) {
   unmuteBtn.addEventListener("click", () => {
     if (!mediaEl) return;
@@ -1111,7 +1107,7 @@ if (audioToggleBtn) {
       return;
     }
     let ready = audioLive;
-    if (ready === null || socket?.connected === false) {
+    if (ready === null) {
       ready = await fetchAudioStatus();
     }
     audioAvailable = ready;
@@ -1573,57 +1569,49 @@ if (claimOnLoad) {
   claimActiveTab("manual-reload");
 }
 
-const socketOptions = {
-  transports: ["websocket", "polling"],
-  upgrade: true,
-  timeout: 30000,
-  reconnection: true,
-  reconnectionAttempts: Infinity,
-  reconnectionDelay: 1000,
-  reconnectionDelayMax: 10000,
-  randomizationFactor: 0.5
+let presenceFailureTimer = null;
+
+const clearPresenceFailure = () => {
+  if (presenceFailureTimer === null) return;
+  clearTimeout(presenceFailureTimer);
+  presenceFailureTimer = null;
 };
-let socketDisconnectTimer = null;
-socket = io(socketOptions);
-socket.on("connect", () => {
-  if (socketDisconnectTimer !== null) {
-    clearTimeout(socketDisconnectTimer);
-    socketDisconnectTimer = null;
-  }
-  emitClientDebug(
-    "socket_connect",
-    {
-      socketId: socket?.id || "",
-      transport: socket?.io?.engine?.transport?.name || "unknown"
-    },
-    { throttleMs: 1000 }
-  );
-});
-socket.on("connect_error", (error) => {
-  emitClientDebug(
-    "socket_connect_error",
-    { message: error?.message || String(error) },
-    { throttleMs: 15000, sendHttpFallback: true }
-  );
-});
-socket.on("status", (data) => {
-  handleStatus(!!data?.live, data?.audio_live);
-});
-socket.on("clients", (data) => {
-  if (!clientsEl) return;
-  const count = Number.isFinite(data?.count) ? data.count : 0;
-  clientsEl.textContent = `👥 ${count} Online`;
-});
-socket.on("disconnect", (reason) => {
-  postClientLog("socket_disconnect", { reason: reason || "unknown" });
-  if (socketDisconnectTimer !== null) return;
-  socketDisconnectTimer = setTimeout(() => {
-    socketDisconnectTimer = null;
+
+const handlePresenceFailure = (reason) => {
+  postClientLog("presence_poll_failed", { reason });
+  if (presenceFailureTimer !== null) return;
+  presenceFailureTimer = setTimeout(() => {
+    presenceFailureTimer = null;
     audioLive = false;
     audioAvailable = false;
     setStatus(false);
+    updateViewerCount(0);
     if (started) {
       stopPlayer();
     }
-  }, 8000);
-});
+  }, presenceFailureGraceMs);
+};
+
+const pollPresence = async () => {
+  try {
+    const response = await fetch(presenceUrl, { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`presence fetch failed: ${response.status}`);
+    }
+    const data = await response.json();
+    clearPresenceFailure();
+    handleStatus(!!data?.live, data?.audio_live);
+    updateViewerCount(data?.count);
+  } catch (error) {
+    debugLog(`presence poll failed: ${error?.message || error}`);
+    emitClientDebug(
+      "presence_poll_failed",
+      { message: error?.message || String(error) },
+      { throttleMs: 15000, sendHttpFallback: true }
+    );
+    handlePresenceFailure(error?.message || String(error));
+  }
+};
+
+pollPresence();
+setInterval(pollPresence, presencePollIntervalMs);
