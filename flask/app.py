@@ -10,13 +10,6 @@ from urllib.parse import parse_qs, urlparse
 
 from flask import Flask, abort, jsonify, render_template, request, session, url_for
 
-app = Flask(__name__)
-SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
-if not SECRET_KEY:
-    SECRET_KEY = secrets.token_hex(32)
-app.config["SECRET_KEY"] = SECRET_KEY
-
-
 def get_env_default(key: str, default: str) -> str:
     value = os.getenv(key, "").strip()
     return value or default
@@ -24,6 +17,23 @@ def get_env_default(key: str, default: str) -> str:
 
 def parse_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_required_secret_key() -> str:
+    secret_key = os.getenv("SECRET_KEY", "").strip()
+    if not secret_key:
+        raise RuntimeError(
+            "SECRET_KEY is required. Set a stable random value in .env before starting the app."
+        )
+    if len(secret_key) < 32:
+        raise RuntimeError(
+            "SECRET_KEY is too short. Use at least 32 characters to keep sessions stable and secure."
+        )
+    return secret_key
+
+
+app = Flask(__name__)
+app.config["SECRET_KEY"] = get_required_secret_key()
 
 
 STREAM_NAME = os.getenv("STREAM_NAME", "live")
