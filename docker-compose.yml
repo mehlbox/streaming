@@ -74,7 +74,7 @@ services:
     command: >
       sh -c "
         pip install --no-cache-dir -r requirements.txt &&
-        python app.py
+        gunicorn --bind 0.0.0.0:5000 --workers 2 --threads 2 --timeout 60 --access-logfile - --error-logfile - app:app
       "
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request, socket; socket.setdefaulttimeout(2); urllib.request.urlopen('http://localhost:5000/status');"]
