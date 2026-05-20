@@ -59,7 +59,12 @@ def get_active_connections():
 
 
 def get_hls_viewer_count():
-    """Count unique IPs in HLS access log within rolling window. Falls back to stub_status."""
+    """Count unique viewer IPs in HLS access log within rolling window.
+
+    Satellite-proxied requests can be marked with an extra log field so the
+    origin agent ignores edge fetches instead of counting them as direct viewers.
+    Falls back to stub_status only when log-based counting is unavailable.
+    """
     if not HLS_ACCESS_LOG or not os.path.exists(HLS_ACCESS_LOG):
         return get_active_connections()
     now = time.time()
@@ -79,10 +84,14 @@ def get_hls_viewer_count():
             parts = line.split()
             if len(parts) >= 2:
                 try:
-                    if float(parts[1]) >= cutoff:
-                        unique_ips.add(parts[0])
+                    if float(parts[1]) < cutoff:
+                        continue
                 except ValueError:
-                    pass
+                    continue
+                via_satellite_proxy = len(parts) >= 3 and parts[2] == "1"
+                if via_satellite_proxy:
+                    continue
+                unique_ips.add(parts[0])
     except Exception:
         return get_active_connections()
     return len(unique_ips)

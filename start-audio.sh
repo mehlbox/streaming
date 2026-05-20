@@ -45,7 +45,9 @@ while true; do
   if [ -n "${AUDIO_INPUT_URL:-}" ]; then
     INPUT="${AUDIO_INPUT_URL}"
   else
-    INPUT="http://nginx/hls/${STREAM_NAME:-live}.m3u8"
+    # Read the live playlist directly from the shared HLS volume so the
+    # audio sidecar does not show up as an extra viewer in nginx access logs.
+    INPUT="/var/www/hls/${STREAM_NAME:-live}.m3u8"
   fi
 
   set -- -hide_banner -loglevel error -nostdin -fflags +genpts -rw_timeout 5000000
