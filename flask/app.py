@@ -1,14 +1,16 @@
 import ipaddress
 import os
 import secrets
+import re
 import sqlite3
 import time
 import uuid
 from pathlib import Path
 from threading import Lock, Thread
 from urllib.parse import parse_qs, urlparse
+from urllib.request import urlopen
 
-from flask import Flask, abort, jsonify, render_template, request, url_for
+from flask import Flask, abort, jsonify, make_response, render_template, request, url_for
 
 def get_env_default(key: str, default: str) -> str:
     value = os.getenv(key, "").strip()
@@ -46,6 +48,17 @@ STATE_CACHE_SECONDS = max(
     float(os.getenv("STATE_CACHE_SECONDS", "10")),
 )
 STATS_SAMPLE_SECONDS = int(os.getenv("STATS_SAMPLE_SECONDS", "60"))
+HLS_ACCESS_LOG = os.getenv("HLS_ACCESS_LOG", "").strip()
+HLS_VIEWER_WINDOW = max(
+    5.0,
+    float(os.getenv("HLS_VIEWER_WINDOW", "15")),
+)
+HLS_LOG_TAIL_BYTES = max(
+    65536,
+    int(os.getenv("HLS_LOG_TAIL_BYTES", str(1024 * 1024))),
+)
+NGINX_STATUS_URL = os.getenv("NGINX_STATUS_URL", "").strip()
+HLS_VIEWER_COOKIE = "stream_viewer"
 AUDIO_STREAM_NAME = os.getenv("AUDIO_STREAM_NAME", "").strip()
 AUDIO_HLS_URL = os.getenv("AUDIO_HLS_URL", "").strip()
 AUDIO_ONLY = parse_bool(os.getenv("AUDIO_ONLY", ""))
@@ -67,6 +80,7 @@ SATELLITE_API_KEY = os.getenv("SATELLITE_API_KEY", "").strip()
 SATELLITE_HEARTBEAT_INTERVAL = int(os.getenv("SATELLITE_HEARTBEAT_INTERVAL", "10"))
 SATELLITE_UNHEALTHY_SECONDS = int(os.getenv("SATELLITE_UNHEALTHY_SECONDS", "30"))
 SATELLITE_PRUNE_SECONDS = int(os.getenv("SATELLITE_PRUNE_SECONDS", "120"))
+LOCAL_SATELLITE_NAME = get_env_default("LOCAL_SATELLITE_NAME", "main")
 APP_DEBUG = parse_bool(os.getenv("APP_DEBUG", "0"))
 
 db_lock = Lock()
@@ -76,6 +90,7 @@ state_snapshot = {
     "live": False,
     "audio_live": False,
     "count": 0,
+    "local_count": 0,
 }
 state_task_started = False
 maintenance_task_started = False
@@ -100,19 +115,6 @@ def init_db() -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         with connect_db() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS viewer_presence (
-                    session_id TEXT PRIMARY KEY,
-                    last_seen INTEGER NOT NULL,
-                    remote_ip TEXT NOT NULL DEFAULT ''
-                )
-                """
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_viewer_presence_last_seen "
-                "ON viewer_presence(last_seen)"
-            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS viewer_stats (
@@ -142,7 +144,6 @@ def init_db() -> None:
             )
         db_ready = True
 
-
 def render_index(debug_enabled: bool):
     audio_hls_url = None
     if AUDIO_HLS_URL:
@@ -150,24 +151,37 @@ def render_index(debug_enabled: bool):
     elif AUDIO_STREAM_NAME:
         audio_hls_url = f"/hls/{AUDIO_STREAM_NAME}.m3u8"
     favicon_url = FAVICON_URL or url_for("static", filename="favicon.svg")
-    return render_template(
-        "index.html",
-        hls_url=f"/hls/{STREAM_NAME}.m3u8",
-        audio_hls_url=audio_hls_url,
-        theme=THEME,
-        site_title=SITE_TITLE,
-        site_subtitle=SITE_SUBTITLE,
-        page_title=PAGE_TITLE,
-        logo_url=LOGO_URL,
-        logo_alt=LOGO_ALT,
-        favicon_url=favicon_url,
-        favicon_type=FAVICON_TYPE,
-        audio_only=AUDIO_ONLY,
-        debug_enabled=debug_enabled,
-        footer_url=FOOTER_URL,
-        footer_text=FOOTER_TEXT,
-        schedule_base_url=SCHEDULE_BASE_URL,
+    response = make_response(
+        render_template(
+            "index.html",
+            hls_url=f"/hls/{STREAM_NAME}.m3u8",
+            audio_hls_url=audio_hls_url,
+            theme=THEME,
+            site_title=SITE_TITLE,
+            site_subtitle=SITE_SUBTITLE,
+            page_title=PAGE_TITLE,
+            logo_url=LOGO_URL,
+            logo_alt=LOGO_ALT,
+            favicon_url=favicon_url,
+            favicon_type=FAVICON_TYPE,
+            audio_only=AUDIO_ONLY,
+            debug_enabled=debug_enabled,
+            footer_url=FOOTER_URL,
+            footer_text=FOOTER_TEXT,
+            schedule_base_url=SCHEDULE_BASE_URL,
+        )
     )
+    if not request.cookies.get(HLS_VIEWER_COOKIE, "").strip():
+        response.set_cookie(
+            HLS_VIEWER_COOKIE,
+            secrets.token_urlsafe(18),
+            max_age=60 * 60 * 24 * 30,
+            httponly=True,
+            secure=not APP_DEBUG,
+            samesite="Lax",
+            path="/",
+        )
+    return response
 
 
 @app.get("/")
@@ -226,24 +240,141 @@ def shorten(value, max_len: int = 240):
     return text[: max_len - 3] + "..."
 
 
-def healthy_satellite_viewer_count(now: float | None = None) -> int:
+def parse_hls_log_line(line: str) -> tuple[float, str, bool] | None:
+    text = line.strip()
+    if not text:
+        return None
+    parts = text.split("|", 4)
+    if len(parts) != 5:
+        return None
+    ts_raw, viewer_cookie, _forwarded_for, _remote_addr, via_satellite = parts
+    try:
+        timestamp = float(ts_raw)
+    except ValueError:
+        return None
+    viewer_id = str(viewer_cookie or "").strip()
+    if not viewer_id or viewer_id == "-":
+        return None
+    return timestamp, viewer_id, via_satellite == "1"
+
+
+def local_hls_viewer_count(now: float | None = None) -> int | None:
+    if not HLS_ACCESS_LOG:
+        return None
+    log_path = Path(HLS_ACCESS_LOG)
+    if not log_path.exists():
+        return None
+    current = time.time() if now is None else now
+    cutoff = current - HLS_VIEWER_WINDOW
+    unique_ips: set[str] = set()
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(0, 2)
+            file_size = handle.tell()
+            offset = max(0, file_size - HLS_LOG_TAIL_BYTES)
+            handle.seek(offset)
+            data = handle.read().decode("utf-8", errors="ignore")
+    except OSError:
+        return None
+    lines = data.splitlines()
+    if offset > 0:
+        lines = lines[1:]
+    for line in lines:
+        parsed = parse_hls_log_line(line)
+        if not parsed:
+            continue
+        timestamp, viewer_id, via_satellite_proxy = parsed
+        if timestamp < cutoff or via_satellite_proxy or not viewer_id:
+            continue
+        unique_ips.add(viewer_id)
+    return len(unique_ips)
+
+
+def local_nginx_connection_count() -> int | None:
+    if not NGINX_STATUS_URL:
+        return None
+    try:
+        with urlopen(NGINX_STATUS_URL, timeout=2) as response:
+            payload = response.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+    match = re.search(r"Active connections:\s*(\d+)", payload)
+    if not match:
+        return None
+    return max(0, int(match.group(1)) - 1)
+
+
+def local_stream_viewer_count(now: float | None = None) -> tuple[int, bool]:
+    current = time.time() if now is None else now
+    log_count = local_hls_viewer_count(current)
+    if log_count is not None:
+        return log_count, True
+    connection_count = local_nginx_connection_count()
+    if connection_count is not None:
+        return connection_count, True
+    return 0, False
+
+
+def healthy_satellite_viewer_count(
+    now: float | None = None,
+    exclude_name: str | None = None,
+) -> int:
     init_db()
     current = time.time() if now is None else now
     cutoff = current - SATELLITE_UNHEALTHY_SECONDS
     with connect_db() as conn:
-        row = conn.execute(
-            """
-            SELECT COALESCE(SUM(viewer_count), 0) AS count
-            FROM satellites
-            WHERE last_heartbeat >= ?
-            """,
-            (cutoff,),
-        ).fetchone()
+        if exclude_name:
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(viewer_count), 0) AS count
+                FROM satellites
+                WHERE last_heartbeat >= ? AND name != ?
+                """,
+                (cutoff, exclude_name),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(viewer_count), 0) AS count
+                FROM satellites
+                WHERE last_heartbeat >= ?
+                """,
+                (cutoff,),
+            ).fetchone()
     return int(row["count"]) if row else 0
 
 
-def total_viewer_count() -> int:
-    return healthy_satellite_viewer_count()
+def total_viewer_count(
+    local_count: int | None = None,
+    local_observed: bool | None = None,
+) -> int:
+    if local_observed is None:
+        computed_local_count, computed_local_observed = local_stream_viewer_count()
+        local_count = computed_local_count
+        local_observed = computed_local_observed
+    satellite_count = healthy_satellite_viewer_count(
+        exclude_name=LOCAL_SATELLITE_NAME if local_observed else None
+    )
+    if local_observed:
+        return max(0, int(local_count or 0)) + satellite_count
+    return satellite_count
+
+
+def build_state_snapshot(
+    local_count: int | None = None,
+    local_observed: bool | None = None,
+) -> dict[str, int | bool]:
+    if local_observed is None:
+        computed_local_count, computed_local_observed = local_stream_viewer_count()
+        local_count = computed_local_count
+        local_observed = computed_local_observed
+    local = max(0, int(local_count or 0)) if local_observed else 0
+    return {
+        "live": is_live(),
+        "audio_live": is_audio_live(),
+        "count": total_viewer_count(local_count=local, local_observed=bool(local_observed)),
+        "local_count": local,
+    }
 
 
 def current_state_snapshot() -> dict[str, int | bool]:
@@ -252,11 +383,7 @@ def current_state_snapshot() -> dict[str, int | bool]:
 
 
 def refresh_state_snapshot() -> None:
-    snapshot = {
-        "live": is_live(),
-        "audio_live": is_audio_live(),
-        "count": total_viewer_count(),
-    }
+    snapshot = build_state_snapshot()
     with state_lock:
         state_snapshot.update(snapshot)
 

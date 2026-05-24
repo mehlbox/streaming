@@ -58,6 +58,24 @@ def get_active_connections():
     return 0
 
 
+def parse_hls_log_line(line):
+    text = str(line or "").strip()
+    if not text:
+        return None
+    parts = text.split("|", 4)
+    if len(parts) != 5:
+        return None
+    ts_raw, viewer_cookie, _forwarded_for, _remote_addr, via_satellite = parts
+    try:
+        timestamp = float(ts_raw)
+    except ValueError:
+        return None
+    viewer_id = str(viewer_cookie or "").strip()
+    if not viewer_id or viewer_id == "-":
+        return None
+    return timestamp, viewer_id, via_satellite == "1"
+
+
 def get_hls_viewer_count():
     """Count unique viewer IPs in HLS access log within rolling window.
 
@@ -81,17 +99,13 @@ def get_hls_viewer_count():
         if offset > 0:
             lines = lines[1:]  # skip potentially incomplete first line
         for line in lines:
-            parts = line.split()
-            if len(parts) >= 2:
-                try:
-                    if float(parts[1]) < cutoff:
-                        continue
-                except ValueError:
-                    continue
-                via_satellite_proxy = len(parts) >= 3 and parts[2] == "1"
-                if via_satellite_proxy:
-                    continue
-                unique_ips.add(parts[0])
+            parsed = parse_hls_log_line(line)
+            if not parsed:
+                continue
+            timestamp, viewer_id, via_satellite_proxy = parsed
+            if timestamp < cutoff or via_satellite_proxy or not viewer_id:
+                continue
+            unique_ips.add(viewer_id)
     except Exception:
         return get_active_connections()
     return len(unique_ips)

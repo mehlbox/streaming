@@ -92,6 +92,9 @@ services:
     environment:
       FLASK_ENV: production
       FLASK_APP: app.py
+      HLS_ACCESS_LOG: /hls-logs/hls.log
+      NGINX_STATUS_URL: http://nginx/nginx-status
+      LOCAL_SATELLITE_NAME: main
     expose:
       - "5000"
     working_dir: /app
@@ -99,6 +102,7 @@ services:
       - ./flask:/app
       - ./data:/var/www/data:ro
       - hls_data:/var/www/hls:ro
+      - hls_logs:/hls-logs:ro
     command:
       - sh
       - -c
