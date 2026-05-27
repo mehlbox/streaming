@@ -1,0 +1,11 @@
+__SATELLITE_HOST__ {
+  handle /hls/* {
+    reverse_proxy 127.0.0.1:__SATELLITE_PORT__
+  }
+
+  handle /health {
+    reverse_proxy 127.0.0.1:__SATELLITE_PORT__
+  }
+
+  respond 404
+}

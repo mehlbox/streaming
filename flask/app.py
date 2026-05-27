@@ -1,16 +1,25 @@
 import ipaddress
+import http.client
 import os
 import secrets
 import re
+import socket
 import sqlite3
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock, Thread
 from urllib.parse import parse_qs, urlparse
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from flask import Flask, Response, abort, jsonify, make_response, render_template, request, url_for
+try:
+    import dns.exception
+    import dns.resolver
+except ImportError:  # pragma: no cover - fallback until dependencies are installed
+    dns = None
 
 def get_env_default(key: str, default: str) -> str:
     value = os.getenv(key, "").strip()
@@ -59,6 +68,7 @@ HLS_LOG_TAIL_BYTES = max(
 )
 NGINX_STATUS_URL = os.getenv("NGINX_STATUS_URL", "").strip()
 HLS_VIEWER_COOKIE = "stream_viewer"
+HLS_VIEWER_COOKIE_DOMAIN = os.getenv("HLS_VIEWER_COOKIE_DOMAIN", "").strip().lstrip(".")
 AUDIO_STREAM_NAME = os.getenv("AUDIO_STREAM_NAME", "").strip()
 AUDIO_HLS_URL = os.getenv("AUDIO_HLS_URL", "").strip()
 AUDIO_ONLY = parse_bool(os.getenv("AUDIO_ONLY", ""))
@@ -76,12 +86,26 @@ FAVICON_TYPE = get_env_default("FAVICON_TYPE", "image/svg+xml")
 FOOTER_URL = get_env_default("FOOTER_URL", "")
 FOOTER_TEXT = get_env_default("FOOTER_TEXT", "Your Footers Here")
 SCHEDULE_BASE_URL = get_env_default("SCHEDULE_BASE_URL", "/static/data")
+STREAMING_HOST = os.getenv("STREAMING_HOST", "").strip()
 SATELLITE_API_KEY = os.getenv("SATELLITE_API_KEY", "").strip()
 SATELLITE_BOOTSTRAP_TOKEN = os.getenv("SATELLITE_BOOTSTRAP_TOKEN", "").strip()
+SATELLITE_BOOTSTRAP_ORIGIN_URL = (
+    os.getenv("SATELLITE_BOOTSTRAP_ORIGIN_URL", "").strip()
+    or os.getenv("PUBLIC_BASE_URL", "").strip()
+    or os.getenv("MAIN_SERVER_URL", "").strip()
+)
 SATELLITE_HEARTBEAT_INTERVAL = int(os.getenv("SATELLITE_HEARTBEAT_INTERVAL", "10"))
 SATELLITE_UNHEALTHY_SECONDS = int(os.getenv("SATELLITE_UNHEALTHY_SECONDS", "30"))
 SATELLITE_PRUNE_SECONDS = int(os.getenv("SATELLITE_PRUNE_SECONDS", "120"))
 LOCAL_SATELLITE_NAME = get_env_default("LOCAL_SATELLITE_NAME", "main")
+DNS_CHECK_CACHE_SECONDS = max(10.0, float(os.getenv("DNS_CHECK_CACHE_SECONDS", "60")))
+DNS_CHECK_TIMEOUT_SECONDS = max(1.0, float(os.getenv("DNS_CHECK_TIMEOUT_SECONDS", "3")))
+DNS_CHECK_NAMESERVERS = [
+    entry.strip()
+    for entry in os.getenv("DNS_CHECK_NAMESERVERS", "1.1.1.1,8.8.8.8,9.9.9.9").split(",")
+    if entry.strip()
+]
+DNS_CHECK_QUORUM = max(1, min(len(DNS_CHECK_NAMESERVERS), int(os.getenv("DNS_CHECK_QUORUM", "2"))))
 SATELLITE_BOOTSTRAP_INSTALL_DIR = (
     os.getenv("SATELLITE_BOOTSTRAP_INSTALL_DIR", "/opt/streaming-satellite").strip()
     or "/opt/streaming-satellite"
@@ -89,7 +113,20 @@ SATELLITE_BOOTSTRAP_INSTALL_DIR = (
 SATELLITE_BOOTSTRAP_DIR = Path(
     os.getenv("SATELLITE_BOOTSTRAP_DIR", "/bootstrap/satellite").strip() or "/bootstrap/satellite"
 )
+SATELLITE_PROBE_TIMEOUT_SECONDS = max(
+    1.0,
+    float(os.getenv("SATELLITE_PROBE_TIMEOUT_SECONDS", "5")),
+)
+SATELLITE_PROBE_CACHE_SECONDS = max(
+    5.0,
+    float(os.getenv("SATELLITE_PROBE_CACHE_SECONDS", "15")),
+)
 APP_DEBUG = parse_bool(os.getenv("APP_DEBUG", "0"))
+PUBLIC_ORIGIN_URL = (
+    os.getenv("PUBLIC_BASE_URL", "").strip()
+    or SATELLITE_BOOTSTRAP_ORIGIN_URL
+    or (f"https://{STREAMING_HOST}" if STREAMING_HOST else "")
+).rstrip("/")
 
 db_lock = Lock()
 db_ready = False
@@ -102,6 +139,40 @@ state_snapshot = {
 }
 state_task_started = False
 maintenance_task_started = False
+dns_cache_lock = Lock()
+dns_cache: dict[str, tuple[float, dict[str, object]]] = {}
+probe_cache_lock = Lock()
+probe_cache: dict[str, tuple[float, dict[str, object]]] = {}
+
+
+class FixedAddressHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host: str, connect_host: str, *args, **kwargs):
+        self._connect_host = connect_host
+        super().__init__(host, *args, **kwargs)
+
+    def connect(self):
+        self.sock = socket.create_connection(
+            (self._connect_host, self.port),
+            self.timeout,
+            self.source_address,
+        )
+
+
+class FixedAddressHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host: str, connect_host: str, *args, **kwargs):
+        self._connect_host = connect_host
+        super().__init__(host, *args, **kwargs)
+
+    def connect(self):
+        sock = socket.create_connection(
+            (self._connect_host, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        if self._tunnel_host:
+            self.sock = sock
+            self._tunnel()
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
 
 
 def connect_db() -> sqlite3.Connection:
@@ -137,6 +208,7 @@ def init_db() -> None:
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL DEFAULT '',
                     url TEXT NOT NULL,
+                    observed_ip TEXT NOT NULL DEFAULT '',
                     cpu_percent REAL NOT NULL DEFAULT 0,
                     bandwidth_mbps REAL NOT NULL DEFAULT 0,
                     viewer_count INTEGER NOT NULL DEFAULT 0,
@@ -150,6 +222,14 @@ def init_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_satellites_last_heartbeat "
                 "ON satellites(last_heartbeat)"
             )
+            satellite_columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(satellites)").fetchall()
+            }
+            if "observed_ip" not in satellite_columns:
+                conn.execute(
+                    "ALTER TABLE satellites ADD COLUMN observed_ip TEXT NOT NULL DEFAULT ''"
+                )
         db_ready = True
 
 def render_index(debug_enabled: bool):
@@ -179,15 +259,18 @@ def render_index(debug_enabled: bool):
             schedule_base_url=SCHEDULE_BASE_URL,
         )
     )
-    if not request.cookies.get(HLS_VIEWER_COOKIE, "").strip():
+    current_viewer_cookie = request.cookies.get(HLS_VIEWER_COOKIE, "").strip()
+    should_set_viewer_cookie = (not current_viewer_cookie) or bool(HLS_VIEWER_COOKIE_DOMAIN)
+    if should_set_viewer_cookie:
         response.set_cookie(
             HLS_VIEWER_COOKIE,
-            secrets.token_urlsafe(18),
+            current_viewer_cookie or secrets.token_urlsafe(18),
             max_age=60 * 60 * 24 * 30,
             httponly=True,
             secure=not APP_DEBUG,
             samesite="Lax",
             path="/",
+            domain=HLS_VIEWER_COOKIE_DOMAIN or None,
         )
     return response
 
@@ -225,13 +308,9 @@ def is_audio_live() -> bool:
 def is_private_addr(addr: str) -> bool:
     if not addr:
         return False
-    candidate = addr.strip()
-    if candidate.startswith("["):
-        end = candidate.find("]")
-        if end != -1:
-            candidate = candidate[1:end]
-    elif ":" in candidate:
-        candidate = candidate.split(":", 1)[0]
+    candidate = normalize_ip_address(addr)
+    if not candidate:
+        return False
     try:
         ip = ipaddress.ip_address(candidate)
     except ValueError:
@@ -246,6 +325,41 @@ def shorten(value, max_len: int = 240):
     if len(text) <= max_len:
         return text
     return text[: max_len - 3] + "..."
+
+
+def normalize_ip_address(addr: str) -> str:
+    candidate = str(addr or "").strip()
+    if not candidate:
+        return ""
+    if candidate.startswith("["):
+        end = candidate.find("]")
+        if end != -1:
+            candidate = candidate[1:end]
+    try:
+        return ipaddress.ip_address(candidate).compressed
+    except ValueError:
+        pass
+    if candidate.count(":") == 1 and "." in candidate:
+        candidate = candidate.split(":", 1)[0].strip()
+    try:
+        return ipaddress.ip_address(candidate).compressed
+    except ValueError:
+        return ""
+
+
+def observed_request_ip() -> str:
+    candidates = []
+    forwarded = request.headers.get("X-Forwarded-For", "").strip()
+    if forwarded:
+        candidates.extend(part.strip() for part in forwarded.split(","))
+    if request.remote_addr:
+        candidates.append(request.remote_addr)
+    normalized = [normalize_ip_address(candidate) for candidate in candidates]
+    normalized = [candidate for candidate in normalized if candidate]
+    for candidate in normalized:
+        if not is_private_addr(candidate):
+            return candidate
+    return normalized[0] if normalized else ""
 
 
 def shell_quote(value: str) -> str:
@@ -278,6 +392,263 @@ def normalize_satellite_public_url(value: str) -> str:
     if parsed.path not in {"", "/"}:
         abort(400, "public_url must point to the satellite /hls base")
     return f"{parsed.scheme}://{parsed.netloc}/hls"
+
+
+def bootstrap_upstream_target(origin_url: str) -> tuple[str, str]:
+    parsed = urlparse((origin_url or "").strip())
+    upstream_host = parsed.hostname or ""
+    if not upstream_host:
+        return origin_url, ""
+    # Keep the origin hostname in the generated installer instead of pinning
+    # whatever address the bootstrap server happens to resolve at render time.
+    return origin_url, upstream_host
+
+
+def satellite_health_url(value: str) -> str:
+    parsed = urlparse((value or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}/health"
+
+
+def satellite_manifest_url(value: str) -> str:
+    parsed = urlparse((value or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    base_path = parsed.path.rstrip("/")
+    if base_path.endswith("/hls"):
+        return f"{parsed.scheme}://{parsed.netloc}{base_path}/live.m3u8"
+    return f"{parsed.scheme}://{parsed.netloc}{base_path}/hls/live.m3u8"
+
+
+def http_probe_once(
+    url: str,
+    headers: dict[str, str] | None = None,
+    connect_ip: str = "",
+) -> dict[str, object]:
+    parsed = urlparse(url)
+    request_headers = {"User-Agent": "streaming-status/1.0"}
+    if headers:
+        request_headers.update({key: value for key, value in headers.items() if value})
+    host = parsed.hostname or ""
+    if host and "Host" not in request_headers:
+        request_headers["Host"] = parsed.netloc
+    target = normalize_ip_address(connect_ip)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    scheme = parsed.scheme.lower()
+    port = parsed.port or (443 if scheme == "https" else 80)
+    connection = None
+    try:
+        if scheme == "https":
+            if target:
+                connection = FixedAddressHTTPSConnection(
+                    host,
+                    target,
+                    port=port,
+                    timeout=SATELLITE_PROBE_TIMEOUT_SECONDS,
+                )
+            else:
+                connection = http.client.HTTPSConnection(
+                    host,
+                    port=port,
+                    timeout=SATELLITE_PROBE_TIMEOUT_SECONDS,
+                )
+        elif scheme == "http":
+            if target:
+                connection = FixedAddressHTTPConnection(
+                    host,
+                    target,
+                    port=port,
+                    timeout=SATELLITE_PROBE_TIMEOUT_SECONDS,
+                )
+            else:
+                connection = http.client.HTTPConnection(
+                    host,
+                    port=port,
+                    timeout=SATELLITE_PROBE_TIMEOUT_SECONDS,
+                )
+        else:
+            return {
+                "status": 0,
+                "headers": {},
+                "body": "",
+                "final_url": url,
+                "error": "Unsupported scheme",
+            }
+        connection.request("GET", path, headers=request_headers)
+        response = connection.getresponse()
+        body = response.read(256).decode("utf-8", errors="ignore")
+        return {
+            "status": int(getattr(response, "status", 200) or 200),
+            "headers": dict(response.getheaders()),
+            "body": body,
+            "final_url": url,
+            "error": "",
+        }
+    except (OSError, http.client.HTTPException, TimeoutError) as exc:
+        return {
+            "status": 0,
+            "headers": {},
+            "body": "",
+            "final_url": url,
+            "error": shorten(getattr(exc, "strerror", None) or str(exc), 120) or "",
+        }
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        return {
+            "status": 0,
+            "headers": {},
+            "body": "",
+            "final_url": url,
+            "error": shorten(str(exc), 120) or "",
+        }
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def probe_candidate_ips(url: str, observed_ip: str = "") -> list[str]:
+    parsed = urlparse(str(url or "").strip())
+    host = parsed.hostname or ""
+    candidates: list[str] = []
+    normalized_observed = normalize_ip_address(observed_ip)
+    if normalized_observed and not is_private_addr(normalized_observed):
+        candidates.append(normalized_observed)
+    if not host:
+        return candidates
+    try:
+        normalized_host = ipaddress.ip_address(host).compressed
+    except ValueError:
+        resolved = resolve_dns_addresses(host)
+        for address in resolved.get("dns_addresses", []):
+            normalized = normalize_ip_address(str(address))
+            if normalized and normalized not in candidates:
+                candidates.append(normalized)
+    else:
+        if normalized_host not in candidates:
+            candidates.append(normalized_host)
+    return candidates
+
+
+def http_probe(
+    url: str,
+    headers: dict[str, str] | None = None,
+    observed_ip: str = "",
+) -> dict[str, object]:
+    last_result: dict[str, object] | None = None
+    for candidate in probe_candidate_ips(url, observed_ip):
+        result = http_probe_once(url, headers, candidate)
+        last_result = result
+        if int(result.get("status", 0) or 0) > 0:
+            return result
+    if last_result is not None:
+        return last_result
+    return http_probe_once(url, headers)
+
+
+def public_probe_status_for_url(value: str, observed_ip: str = "", now: float | None = None) -> dict[str, object]:
+    current = time.time() if now is None else now
+    normalized_value = str(value or "").strip()
+    cache_key = f"{normalized_value}|{normalize_ip_address(observed_ip)}"
+    if not normalized_value:
+        return {
+            "public_ok": False,
+            "health_ok": False,
+            "health_label": "No URL",
+            "health_status": 0,
+            "health_url": "",
+            "hls_ok": False,
+            "hls_label": "No URL",
+            "hls_status": 0,
+            "hls_url": "",
+            "hls_allow_origin": "",
+            "hls_allow_credentials": "",
+        }
+
+    with probe_cache_lock:
+        cached = probe_cache.get(cache_key)
+    if cached and current - cached[0] <= SATELLITE_PROBE_CACHE_SECONDS:
+        return dict(cached[1])
+
+    health_url = satellite_health_url(normalized_value)
+    hls_url = satellite_manifest_url(normalized_value)
+    origin_headers = {"Origin": PUBLIC_ORIGIN_URL} if PUBLIC_ORIGIN_URL else {}
+    viewer_headers = dict(origin_headers)
+    viewer_headers["Cookie"] = f"{HLS_VIEWER_COOKIE}=status-probe"
+
+    health_probe = (
+        http_probe(health_url, origin_headers, observed_ip)
+        if health_url else
+        {"status": 0, "body": "", "error": "Missing URL"}
+    )
+    hls_probe = (
+        http_probe(hls_url, viewer_headers, observed_ip)
+        if hls_url else
+        {"status": 0, "body": "", "error": "Missing URL"}
+    )
+
+    health_body = str(health_probe.get("body", "") or "").strip().lower()
+    health_status = int(health_probe.get("status", 0) or 0)
+    health_ok = health_status == 200 and (not health_body or health_body.startswith("ok"))
+    health_label = "200" if health_ok else (
+        str(health_status) if health_status else shorten(str(health_probe.get("error", "") or "Fail"), 24)
+    )
+
+    hls_status = int(hls_probe.get("status", 0) or 0)
+    hls_headers = {str(key).lower(): str(value) for key, value in dict(hls_probe.get("headers", {})).items()}
+    hls_body = str(hls_probe.get("body", "") or "")
+    content_type = hls_headers.get("content-type", "").lower()
+    allow_origin = hls_headers.get("access-control-allow-origin", "")
+    allow_credentials = hls_headers.get("access-control-allow-credentials", "")
+    manifest_ok = hls_status == 200 and (
+        "#EXTM3U" in hls_body or "application/vnd.apple.mpegurl" in content_type
+    )
+    cors_ok = True
+    if PUBLIC_ORIGIN_URL:
+        cors_ok = allow_origin == PUBLIC_ORIGIN_URL and allow_credentials.lower() == "true"
+    hls_ok = manifest_ok and cors_ok
+    if hls_ok:
+        hls_label = "200"
+    elif manifest_ok and not cors_ok:
+        hls_label = "CORS"
+    elif hls_status:
+        hls_label = str(hls_status)
+    else:
+        hls_label = shorten(str(hls_probe.get("error", "") or "Fail"), 24)
+
+    resolved = {
+        "public_ok": health_ok and hls_ok,
+        "health_ok": health_ok,
+        "health_label": health_label,
+        "health_status": health_status,
+        "health_url": health_url,
+        "hls_ok": hls_ok,
+        "hls_label": hls_label,
+        "hls_status": hls_status,
+        "hls_url": hls_url,
+        "hls_allow_origin": allow_origin,
+        "hls_allow_credentials": allow_credentials,
+    }
+    with probe_cache_lock:
+        probe_cache[cache_key] = (current, resolved)
+    return dict(resolved)
+
+
+def local_probe_status_for_url(value: str) -> dict[str, object]:
+    return {
+        "public_ok": True,
+        "health_ok": True,
+        "health_label": "Local",
+        "health_status": 200,
+        "health_url": satellite_health_url(value),
+        "hls_ok": True,
+        "hls_label": "Same-origin",
+        "hls_status": 200,
+        "hls_url": satellite_manifest_url(value),
+        "hls_allow_origin": "",
+        "hls_allow_credentials": "",
+    }
 
 
 def bootstrap_file_text(name: str) -> str:
@@ -322,8 +693,9 @@ def render_satellite_bootstrap_script() -> str:
         abort(400, "Invalid capacity")
     install_dir = shorten(request.args.get("install_dir", SATELLITE_BOOTSTRAP_INSTALL_DIR), 240)
     name = shorten(request.args.get("name", ""), 120)
+    default_origin_url = SATELLITE_BOOTSTRAP_ORIGIN_URL or request_external_base_url()
     origin_url = require_http_url(
-        request.args.get("origin_url", "") or request_external_base_url(),
+        request.args.get("origin_url", "") or default_origin_url,
         "origin_url",
         allow_path=False,
     )
@@ -331,6 +703,7 @@ def render_satellite_bootstrap_script() -> str:
     if not raw_public_url:
         abort(400, "Missing public_url")
     public_url = normalize_satellite_public_url(raw_public_url)
+    origin_upstream_url, origin_upstream_host = bootstrap_upstream_target(origin_url)
     nginx_template = bootstrap_file_text("nginx.host.conf.template")
 
     return render_bootstrap_asset(
@@ -341,11 +714,14 @@ def render_satellite_bootstrap_script() -> str:
             "__SATELLITE_PUBLIC_URL_QUOTED__": shell_quote(public_url),
             "__SATELLITE_MAX_VIEWERS_QUOTED__": shell_quote(str(capacity)),
             "__MAIN_SERVER_URL_QUOTED__": shell_quote(origin_url),
+            "__MAIN_SERVER_UPSTREAM_URL_QUOTED__": shell_quote(origin_upstream_url),
+            "__MAIN_SERVER_UPSTREAM_HOST_QUOTED__": shell_quote(origin_upstream_host),
             "__SATELLITE_PORT_QUOTED__": shell_quote(str(port)),
             "__SATELLITE_API_KEY_QUOTED__": shell_quote(SATELLITE_API_KEY),
             "__AGENT_PY__": bootstrap_file_text("agent.py"),
             "__REQUIREMENTS_TXT__": bootstrap_file_text("requirements.txt"),
             "__NGINX_CONF_TEMPLATE__": nginx_template,
+            "__CADDYFILE_TEMPLATE__": bootstrap_file_text("Caddyfile.template"),
         },
     )
 
@@ -654,22 +1030,203 @@ def satellite_score(row: sqlite3.Row) -> float:
     return headroom * (1 - min(cpu, 100.0) / 100.0)
 
 
+def is_local_satellite(row: sqlite3.Row) -> bool:
+    return str(row["name"] or "").strip() == LOCAL_SATELLITE_NAME
+
+
+def satellite_heartbeat_healthy(row: sqlite3.Row, now: float | None = None) -> bool:
+    current = time.time() if now is None else now
+    return current - float(row["last_heartbeat"]) <= SATELLITE_UNHEALTHY_SECONDS
+
+
+def resolve_dns_addresses(host: str) -> dict[str, object]:
+    if dns is not None and DNS_CHECK_NAMESERVERS:
+        vote_counts: dict[str, int] = {}
+        errors: list[str] = []
+        for nameserver in DNS_CHECK_NAMESERVERS:
+            resolver = dns.resolver.Resolver(configure=False)
+            resolver.nameservers = [nameserver]
+            resolver.timeout = DNS_CHECK_TIMEOUT_SECONDS
+            resolver.lifetime = DNS_CHECK_TIMEOUT_SECONDS
+            try:
+                for record_type in ("A", "AAAA"):
+                    try:
+                        answers = resolver.resolve(host, record_type)
+                    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+                        continue
+                    seen_for_resolver: set[str] = set()
+                    for answer in answers:
+                        normalized = normalize_ip_address(getattr(answer, "address", str(answer)))
+                        if normalized and normalized not in seen_for_resolver:
+                            seen_for_resolver.add(normalized)
+                    for normalized in seen_for_resolver:
+                        vote_counts[normalized] = vote_counts.get(normalized, 0) + 1
+            except dns.exception.DNSException as exc:
+                errors.append(f"{nameserver}:{shorten(str(exc), 40)}")
+                continue
+
+        addresses = sorted(
+            address
+            for address, count in vote_counts.items()
+            if count >= DNS_CHECK_QUORUM
+        )
+        if addresses:
+            return {
+                "dns_host": host,
+                "dns_addresses": addresses,
+                "dns_error": "",
+                "dns_source": f"public:{','.join(DNS_CHECK_NAMESERVERS)} quorum={DNS_CHECK_QUORUM}",
+            }
+
+        if vote_counts:
+            return {
+                "dns_host": host,
+                "dns_addresses": sorted(vote_counts),
+                "dns_error": f"No quorum ({DNS_CHECK_QUORUM}/{len(DNS_CHECK_NAMESERVERS)})",
+                "dns_source": f"public:{','.join(DNS_CHECK_NAMESERVERS)} quorum={DNS_CHECK_QUORUM}",
+            }
+
+        if errors:
+            return {
+                "dns_host": host,
+                "dns_addresses": [],
+                "dns_error": shorten("; ".join(errors), 80),
+                "dns_source": f"public:{','.join(DNS_CHECK_NAMESERVERS)} quorum={DNS_CHECK_QUORUM}",
+            }
+
+        return {
+            "dns_host": host,
+            "dns_addresses": [],
+            "dns_error": "",
+            "dns_source": f"public:{','.join(DNS_CHECK_NAMESERVERS)} quorum={DNS_CHECK_QUORUM}",
+        }
+
+    try:
+        results = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+        addresses = sorted({normalize_ip_address(item[4][0]) for item in results if item[4]})
+        return {
+            "dns_host": host,
+            "dns_addresses": [address for address in addresses if address],
+            "dns_error": "",
+            "dns_source": "system-resolver",
+        }
+    except OSError as exc:
+        return {
+            "dns_host": host,
+            "dns_addresses": [],
+            "dns_error": shorten(getattr(exc, "strerror", None) or str(exc), 80),
+            "dns_source": "system-resolver",
+        }
+
+
+def dns_status_for_url(url: str, observed_ip: str = "", now: float | None = None) -> dict[str, object]:
+    current = time.time() if now is None else now
+    host = urlparse(str(url or "").strip()).hostname or ""
+    normalized_observed_ip = normalize_ip_address(observed_ip)
+    observed_public = bool(normalized_observed_ip) and not is_private_addr(normalized_observed_ip)
+    if not host:
+        return {
+            "dns_ok": False,
+            "dns_label": "Invalid URL",
+            "dns_host": "",
+            "dns_addresses": [],
+            "dns_matches_observed": False,
+            "observed_ip": normalized_observed_ip,
+            "dns_source": "",
+        }
+    try:
+        normalized_host_ip = ipaddress.ip_address(host).compressed
+    except ValueError:
+        pass
+    else:
+        matches_observed = (not observed_public) or normalized_host_ip == normalized_observed_ip
+        return {
+            "dns_ok": matches_observed,
+            "dns_label": "Direct IP" if not observed_public else ("Match" if matches_observed else "Mismatch"),
+            "dns_host": host,
+            "dns_addresses": [normalized_host_ip],
+            "dns_matches_observed": matches_observed,
+            "observed_ip": normalized_observed_ip,
+            "dns_source": "direct-ip",
+        }
+
+    resolved: dict[str, object] | None = None
+    with dns_cache_lock:
+        cached = dns_cache.get(host)
+        if cached and current - cached[0] <= DNS_CHECK_CACHE_SECONDS:
+            resolved = dict(cached[1])
+
+    if resolved is None:
+        resolved = resolve_dns_addresses(host)
+        with dns_cache_lock:
+            dns_cache[host] = (current, resolved)
+
+    addresses = list(resolved.get("dns_addresses", []))
+    dns_error = str(resolved.get("dns_error", "") or "")
+    dns_source = str(resolved.get("dns_source", "") or "")
+    if dns_error:
+        return {
+            "dns_ok": False,
+            "dns_label": dns_error,
+            "dns_host": host,
+            "dns_addresses": addresses,
+            "dns_matches_observed": False,
+            "observed_ip": normalized_observed_ip,
+            "dns_source": dns_source,
+        }
+    if not addresses:
+        return {
+            "dns_ok": False,
+            "dns_label": "No records",
+            "dns_host": host,
+            "dns_addresses": [],
+            "dns_matches_observed": False,
+            "observed_ip": normalized_observed_ip,
+            "dns_source": dns_source,
+        }
+
+    matches_observed = (not observed_public) or normalized_observed_ip in addresses
+    data = {
+        "dns_ok": matches_observed,
+        "dns_label": (
+            "Resolved" if not observed_public else ("Match" if matches_observed else "Mismatch")
+        ),
+        "dns_host": host,
+        "dns_addresses": addresses,
+        "dns_matches_observed": matches_observed,
+        "observed_ip": normalized_observed_ip,
+        "dns_source": dns_source,
+    }
+    return data
+
+
 def satellite_info(row: sqlite3.Row, now: float | None = None) -> dict[str, str | int | float | bool]:
     current = time.time() if now is None else now
     last_heartbeat = float(row["last_heartbeat"])
     age = round(current - last_heartbeat, 1)
-    healthy = age <= SATELLITE_UNHEALTHY_SECONDS
-    return {
+    heartbeat_healthy = satellite_heartbeat_healthy(row, current)
+    local_satellite = is_local_satellite(row)
+    info = {
         "id": row["id"],
         "name": row["name"],
         "url": row["url"],
+        "observed_ip": normalize_ip_address(str(row["observed_ip"] or "")),
         "viewer_count": int(row["viewer_count"]),
         "cpu_percent": float(row["cpu_percent"]),
         "bandwidth_mbps": float(row["bandwidth_mbps"]),
         "capacity_max_viewers": int(row["capacity_max_viewers"]),
         "last_heartbeat_age": age,
-        "healthy": healthy,
+        "heartbeat_healthy": heartbeat_healthy,
+        "local": local_satellite,
     }
+    info.update(dns_status_for_url(str(row["url"] or ""), str(row["observed_ip"] or ""), current))
+    if local_satellite:
+        info.update(local_probe_status_for_url(str(row["url"] or "")))
+        info["healthy"] = bool(info["heartbeat_healthy"]) and bool(info["dns_ok"])
+    else:
+        info.update(public_probe_status_for_url(str(row["url"] or ""), str(row["observed_ip"] or ""), current))
+        info["healthy"] = bool(info["heartbeat_healthy"]) and bool(info["public_ok"])
+    return info
 
 
 @app.post("/api/satellite/register")
@@ -678,6 +1235,7 @@ def satellite_register():
     data = validate_satellite_api_key()
     name = shorten(data.get("name", ""), 120)
     url = shorten(data.get("url", ""), 500)
+    observed_ip = observed_request_ip()
     if not url:
         abort(400, "Missing satellite url")
     sat_id = str(uuid.uuid4())
@@ -687,14 +1245,28 @@ def satellite_register():
             conn.execute(
                 """
                 INSERT INTO satellites(
-                    id, name, url, cpu_percent, bandwidth_mbps,
+                    id, name, url, observed_ip, cpu_percent, bandwidth_mbps,
                     viewer_count, capacity_max_viewers, last_heartbeat, registered_at
-                ) VALUES(?, ?, ?, 0, 0, 0, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, 0, 0, 0, ?, ?, ?)
                 """,
-                (sat_id, name, url, int(data.get("capacity_max_viewers", 100)), now, now),
+                (
+                    sat_id,
+                    name,
+                    url,
+                    observed_ip,
+                    int(data.get("capacity_max_viewers", 100)),
+                    now,
+                    now,
+                ),
             )
     ensure_maintenance_tasks()
-    app.logger.info("Satellite registered: %s (%s) at %s", sat_id, name, url)
+    app.logger.info(
+        "Satellite registered: %s (%s) at %s observed_ip=%s",
+        sat_id,
+        name,
+        url,
+        observed_ip or "-",
+    )
     return jsonify(
         {
             "id": sat_id,
@@ -708,16 +1280,18 @@ def satellite_heartbeat(sat_id):
     init_db()
     data = validate_satellite_api_key()
     updated_at = time.time()
+    observed_ip = observed_request_ip()
     with connect_db() as conn:
         with conn:
             cur = conn.execute(
                 """
                 UPDATE satellites
-                SET cpu_percent = ?, bandwidth_mbps = ?, viewer_count = ?,
+                SET observed_ip = ?, cpu_percent = ?, bandwidth_mbps = ?, viewer_count = ?,
                     capacity_max_viewers = ?, last_heartbeat = ?
                 WHERE id = ?
                 """,
                 (
+                    observed_ip,
                     min(100.0, max(0.0, float(data.get("cpu_percent", 0)))),
                     max(0.0, float(data.get("bandwidth_mbps", 0))),
                     max(0, int(data.get("viewer_count", 0))),
@@ -748,17 +1322,59 @@ def satellite_deregister(sat_id):
 @app.get("/api/satellite/assign")
 def satellite_assign():
     init_db()
+    now = time.time()
+    exclude_url = (request.args.get("exclude") or "").rstrip("/")
     with connect_db() as conn:
-        rows = conn.execute("SELECT * FROM satellites").fetchall()
-    best_row = None
-    best_score = -1.0
-    for row in rows:
-        score = satellite_score(row)
-        if score > best_score:
-            best_score = score
-            best_row = row
-    if best_row and best_score > 0:
-        return jsonify({"satellite_url": best_row["url"]})
+        rows = [dict(row) for row in conn.execute("SELECT * FROM satellites").fetchall()]
+
+    candidate_rows = [row for row in rows if satellite_score(row) > 0]
+    if exclude_url:
+        alternates = [row for row in candidate_rows if str(row["url"] or "").rstrip("/") != exclude_url]
+        if alternates:
+            candidate_rows = alternates
+
+    def local_candidate(row: dict[str, object]) -> tuple[float, dict[str, object] | None]:
+        if not satellite_heartbeat_healthy(row, now):
+            return -1.0, None
+        dns_status = dns_status_for_url(str(row["url"] or ""), str(row["observed_ip"] or ""), now)
+        if not bool(dns_status["dns_ok"]):
+            return -1.0, None
+        return satellite_score(row), row
+
+    def remote_candidate(row: dict[str, object]) -> tuple[float, dict[str, object] | None]:
+        if not satellite_heartbeat_healthy(row, now):
+            return -1.0, None
+        probe_status = public_probe_status_for_url(str(row["url"] or ""), str(row["observed_ip"] or ""), now)
+        if not bool(probe_status["public_ok"]):
+            return -1.0, None
+        return satellite_score(row), row
+
+    best_local_row = None
+    best_local_score = -1.0
+    remote_rows = []
+    for row in candidate_rows:
+        if is_local_satellite(row):
+            local_score, local_row = local_candidate(row)
+            if local_row is not None and local_score > best_local_score:
+                best_local_score = local_score
+                best_local_row = local_row
+        else:
+            remote_rows.append(row)
+
+    if remote_rows:
+        max_workers = min(8, len(remote_rows)) or 1
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
+            futures = [executor.submit(remote_candidate, row) for row in remote_rows]
+            for future in as_completed(futures):
+                remote_score, remote_row = future.result()
+                if remote_row is not None and remote_score > 0:
+                    return jsonify({"satellite_url": remote_row["url"]})
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    if best_local_row is not None and best_local_score > 0:
+        return jsonify({"satellite_url": best_local_row["url"]})
     return jsonify({"satellite_url": None})
 
 

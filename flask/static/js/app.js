@@ -62,6 +62,7 @@ let satelliteAssigned = false;
 let satelliteAssignAttempts = 0;
 const satelliteAssignMaxAttempts = 5;
 const satelliteAssignRetryMs = 15000;
+const satelliteStartupManifestRetryScheduleMs = [400];
 const audioOnlyStorageKey = "audioOnly";
 const autostartAttemptsKey = "autostartAttempts";
 const autostartStorageKey = "autostartEnabled";
@@ -100,13 +101,117 @@ let lastStallRecoveryAt = 0;
 let playerStartedAt = 0;
 let lastPlaybackProgressAt = 0;
 let lastPlaybackPosition = null;
+let satelliteStartupManifestRetryCount = 0;
+let satelliteStartupManifestRetryTimer = null;
+let currentExcludeSatelliteUrl = null;
+const debugFlowMaxLines = 80;
+const debugImportantMaxLines = 40;
+const debugLogDefaultThrottleMs = 1500;
+const debugLogPolicies = [
+  { prefix: "source selected:", throttleMs: 30000 },
+  { prefix: "satellite assignment:", throttleMs: 10000 },
+  { prefix: "player ready", throttleMs: 10000 },
+  { prefix: "autostart ", throttleMs: 5000 }
+];
+const debugImportantPrefixes = [
+  "no satellite yet",
+  "no satellite available",
+  "satellite assign failed",
+  "satellite fallback:",
+  "satellite retry",
+  "recovering playback",
+  "play() failed",
+  "audio stream not configured",
+  "audio stream offline",
+  "media error:",
+  "media stalled",
+  "media waiting",
+  "hls load failed:",
+  "stream load failed on",
+  "status poll failed:",
+  "error:",
+  "promise:",
+  "tab broadcast failed:",
+  "tab message parse failed:",
+  "tab locked, skip start",
+  "tab suppressed, skip start",
+  "no media source available",
+  "satellite fetch failed:",
+  "autostart reset failed:"
+];
+const debugLogHistory = new Map();
+const debugFlowEntries = [];
+const debugImportantEntries = [];
+
+const debugLogThrottleMsForMessage = (message) => {
+  const policy = debugLogPolicies.find((entry) => message.startsWith(entry.prefix));
+  return policy?.throttleMs ?? debugLogDefaultThrottleMs;
+};
+
+const debugLogLevelForMessage = (message) => (
+  debugImportantPrefixes.some((prefix) => message.startsWith(prefix)) ? "important" : "flow"
+);
+
+const trimDebugEntries = (entries, maxLines) => {
+  if (entries.length > maxLines) {
+    entries.splice(0, entries.length - maxLines);
+  }
+};
+
+const renderDebugPanel = () => {
+  const sections = [];
+  if (debugFlowEntries.length) {
+    sections.push("Ablauf", ...debugFlowEntries);
+  }
+  if (debugImportantEntries.length) {
+    if (sections.length) sections.push("");
+    sections.push("Wichtig", ...debugImportantEntries);
+  }
+  debugPanel.textContent = sections.length ? `${sections.join("\n")}\n` : "";
+  debugPanel.scrollTop = debugPanel.scrollHeight;
+};
 
 const debugLog = (message) => {
   if (!debugPanel || !debugEnabled) return;
+  const now = Date.now();
+  const throttleMs = debugLogThrottleMsForMessage(message);
+  const lastLoggedAt = debugLogHistory.get(message) || 0;
+  if (now - lastLoggedAt < throttleMs) return;
+  debugLogHistory.set(message, now);
   debugPanel.classList.remove("hidden");
   const ts = new Date().toLocaleTimeString();
-  debugPanel.textContent += `[${ts}] ${message}\n`;
-  debugPanel.scrollTop = debugPanel.scrollHeight;
+  const nextLine = `[${ts}] ${message}`;
+  if (debugLogLevelForMessage(message) === "important") {
+    debugImportantEntries.push(nextLine);
+    trimDebugEntries(debugImportantEntries, debugImportantMaxLines);
+  } else {
+    debugFlowEntries.push(nextLine);
+    trimDebugEntries(debugFlowEntries, debugFlowMaxLines);
+  }
+  renderDebugPanel();
+};
+
+const escapeHtml = (value) => String(value ?? "")
+  .replaceAll("&", "&amp;")
+  .replaceAll("<", "&lt;")
+  .replaceAll(">", "&gt;")
+  .replaceAll('"', "&quot;")
+  .replaceAll("'", "&#39;");
+
+const viewerCookieValue = () => {
+  const prefix = "stream_viewer=";
+  const entry = document.cookie.split("; ").find((value) => value.startsWith(prefix));
+  return entry ? entry.slice(prefix.length) : "";
+};
+
+const debugSatelliteLabel = (value) => {
+  if (!value) return "main";
+  try {
+    const host = new URL(value).hostname || "";
+    return host.split(".")[0] || host || value;
+  } catch {
+    return value;
+  }
 };
 
 const resolveHlsUrl = (baseUrl) => {
@@ -115,9 +220,48 @@ const resolveHlsUrl = (baseUrl) => {
   return `${satelliteUrl.replace(/\/$/, "")}/${filename}`;
 };
 
+const resetSatelliteStartupRetries = () => {
+  satelliteStartupManifestRetryCount = 0;
+  if (satelliteStartupManifestRetryTimer) {
+    clearTimeout(satelliteStartupManifestRetryTimer);
+    satelliteStartupManifestRetryTimer = null;
+  }
+};
+
+const retrySatelliteStartupLoad = (reason) => {
+  if (!satelliteAssigned) return false;
+  if (satelliteStartupManifestRetryCount >= satelliteStartupManifestRetryScheduleMs.length) {
+    return false;
+  }
+  const delayMs = satelliteStartupManifestRetryScheduleMs[satelliteStartupManifestRetryCount];
+  satelliteStartupManifestRetryCount += 1;
+  debugLog(`satellite retry ${satelliteStartupManifestRetryCount}/${satelliteStartupManifestRetryScheduleMs.length}: ${reason}`);
+  if (hls) {
+    hls.destroy();
+    hls = null;
+  }
+  started = false;
+  if (satelliteStartupManifestRetryTimer) {
+    clearTimeout(satelliteStartupManifestRetryTimer);
+  }
+  satelliteStartupManifestRetryTimer = setTimeout(() => {
+    satelliteStartupManifestRetryTimer = null;
+    if (!satelliteAssigned || started) return;
+    startPlayer();
+  }, delayMs);
+  return true;
+};
+
 const fetchSatelliteAssignment = async () => {
   try {
-    const resp = await fetch("/api/satellite/assign", { cache: "no-store" });
+    const previousSatelliteUrl = satelliteUrl;
+    const previousAssigned = satelliteAssigned;
+    const previousActiveHlsUrl = activeHlsUrl;
+    debugLog("satellite assignment: checking");
+    const assignUrl = currentExcludeSatelliteUrl
+      ? `/api/satellite/assign?exclude=${encodeURIComponent(currentExcludeSatelliteUrl)}`
+      : "/api/satellite/assign";
+    const resp = await fetch(assignUrl, { cache: "no-store" });
     if (!resp.ok) return;
     const data = await resp.json();
     if (data.satellite_url) {
@@ -126,13 +270,21 @@ const fetchSatelliteAssignment = async () => {
       if (assignedUrl === window.location.origin) {
         satelliteUrl = null;
         satelliteAssigned = false;
-        debugLog("using main server (local satellite)");
+        resetSatelliteStartupRetries();
+        debugLog("satellite assignment: main");
       } else {
         satelliteUrl = assignedUrl;
         satelliteAssigned = true;
-        debugLog(`satellite assigned: ${satelliteUrl}`);
+        resetSatelliteStartupRetries();
+        currentExcludeSatelliteUrl = null;
+        debugLog(`satellite assignment: ${debugSatelliteLabel(satelliteUrl)}`);
       }
       setActiveMedia();
+      if (started && activeHlsUrl !== previousActiveHlsUrl) {
+        restartPlayerForSourceChange(
+          `assignment ${previousAssigned ? (previousSatelliteUrl || "main") : "main"} -> ${satelliteAssigned ? satelliteUrl : "main"}`
+        );
+      }
     } else {
       satelliteAssignAttempts++;
       if (satelliteAssignAttempts < satelliteAssignMaxAttempts) {
@@ -151,9 +303,34 @@ const fetchSatelliteAssignment = async () => {
   }
 };
 
+const switchToAlternateSatellite = async (reason) => {
+  const failedSatelliteUrl = satelliteUrl;
+  if (!failedSatelliteUrl) {
+    fallbackToMainServer();
+    return;
+  }
+  debugLog(`stream load failed on ${debugSatelliteLabel(failedSatelliteUrl)}; switching`);
+  currentExcludeSatelliteUrl = failedSatelliteUrl;
+  resetSatelliteStartupRetries();
+  await fetchSatelliteAssignment();
+  if (satelliteUrl === failedSatelliteUrl || !satelliteAssigned) {
+    debugLog(`stream load failed on ${debugSatelliteLabel(failedSatelliteUrl)}; fallback to main`);
+    fallbackToMainServer();
+    if (hls) {
+      hls.destroy();
+      hls = null;
+    }
+    started = false;
+    startPlayer();
+    return;
+  }
+  debugLog(`switch complete: ${debugSatelliteLabel(failedSatelliteUrl)} -> ${debugSatelliteLabel(satelliteUrl)}`);
+};
+
 const fallbackToMainServer = () => {
   if (!satelliteAssigned) return;
-  debugLog("satellite fallback: reverting to main server");
+  resetSatelliteStartupRetries();
+  debugLog(`satellite fallback: reverting to main server from ${satelliteUrl || "unknown"}`);
   satelliteUrl = null;
   satelliteAssigned = false;
   setActiveMedia();
@@ -191,6 +368,54 @@ const activeMediaState = () => {
     networkState: element?.networkState ?? null,
     currentTime
   };
+};
+
+const truncateDebugValue = (value, maxLength = 160) => {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}...` : text;
+};
+
+const hlsErrorSummary = (data) => {
+  const details = data?.details || data?.type || "unknown";
+  const responseCode = data?.response?.code ?? data?.networkDetails?.status;
+  const responseText = truncateDebugValue(data?.response?.text || data?.networkDetails?.statusText || "");
+  const requestUrl = data?.context?.url || data?.url || activeHlsUrl || "";
+  const finalUrl = data?.networkDetails?.responseURL || data?.networkDetails?.url || "";
+  const parts = [
+    `type=${data?.type || "unknown"}`,
+    `details=${details}`,
+    `fatal=${data?.fatal ? "true" : "false"}`
+  ];
+  if (requestUrl) parts.push(`request=${requestUrl}`);
+  if (finalUrl && finalUrl !== requestUrl) parts.push(`final=${finalUrl}`);
+  if (responseCode !== undefined && responseCode !== null && responseCode !== "") {
+    parts.push(`status=${responseCode}`);
+  }
+  if (responseText) parts.push(`response=${responseText}`);
+  return parts.join(" ");
+};
+
+const probeManifestRequest = async (url, credentialsMode) => {
+  try {
+    await fetch(url, {
+      cache: "no-store",
+      mode: "cors",
+      credentials: credentialsMode
+    });
+  } catch (error) {
+    void error;
+  }
+};
+
+const debugManifestFailure = (data) => {
+  const targetUrl = data?.context?.url || data?.url || activeHlsUrl || "";
+  debugLog(`hls load failed: ${data?.details || data?.type || "unknown"}`);
+  if (!debugEnabled || !targetUrl) return;
+  void probeManifestRequest(targetUrl, "omit");
+  if (satelliteAssigned) {
+    void probeManifestRequest(targetUrl, "include");
+  }
 };
 
 const postClientLog = (event, details = {}) => {
@@ -364,6 +589,7 @@ const loadAutostartAttempts = () => {
 
 const logAutostartStatus = (reason) => {
   if (!debugEnabled) return;
+  if (reason === "reset") return;
   const state = autostartEnabled ? "on" : "off";
   const suffix = reason ? ` - ${reason}` : "";
   debugLog(`autostart ${state} (${autostartAttempts}/${autostartMaxAttempts})${suffix}`);
@@ -650,10 +876,19 @@ const setActiveMedia = () => {
   } else {
     activeHlsUrl = resolveHlsUrl(hlsUrl);
   }
+  debugLog(`source selected: ${audioOnlyEnabled ? "audio" : "video"} via ${debugSatelliteLabel(satelliteUrl)}`);
   resetPlaybackProgressTracking();
   updatePlayerClass();
   updateAutostartUI();
   applyVolume();
+};
+
+const restartPlayerForSourceChange = (reason) => {
+  if (!started) return;
+  const shouldForcePlay = playbackActive || !mediaEl?.paused;
+  debugLog(`source switch: ${reason}`);
+  stopPlayer();
+  startPlayerWithOptions({ forcePlay: shouldForcePlay });
 };
 
 const statsColors = () => {
@@ -764,22 +999,47 @@ const renderSatelliteTable = (satellites) => {
   if (!satelliteBody || !debugEnabled) return;
   if (!satellites || satellites.length === 0) {
     if (satelliteSection) satelliteSection.classList.remove("hidden");
-    satelliteBody.innerHTML = '<tr><td colspan="6" class="satellite-empty">Keine Server verbunden.</td></tr>';
+    satelliteBody.innerHTML = '<tr><td colspan="9" class="satellite-empty">Keine Server verbunden.</td></tr>';
     return;
   }
   if (satelliteSection) satelliteSection.classList.remove("hidden");
   satelliteBody.innerHTML = satellites.map((sat) => {
     const healthClass = sat.healthy ? "sat-healthy" : "sat-unhealthy";
     const healthLabel = sat.healthy ? "OK" : "Offline";
+    const dnsClass = sat.dns_ok ? "sat-healthy" : "sat-unhealthy";
+    const dnsLabel = sat.dns_label || (sat.dns_ok ? "OK" : "Fehler");
+    const probeHealthClass = sat.local ? "sat-healthy" : (sat.health_ok ? "sat-healthy" : "sat-unhealthy");
+    const probeHlsClass = sat.local ? "sat-healthy" : (sat.hls_ok ? "sat-healthy" : "sat-unhealthy");
+    const probeHealthLabel = sat.health_label || (sat.health_ok ? "200" : "Fail");
+    const probeHlsLabel = sat.hls_label || (sat.hls_ok ? "200" : "Fail");
     const hbAge = sat.last_heartbeat_age < 60
       ? `${Math.round(sat.last_heartbeat_age)}s`
       : `${Math.round(sat.last_heartbeat_age / 60)}m`;
+    const dnsTitle = escapeHtml([
+      sat.dns_host ? `Host: ${sat.dns_host}` : "",
+      sat.dns_addresses?.length ? `DNS: ${sat.dns_addresses.join(", ")}` : "",
+      sat.observed_ip ? `Observed: ${sat.observed_ip}` : "",
+      sat.dns_source ? `Source: ${sat.dns_source}` : ""
+    ].filter(Boolean).join(" | "));
+    const healthTitle = escapeHtml([
+      sat.health_url ? `URL: ${sat.health_url}` : "",
+      sat.health_status ? `Status: ${sat.health_status}` : ""
+    ].filter(Boolean).join(" | "));
+    const hlsTitle = escapeHtml([
+      sat.hls_url ? `URL: ${sat.hls_url}` : "",
+      sat.hls_status ? `Status: ${sat.hls_status}` : "",
+      sat.hls_allow_origin ? `Allow-Origin: ${sat.hls_allow_origin}` : "",
+      sat.hls_allow_credentials ? `Allow-Credentials: ${sat.hls_allow_credentials}` : ""
+    ].filter(Boolean).join(" | "));
     return `<tr>
-      <td>${sat.name || sat.id.slice(0, 8)}</td>
+      <td>${escapeHtml(sat.name || sat.id.slice(0, 8))}</td>
       <td>${sat.viewer_count} / ${sat.capacity_max_viewers}</td>
       <td>${sat.cpu_percent.toFixed(1)}%</td>
       <td>${sat.bandwidth_mbps.toFixed(1)} Mbps</td>
       <td><span class="sat-health ${healthClass}">${healthLabel}</span></td>
+      <td title="${dnsTitle}"><span class="sat-health ${dnsClass}">${escapeHtml(dnsLabel)}</span></td>
+      <td title="${healthTitle}"><span class="sat-health ${probeHealthClass}">${escapeHtml(probeHealthLabel)}</span></td>
+      <td title="${hlsTitle}"><span class="sat-health ${probeHlsClass}">${escapeHtml(probeHlsLabel)}</span></td>
       <td>${hbAge}</td>
     </tr>`;
   }).join("");
@@ -896,13 +1156,21 @@ const attemptMediaRecovery = () => {
 const forceReload = () => {
   const url = new URL(window.location.href);
   url.searchParams.set("reload", Date.now().toString());
+  if (satelliteUrl) {
+    url.searchParams.set("sat_exclude", satelliteUrl);
+  } else {
+    url.searchParams.delete("sat_exclude");
+  }
   window.location.replace(url.toString());
 };
 const url = new URL(window.location.href);
 const claimOnLoad = url.searchParams.get("claim") === "1";
-if (url.searchParams.has("reload") || claimOnLoad) {
+const excludeSatelliteUrl = url.searchParams.get("sat_exclude") || null;
+currentExcludeSatelliteUrl = excludeSatelliteUrl;
+if (url.searchParams.has("reload") || claimOnLoad || url.searchParams.has("sat_exclude")) {
   url.searchParams.delete("reload");
   url.searchParams.delete("claim");
+  url.searchParams.delete("sat_exclude");
   history.replaceState(null, "", url.toString());
 }
 if (audioOnlyToggle) {
@@ -1242,8 +1510,7 @@ if (volumeSlider) {
       updateUnmute();
     }
   });
-  element.addEventListener("loadedmetadata", () => debugLog("media loadedmetadata"));
-  element.addEventListener("canplay", () => debugLog("media canplay"));
+  element.addEventListener("canplay", () => debugLog("player ready"));
 });
 
 const resetMediaElement = (element) => {
@@ -1438,6 +1705,9 @@ const startPlayerWithOptions = ({ forcePlay }) => {
   started = true;
   playerStartedAt = Date.now();
   setStatus(true);
+  if (mediaEl) {
+    mediaEl.crossOrigin = satelliteAssigned ? "use-credentials" : "";
+  }
 
   if (mediaEl && mediaEl.canPlayType("application/vnd.apple.mpegurl")) {
     mediaEl.src = activeHlsUrl;
@@ -1463,7 +1733,16 @@ const startPlayerWithOptions = ({ forcePlay }) => {
       lowLatencyMode: false,
       maxBufferLength: 30,
       maxMaxBufferLength: 60,
-      backBufferLength: 30
+      backBufferLength: 30,
+      xhrSetup: (xhr) => {
+        xhr.withCredentials = satelliteAssigned;
+      },
+      fetchSetup: (context, initParams) => (
+        new Request(context.url, {
+          ...initParams,
+          credentials: satelliteAssigned ? "include" : "same-origin"
+        })
+      )
     });
     hls.loadSource(activeHlsUrl);
     if (mediaEl) {
@@ -1473,6 +1752,7 @@ const startPlayerWithOptions = ({ forcePlay }) => {
       attemptPlay(mediaEl);
     }
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      resetSatelliteStartupRetries();
       jumpToLiveEdge(hls, mediaEl);
       if (forcePlay) {
         attemptPlay(mediaEl);
@@ -1483,7 +1763,8 @@ const startPlayerWithOptions = ({ forcePlay }) => {
     });
     hls.on(Hls.Events.ERROR, (event, data) => {
       const details = data?.details || "";
-      debugLog(`hls error: ${details || data?.type || "unknown"}`);
+      debugLog(`hls load failed: ${details || data?.type || "unknown"}`);
+      debugManifestFailure(data);
       emitClientDebug(
         "hls_error",
         {
@@ -1497,15 +1778,19 @@ const startPlayerWithOptions = ({ forcePlay }) => {
         attemptMediaRecovery();
         return;
       }
-      if (details === "manifestLoadError" || details === "levelLoadError") {
+      if (
+        details === "manifestLoadError"
+        || details === "levelLoadError"
+        || details === "manifestLoadTimeOut"
+        || details === "levelLoadTimeOut"
+        || details === "fragLoadTimeOut"
+      ) {
         if (satelliteAssigned) {
-          fallbackToMainServer();
-          if (hls) {
-            hls.destroy();
-            hls = null;
+          const responseCode = data?.response?.code ?? data?.networkDetails?.status ?? 0;
+          if (retrySatelliteStartupLoad(`${details} status=${responseCode || 0}`)) {
+            return;
           }
-          started = false;
-          startPlayer();
+          void switchToAlternateSatellite(`${details} status=${responseCode || 0}`);
           return;
         }
         if (hls) {

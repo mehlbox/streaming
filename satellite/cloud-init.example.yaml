@@ -1,0 +1,25 @@
+#cloud-config
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+
+write_files:
+  - path: /usr/local/bin/bootstrap-streaming-satellite.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/bin/sh
+      set -eu
+
+      # Change only this value when cloning the config for sat1, sat2, ...
+      SATELLITE_NAME="node1"
+
+      STREAMING_HOST="streaming.bethaus-speyer.de"
+      BOOTSTRAP_TOKEN="xgzsToeLFCLMhl5OzRJZcjrDjdQXV340s62Xkwuk_Kk"
+      SATELLITE_PUBLIC_URL="https://${SATELLITE_NAME}.bethaus-speyer.de/hls"
+
+      curl -fsSL "https://${STREAMING_HOST}/api/satellite/bootstrap.sh?token=${BOOTSTRAP_TOKEN}&public_url=${SATELLITE_PUBLIC_URL}&name=${SATELLITE_NAME}" | sh
+
+runcmd:
+  - [sh, -lc, '/usr/local/bin/bootstrap-streaming-satellite.sh']

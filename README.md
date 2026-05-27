@@ -61,6 +61,7 @@ Set these on the main server:
 
 - `SATELLITE_API_KEY` with the shared satellite secret
 - `SATELLITE_BOOTSTRAP_TOKEN` with a separate download token for the installer endpoint
+- `SATELLITE_BOOTSTRAP_ORIGIN_URL=https://streaming.example.com` if the main app is behind Traefik or another TLS terminator
 
 Then a new server can join with a single command:
 
@@ -68,12 +69,15 @@ Then a new server can join with a single command:
 curl -fsSL "https://streaming.example.com/api/satellite/bootstrap.sh?token=BOOTSTRAP_TOKEN&public_url=https://sat1.example.com/hls&name=sat1" | sh
 ```
 
+For cloud-init based provisioning, see [satellite/cloud-init.example.yaml](satellite/cloud-init.example.yaml).
+
 Notes:
 
-- Docker is not required on the satellite VM. The installer sets up `nginx`, `python3`, a virtualenv, and a system service directly on the host.
+- Docker is not required on the satellite VM. The installer sets up `nginx`, `caddy`, `python3`, a virtualenv, and a system service directly on the host.
 - `public_url` is required and should be the DNS URL viewers will use for that satellite, for example `https://sat1.example.com/hls`.
-- On HTTPS origins you should usually pass an HTTPS `public_url` to avoid mixed-content issues in browsers.
-- The installer writes its files to `/opt/streaming-satellite`, configures nginx, and starts the agent automatically.
+- `public_url` must use `https://`. The satellite obtains and renews its own certificate locally through Caddy.
+- If the main app is behind a reverse proxy, set `SATELLITE_BOOTSTRAP_ORIGIN_URL` so satellites pull HLS from the public HTTPS origin instead of an internal HTTP URL that may redirect.
+- The installer writes its files to `/opt/streaming-satellite`, configures local nginx on loopback, configures Caddy for public HTTPS, and starts the agent automatically.
 - You can override defaults at execution time, for example `INSTALL_DIR=/srv/sat1 SATELLITE_PORT=8088 ... | sh`.
 
 ## Notes
