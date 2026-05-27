@@ -10,7 +10,7 @@ from threading import Lock, Thread
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
-from flask import Flask, abort, jsonify, make_response, render_template, request, url_for
+from flask import Flask, Response, abort, jsonify, make_response, render_template, request, url_for
 
 def get_env_default(key: str, default: str) -> str:
     value = os.getenv(key, "").strip()
@@ -77,10 +77,18 @@ FOOTER_URL = get_env_default("FOOTER_URL", "")
 FOOTER_TEXT = get_env_default("FOOTER_TEXT", "Your Footers Here")
 SCHEDULE_BASE_URL = get_env_default("SCHEDULE_BASE_URL", "/static/data")
 SATELLITE_API_KEY = os.getenv("SATELLITE_API_KEY", "").strip()
+SATELLITE_BOOTSTRAP_TOKEN = os.getenv("SATELLITE_BOOTSTRAP_TOKEN", "").strip()
 SATELLITE_HEARTBEAT_INTERVAL = int(os.getenv("SATELLITE_HEARTBEAT_INTERVAL", "10"))
 SATELLITE_UNHEALTHY_SECONDS = int(os.getenv("SATELLITE_UNHEALTHY_SECONDS", "30"))
 SATELLITE_PRUNE_SECONDS = int(os.getenv("SATELLITE_PRUNE_SECONDS", "120"))
 LOCAL_SATELLITE_NAME = get_env_default("LOCAL_SATELLITE_NAME", "main")
+SATELLITE_BOOTSTRAP_INSTALL_DIR = (
+    os.getenv("SATELLITE_BOOTSTRAP_INSTALL_DIR", "/opt/streaming-satellite").strip()
+    or "/opt/streaming-satellite"
+)
+SATELLITE_BOOTSTRAP_DIR = Path(
+    os.getenv("SATELLITE_BOOTSTRAP_DIR", "/bootstrap/satellite").strip() or "/bootstrap/satellite"
+)
 APP_DEBUG = parse_bool(os.getenv("APP_DEBUG", "0"))
 
 db_lock = Lock()
@@ -238,6 +246,108 @@ def shorten(value, max_len: int = 240):
     if len(text) <= max_len:
         return text
     return text[: max_len - 3] + "..."
+
+
+def shell_quote(value: str) -> str:
+    return "'" + str(value).replace("'", "'\"'\"'") + "'"
+
+
+def request_external_base_url() -> str:
+    scheme = request.headers.get("X-Forwarded-Proto", request.scheme).split(",", 1)[0].strip()
+    host = request.headers.get("X-Forwarded-Host", request.host).split(",", 1)[0].strip()
+    return f"{scheme or request.scheme}://{host or request.host}".rstrip("/")
+
+
+def require_http_url(value: str, field_name: str, allow_path: bool) -> str:
+    parsed = urlparse((value or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        abort(400, f"Invalid {field_name}")
+    if parsed.query or parsed.fragment:
+        abort(400, f"Invalid {field_name}")
+    path = parsed.path.rstrip("/")
+    if not allow_path and path:
+        abort(400, f"Invalid {field_name}")
+    return f"{parsed.scheme}://{parsed.netloc}{path}"
+
+
+def normalize_satellite_public_url(value: str) -> str:
+    base = require_http_url((value or "").strip(), "public_url", allow_path=True)
+    if base.endswith("/hls"):
+        return base
+    parsed = urlparse(base)
+    if parsed.path not in {"", "/"}:
+        abort(400, "public_url must point to the satellite /hls base")
+    return f"{parsed.scheme}://{parsed.netloc}/hls"
+
+
+def bootstrap_file_text(name: str) -> str:
+    path = SATELLITE_BOOTSTRAP_DIR / name
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        abort(500, f"Missing bootstrap asset: {name}")
+
+
+def render_bootstrap_asset(name: str, replacements: dict[str, str]) -> str:
+    text = bootstrap_file_text(name)
+    for key, value in replacements.items():
+        text = text.replace(key, value)
+    return text
+
+
+def validate_satellite_bootstrap_token() -> None:
+    configured = SATELLITE_BOOTSTRAP_TOKEN or SATELLITE_API_KEY
+    if not configured:
+        abort(403, "Satellite bootstrap not configured")
+    token = request.args.get("token", "").strip()
+    if not token:
+        auth = request.headers.get("Authorization", "").strip()
+        if auth.lower().startswith("bearer "):
+            token = auth[7:].strip()
+    if not token or not secrets.compare_digest(token, configured):
+        abort(403, "Invalid bootstrap token")
+
+
+def render_satellite_bootstrap_script() -> str:
+    validate_satellite_bootstrap_token()
+    if not SATELLITE_API_KEY:
+        abort(403, "Satellite API not configured")
+    try:
+        port = max(1, min(65535, int(request.args.get("port", "8080"))))
+    except ValueError:
+        abort(400, "Invalid port")
+    try:
+        capacity = max(1, int(request.args.get("capacity", "200")))
+    except ValueError:
+        abort(400, "Invalid capacity")
+    install_dir = shorten(request.args.get("install_dir", SATELLITE_BOOTSTRAP_INSTALL_DIR), 240)
+    name = shorten(request.args.get("name", ""), 120)
+    origin_url = require_http_url(
+        request.args.get("origin_url", "") or request_external_base_url(),
+        "origin_url",
+        allow_path=False,
+    )
+    raw_public_url = shorten(request.args.get("public_url", ""), 500) or ""
+    if not raw_public_url:
+        abort(400, "Missing public_url")
+    public_url = normalize_satellite_public_url(raw_public_url)
+    nginx_template = bootstrap_file_text("nginx.host.conf.template")
+
+    return render_bootstrap_asset(
+        "bootstrap.sh.template",
+        {
+            "__INSTALL_DIR_QUOTED__": shell_quote(install_dir),
+            "__SATELLITE_NAME_QUOTED__": shell_quote(name),
+            "__SATELLITE_PUBLIC_URL_QUOTED__": shell_quote(public_url),
+            "__SATELLITE_MAX_VIEWERS_QUOTED__": shell_quote(str(capacity)),
+            "__MAIN_SERVER_URL_QUOTED__": shell_quote(origin_url),
+            "__SATELLITE_PORT_QUOTED__": shell_quote(str(port)),
+            "__SATELLITE_API_KEY_QUOTED__": shell_quote(SATELLITE_API_KEY),
+            "__AGENT_PY__": bootstrap_file_text("agent.py"),
+            "__REQUIREMENTS_TXT__": bootstrap_file_text("requirements.txt"),
+            "__NGINX_CONF_TEMPLATE__": nginx_template,
+        },
+    )
 
 
 def parse_hls_log_line(line: str) -> tuple[float, str, bool] | None:
@@ -659,6 +769,15 @@ def satellite_list():
     with connect_db() as conn:
         rows = conn.execute("SELECT * FROM satellites ORDER BY name ASC, id ASC").fetchall()
     return jsonify({"satellites": [satellite_info(row, now) for row in rows]})
+
+
+@app.get("/api/satellite/bootstrap.sh")
+def satellite_bootstrap_script():
+    return Response(
+        render_satellite_bootstrap_script(),
+        mimetype="text/x-shellscript",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 if __name__ == "__main__":

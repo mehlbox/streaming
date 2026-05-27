@@ -1,0 +1,174 @@
+#!/bin/sh
+set -eu
+
+INSTALL_DIR=${INSTALL_DIR:-__INSTALL_DIR_QUOTED__}
+DEFAULT_SATELLITE_NAME=${SATELLITE_NAME:-__SATELLITE_NAME_QUOTED__}
+SATELLITE_PUBLIC_URL=${SATELLITE_PUBLIC_URL:-__SATELLITE_PUBLIC_URL_QUOTED__}
+SATELLITE_MAX_VIEWERS=${SATELLITE_MAX_VIEWERS:-__SATELLITE_MAX_VIEWERS_QUOTED__}
+MAIN_SERVER_URL=${MAIN_SERVER_URL:-__MAIN_SERVER_URL_QUOTED__}
+MAIN_SERVER_INTERNAL_URL=${MAIN_SERVER_INTERNAL_URL:-$MAIN_SERVER_URL}
+SATELLITE_PORT=${SATELLITE_PORT:-__SATELLITE_PORT_QUOTED__}
+SATELLITE_API_KEY=__SATELLITE_API_KEY_QUOTED__
+
+NGINX_CONF_PATH=${NGINX_CONF_PATH:-/etc/nginx/conf.d/streaming-satellite.conf}
+HLS_ACCESS_LOG=${HLS_ACCESS_LOG:-/var/log/streaming-satellite/hls.log}
+AGENT_LOG_PATH=${AGENT_LOG_PATH:-/var/log/streaming-satellite/agent.log}
+SERVICE_NAME=${SERVICE_NAME:-streaming-satellite-agent}
+CACHE_DIR=${CACHE_DIR:-/var/cache/nginx/streaming-satellite}
+
+if [ -z "$DEFAULT_SATELLITE_NAME" ]; then
+  DEFAULT_SATELLITE_NAME="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo satellite)"
+fi
+
+run_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    "$@"
+  fi
+}
+
+write_file() {
+  target="$1"
+  tmp="$(mktemp)"
+  cat > "$tmp"
+  if [ "$(id -u)" -eq 0 ] || [ -w "$(dirname "$target")" ]; then
+    cat "$tmp" > "$target"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo cp "$tmp" "$target"
+  else
+    cat "$tmp" > "$target"
+  fi
+  rm -f "$tmp"
+}
+
+install_packages() {
+  if command -v apt-get >/dev/null 2>&1; then
+    run_root apt-get update
+    run_root apt-get install -y ca-certificates curl nginx python3 python3-venv
+    return
+  fi
+  if command -v dnf >/dev/null 2>&1; then
+    run_root dnf install -y ca-certificates curl nginx python3
+    return
+  fi
+  if command -v yum >/dev/null 2>&1; then
+    run_root yum install -y ca-certificates curl nginx python3
+    return
+  fi
+  if command -v apk >/dev/null 2>&1; then
+    run_root apk add --no-cache ca-certificates curl nginx python3 py3-pip py3-virtualenv
+    return
+  fi
+  echo "Unsupported package manager. Install nginx and python3 manually." >&2
+  exit 1
+}
+
+render_nginx_conf() {
+  origin_escaped="$(printf '%s' "$MAIN_SERVER_INTERNAL_URL" | sed 's/[\/&]/\\&/g')"
+  port_escaped="$(printf '%s' "$SATELLITE_PORT" | sed 's/[\/&]/\\&/g')"
+  log_escaped="$(printf '%s' "$HLS_ACCESS_LOG" | sed 's/[\/&]/\\&/g')"
+  cache_escaped="$(printf '%s' "$CACHE_DIR" | sed 's/[\/&]/\\&/g')"
+  sed \
+    -e "s|__MAIN_SERVER_INTERNAL_URL__|$origin_escaped|g" \
+    -e "s|__SATELLITE_PORT__|$port_escaped|g" \
+    -e "s|__HLS_ACCESS_LOG__|$log_escaped|g" \
+    -e "s|__NGINX_CACHE_DIR__|$cache_escaped|g" \
+    "$INSTALL_DIR/satellite/nginx.conf.template"
+}
+
+reload_nginx() {
+  run_root nginx -t
+  if command -v systemctl >/dev/null 2>&1; then
+    run_root systemctl enable --now nginx >/dev/null 2>&1 || true
+    run_root systemctl reload nginx || run_root systemctl restart nginx
+  else
+    run_root nginx -s reload || run_root nginx
+  fi
+}
+
+install_packages
+
+if [ -z "$SATELLITE_PUBLIC_URL" ]; then
+  echo "SATELLITE_PUBLIC_URL is required. Use a DNS URL such as https://your-satellite-host/hls." >&2
+  exit 1
+fi
+
+run_root mkdir -p "$INSTALL_DIR/satellite"
+run_root mkdir -p "$(dirname "$HLS_ACCESS_LOG")"
+run_root mkdir -p "$(dirname "$AGENT_LOG_PATH")"
+run_root mkdir -p "$CACHE_DIR"
+
+write_file "$INSTALL_DIR/.env" <<EOF
+SATELLITE_API_KEY=$SATELLITE_API_KEY
+SATELLITE_NAME=$DEFAULT_SATELLITE_NAME
+SATELLITE_PUBLIC_URL=$SATELLITE_PUBLIC_URL
+SATELLITE_MAX_VIEWERS=$SATELLITE_MAX_VIEWERS
+MAIN_SERVER_URL=$MAIN_SERVER_URL
+MAIN_SERVER_INTERNAL_URL=$MAIN_SERVER_INTERNAL_URL
+SATELLITE_PORT=$SATELLITE_PORT
+NGINX_STATUS_URL=http://127.0.0.1:$SATELLITE_PORT/nginx-status
+HLS_ACCESS_LOG=$HLS_ACCESS_LOG
+EOF
+
+write_file "$INSTALL_DIR/satellite/agent.py" <<'EOF'
+__AGENT_PY__
+EOF
+
+write_file "$INSTALL_DIR/satellite/requirements.txt" <<'EOF'
+__REQUIREMENTS_TXT__
+EOF
+
+write_file "$INSTALL_DIR/satellite/nginx.conf.template" <<'EOF'
+__NGINX_CONF_TEMPLATE__
+EOF
+
+python3 -m venv "$INSTALL_DIR/venv"
+"$INSTALL_DIR/venv/bin/pip" install --upgrade pip
+"$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/satellite/requirements.txt"
+
+render_nginx_conf | write_file "$NGINX_CONF_PATH"
+
+if [ -e /etc/nginx/sites-enabled/default ]; then
+  run_root rm -f /etc/nginx/sites-enabled/default
+fi
+if [ -e /etc/nginx/conf.d/default.conf ]; then
+  run_root rm -f /etc/nginx/conf.d/default.conf
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+  write_file "/etc/systemd/system/$SERVICE_NAME.service" <<EOF
+[Unit]
+Description=Streaming satellite agent
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$INSTALL_DIR/satellite
+EnvironmentFile=$INSTALL_DIR/.env
+ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/satellite/agent.py
+Restart=always
+RestartSec=5
+StandardOutput=append:$AGENT_LOG_PATH
+StandardError=append:$AGENT_LOG_PATH
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  run_root systemctl daemon-reload
+  reload_nginx
+  run_root systemctl enable --now "$SERVICE_NAME"
+  run_root systemctl restart "$SERVICE_NAME"
+else
+  reload_nginx
+  nohup "$INSTALL_DIR/venv/bin/python" "$INSTALL_DIR/satellite/agent.py" >>"$AGENT_LOG_PATH" 2>&1 &
+fi
+
+echo "Satellite bootstrap complete."
+echo "Config dir: $INSTALL_DIR"
+echo "Public URL: $SATELLITE_PUBLIC_URL"
+echo "Main server: $MAIN_SERVER_URL"
+echo "Nginx port: $SATELLITE_PORT"

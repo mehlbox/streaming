@@ -53,6 +53,29 @@ The docker compose setup includes an `audio` ffmpeg container that reads the sha
 
 If you prefer RTMP input or need a different source, set `AUDIO_INPUT_URL` to your desired URL.
 
+## Satellite bootstrap
+
+The main server can expose a one-shot installer script for fresh satellite hosts.
+
+Set these on the main server:
+
+- `SATELLITE_API_KEY` with the shared satellite secret
+- `SATELLITE_BOOTSTRAP_TOKEN` with a separate download token for the installer endpoint
+
+Then a new server can join with a single command:
+
+```bash
+curl -fsSL "https://streaming.example.com/api/satellite/bootstrap.sh?token=BOOTSTRAP_TOKEN&public_url=https://sat1.example.com/hls&name=sat1" | sh
+```
+
+Notes:
+
+- Docker is not required on the satellite VM. The installer sets up `nginx`, `python3`, a virtualenv, and a system service directly on the host.
+- `public_url` is required and should be the DNS URL viewers will use for that satellite, for example `https://sat1.example.com/hls`.
+- On HTTPS origins you should usually pass an HTTPS `public_url` to avoid mixed-content issues in browsers.
+- The installer writes its files to `/opt/streaming-satellite`, configures nginx, and starts the agent automatically.
+- You can override defaults at execution time, for example `INSTALL_DIR=/srv/sat1 SATELLITE_PORT=8088 ... | sh`.
+
 ## Notes
 
 - The schedule and offline messages are configured in `flask/static/js/app.js`.

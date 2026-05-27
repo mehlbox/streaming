@@ -100,6 +100,7 @@ services:
     working_dir: /app
     volumes:
       - ./flask:/app
+      - ./satellite:/bootstrap/satellite:ro
       - ./data:/var/www/data:ro
       - hls_data:/var/www/hls:ro
       - hls_logs:/hls-logs:ro
