@@ -1004,8 +1004,12 @@ const renderSatelliteTable = (satellites) => {
   }
   if (satelliteSection) satelliteSection.classList.remove("hidden");
   satelliteBody.innerHTML = satellites.map((sat) => {
-    const healthClass = sat.healthy ? "sat-healthy" : "sat-unhealthy";
-    const healthLabel = sat.healthy ? "OK" : "Offline";
+    const healthClass = sat.healthy
+      ? "sat-healthy"
+      : (sat.heartbeat_healthy ? "sat-degraded" : "sat-unhealthy");
+    const healthLabel = sat.healthy
+      ? "OK"
+      : (sat.heartbeat_healthy ? "Heartbeat" : "Offline");
     const dnsClass = sat.dns_ok ? "sat-healthy" : "sat-unhealthy";
     const dnsLabel = sat.dns_label || (sat.dns_ok ? "OK" : "Fehler");
     const probeHealthClass = sat.local ? "sat-healthy" : (sat.health_ok ? "sat-healthy" : "sat-unhealthy");

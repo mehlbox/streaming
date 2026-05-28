@@ -4,12 +4,20 @@ set -eu
 INSTALL_DIR=${INSTALL_DIR:-__INSTALL_DIR_QUOTED__}
 DEFAULT_SATELLITE_NAME=${SATELLITE_NAME:-__SATELLITE_NAME_QUOTED__}
 SATELLITE_PUBLIC_URL=${SATELLITE_PUBLIC_URL:-__SATELLITE_PUBLIC_URL_QUOTED__}
-SATELLITE_MAX_VIEWERS=${SATELLITE_MAX_VIEWERS:-__SATELLITE_MAX_VIEWERS_QUOTED__}
+DEFAULT_SATELLITE_MAX_VIEWERS=__SATELLITE_MAX_VIEWERS_QUOTED__
+SATELLITE_MAX_VIEWERS=${SATELLITE_MAX_VIEWERS:-}
 MAIN_SERVER_URL=${MAIN_SERVER_URL:-__MAIN_SERVER_URL_QUOTED__}
 MAIN_SERVER_INTERNAL_URL=${MAIN_SERVER_INTERNAL_URL:-__MAIN_SERVER_UPSTREAM_URL_QUOTED__}
 MAIN_SERVER_UPSTREAM_HOST=${MAIN_SERVER_UPSTREAM_HOST:-__MAIN_SERVER_UPSTREAM_HOST_QUOTED__}
 SATELLITE_PORT=${SATELLITE_PORT:-__SATELLITE_PORT_QUOTED__}
 SATELLITE_API_KEY=__SATELLITE_API_KEY_QUOTED__
+SATELLITE_VIEWER_MBPS=${SATELLITE_VIEWER_MBPS:-3.5}
+SATELLITE_SPEEDTEST_RUNS=${SATELLITE_SPEEDTEST_RUNS:-3}
+SATELLITE_SPEEDTEST_MARGIN_PERCENT=${SATELLITE_SPEEDTEST_MARGIN_PERCENT:-20}
+SATELLITE_SPEEDTEST_PAUSE_SECONDS=${SATELLITE_SPEEDTEST_PAUSE_SECONDS:-5}
+SATELLITE_SPEEDTEST_PY_URL=${SATELLITE_SPEEDTEST_PY_URL:-https://raw.githubusercontent.com/sivel/speedtest-cli/master/speedtest.py}
+SATELLITE_SPEEDTEST_UPLOAD_MBPS=${SATELLITE_SPEEDTEST_UPLOAD_MBPS:-0}
+SATELLITE_SPEEDTEST_SAFE_UPLOAD_MBPS=${SATELLITE_SPEEDTEST_SAFE_UPLOAD_MBPS:-0}
 
 NGINX_CONF_PATH=${NGINX_CONF_PATH:-/etc/nginx/conf.d/streaming-satellite.conf}
 CADDY_CONF_PATH=${CADDY_CONF_PATH:-/etc/caddy/Caddyfile}
@@ -75,6 +83,152 @@ install_packages() {
   fi
   echo "Unsupported package manager. Install caddy, nginx, and python3 manually." >&2
   exit 1
+}
+
+download_speedtest_cli() {
+  target="$(mktemp /tmp/streaming-speedtest.XXXXXX.py)"
+  if ! curl -fsSL "$SATELLITE_SPEEDTEST_PY_URL" -o "$target"; then
+    rm -f "$target"
+    return 1
+  fi
+  echo "$target"
+}
+
+run_speedtest_result() {
+  script_path="$1"
+  python3 "$script_path" --secure --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    payload = json.load(sys.stdin)
+    download = float(payload.get("download", 0.0))
+    upload = float(payload.get("upload", 0.0))
+except Exception:
+    raise SystemExit(1)
+if upload <= 0:
+    raise SystemExit(1)
+print(f"{round(download / 1_000_000, 2)} {round(upload / 1_000_000, 2)}")
+'
+}
+
+resolve_satellite_capacity() {
+  if [ -n "$SATELLITE_MAX_VIEWERS" ]; then
+    return
+  fi
+  SATELLITE_SPEEDTEST_RUNS="$(python3 - "$SATELLITE_SPEEDTEST_RUNS" <<'PY'
+import sys
+
+try:
+    value = int(sys.argv[1])
+except (TypeError, ValueError):
+    value = 3
+print(max(1, value))
+PY
+)"
+  SATELLITE_SPEEDTEST_MARGIN_PERCENT="$(python3 - "$SATELLITE_SPEEDTEST_MARGIN_PERCENT" <<'PY'
+import sys
+
+try:
+    value = float(sys.argv[1])
+except (TypeError, ValueError):
+    value = 20.0
+print(max(0.0, min(95.0, value)))
+PY
+)"
+  SATELLITE_VIEWER_MBPS="$(python3 - "$SATELLITE_VIEWER_MBPS" <<'PY'
+import sys
+
+try:
+    value = float(sys.argv[1])
+except (TypeError, ValueError):
+    value = 3.5
+print(max(0.1, value))
+PY
+)"
+  SATELLITE_SPEEDTEST_PAUSE_SECONDS="$(python3 - "$SATELLITE_SPEEDTEST_PAUSE_SECONDS" <<'PY'
+import sys
+
+try:
+    value = float(sys.argv[1])
+except (TypeError, ValueError):
+    value = 5.0
+print(max(0.0, value))
+PY
+)"
+
+  speedtest_script="$(download_speedtest_cli || true)"
+  if [ -z "${speedtest_script:-}" ]; then
+    SATELLITE_MAX_VIEWERS="$DEFAULT_SATELLITE_MAX_VIEWERS"
+    echo "Speedtest setup failed, using fallback capacity: $SATELLITE_MAX_VIEWERS viewers" >&2
+    return
+  fi
+
+  samples_file="$(mktemp /tmp/streaming-speedtest-samples.XXXXXX)"
+  runs_completed=0
+  run_index=1
+  while [ "$run_index" -le "$SATELLITE_SPEEDTEST_RUNS" ]; do
+    result="$(run_speedtest_result "$speedtest_script" || true)"
+    if [ -n "${result:-}" ]; then
+      download_sample="$(printf '%s\n' "$result" | awk '{print $1}')"
+      upload_sample="$(printf '%s\n' "$result" | awk '{print $2}')"
+      printf '%s\n' "$upload_sample" >> "$samples_file"
+      runs_completed=$((runs_completed + 1))
+      echo "Speedtest $run_index/$SATELLITE_SPEEDTEST_RUNS: download ${download_sample} Mbps | upload ${upload_sample} Mbps | using upload"
+    else
+      echo "Speedtest $run_index/$SATELLITE_SPEEDTEST_RUNS failed" >&2
+    fi
+    if [ "$run_index" -lt "$SATELLITE_SPEEDTEST_RUNS" ] && [ "$SATELLITE_SPEEDTEST_PAUSE_SECONDS" != "0.0" ]; then
+      sleep "$SATELLITE_SPEEDTEST_PAUSE_SECONDS"
+    fi
+    run_index=$((run_index + 1))
+  done
+  rm -f "$speedtest_script"
+
+  if [ "$runs_completed" -eq 0 ]; then
+    rm -f "$samples_file"
+    SATELLITE_MAX_VIEWERS="$DEFAULT_SATELLITE_MAX_VIEWERS"
+    echo "All speedtests failed, using fallback capacity: $SATELLITE_MAX_VIEWERS viewers" >&2
+    return
+  fi
+
+  SATELLITE_SPEEDTEST_UPLOAD_MBPS="$(python3 - "$samples_file" <<'PY'
+import pathlib
+import statistics
+import sys
+
+path = pathlib.Path(sys.argv[1])
+values = [
+    float(line.strip())
+    for line in path.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+if not values:
+    raise SystemExit(1)
+print(round(statistics.fmean(values), 2))
+PY
+)"
+  rm -f "$samples_file"
+
+  SATELLITE_SPEEDTEST_SAFE_UPLOAD_MBPS="$(python3 - "$SATELLITE_SPEEDTEST_UPLOAD_MBPS" "$SATELLITE_SPEEDTEST_MARGIN_PERCENT" <<'PY'
+import sys
+
+average = float(sys.argv[1])
+margin_percent = max(0.0, min(95.0, float(sys.argv[2])))
+safe = average * (1.0 - margin_percent / 100.0)
+print(round(max(0.0, safe), 2))
+PY
+)"
+  SATELLITE_MAX_VIEWERS="$(python3 - "$SATELLITE_SPEEDTEST_SAFE_UPLOAD_MBPS" "$SATELLITE_VIEWER_MBPS" <<'PY'
+import math
+import sys
+
+safe_upload = float(sys.argv[1])
+per_viewer = max(0.1, float(sys.argv[2]))
+print(max(1, int(math.floor(safe_upload / per_viewer))))
+PY
+)"
+  echo "Average upload speedtest: ${SATELLITE_SPEEDTEST_UPLOAD_MBPS} Mbps"
+  echo "Safe upload after ${SATELLITE_SPEEDTEST_MARGIN_PERCENT}% margin: ${SATELLITE_SPEEDTEST_SAFE_UPLOAD_MBPS} Mbps"
+  echo "Calculated capacity: ${SATELLITE_MAX_VIEWERS} viewers at ${SATELLITE_VIEWER_MBPS} Mbps/viewer"
 }
 
 render_nginx_conf() {
@@ -182,11 +336,19 @@ run_root mkdir -p "$(dirname "$HLS_ACCESS_LOG")"
 run_root mkdir -p "$(dirname "$AGENT_LOG_PATH")"
 run_root mkdir -p "$CACHE_DIR"
 
+resolve_satellite_capacity
+
 write_file "$INSTALL_DIR/.env" <<EOF
 SATELLITE_API_KEY=$SATELLITE_API_KEY
 SATELLITE_NAME=$DEFAULT_SATELLITE_NAME
 SATELLITE_PUBLIC_URL=$SATELLITE_PUBLIC_URL
 SATELLITE_MAX_VIEWERS=$SATELLITE_MAX_VIEWERS
+SATELLITE_VIEWER_MBPS=$SATELLITE_VIEWER_MBPS
+SATELLITE_SPEEDTEST_RUNS=$SATELLITE_SPEEDTEST_RUNS
+SATELLITE_SPEEDTEST_MARGIN_PERCENT=$SATELLITE_SPEEDTEST_MARGIN_PERCENT
+SATELLITE_SPEEDTEST_PAUSE_SECONDS=$SATELLITE_SPEEDTEST_PAUSE_SECONDS
+SATELLITE_SPEEDTEST_UPLOAD_MBPS=$SATELLITE_SPEEDTEST_UPLOAD_MBPS
+SATELLITE_SPEEDTEST_SAFE_UPLOAD_MBPS=$SATELLITE_SPEEDTEST_SAFE_UPLOAD_MBPS
 MAIN_SERVER_URL=$MAIN_SERVER_URL
 MAIN_SERVER_INTERNAL_URL=$MAIN_SERVER_INTERNAL_URL
 MAIN_SERVER_UPSTREAM_HOST=$MAIN_SERVER_UPSTREAM_HOST
@@ -254,3 +416,4 @@ echo "Config dir: $INSTALL_DIR"
 echo "Public URL: $SATELLITE_PUBLIC_URL"
 echo "Main server: $MAIN_SERVER_URL"
 echo "Internal HLS nginx port: $SATELLITE_PORT"
+echo "Satellite capacity: $SATELLITE_MAX_VIEWERS viewers"

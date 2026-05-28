@@ -1428,6 +1428,11 @@ body::before {
   color: #16a34a;
 }
 
+.sat-degraded {
+  background: rgba(245, 158, 11, 0.18);
+  color: #c2410c;
+}
+
 .sat-unhealthy {
   background: rgba(239, 68, 68, 0.15);
   color: #dc2626;

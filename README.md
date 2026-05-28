@@ -76,6 +76,7 @@ Notes:
 
 - Docker is not required on the satellite VM. The installer sets up `nginx`, `caddy`, `python3`, a virtualenv, and a system service directly on the host.
 - The bootstrap endpoint assigns the node name and `public_url` itself and reuses the same node number for known IPs via the persisted JSON node map.
+- During bootstrap, the installer runs 3 upload speed tests, averages them, subtracts 20%, and derives `SATELLITE_MAX_VIEWERS` from `SATELLITE_VIEWER_MBPS` (default `3.5`). If the speed test fails, it falls back to the configured `SATELLITE_MAX_VIEWERS`.
 - `public_url` must use `https://`. The satellite obtains and renews its own certificate locally through Caddy.
 - If the main app is behind a reverse proxy, set `SATELLITE_BOOTSTRAP_ORIGIN_URL` so satellites pull HLS from the public HTTPS origin instead of an internal HTTP URL that may redirect.
 - The installer writes its files to `/opt/streaming-satellite`, configures local nginx on loopback, configures Caddy for public HTTPS, and starts the agent automatically.
