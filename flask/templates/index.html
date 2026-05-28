@@ -11,7 +11,7 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}" />
   <link rel="icon" href="{{ favicon_url }}" type="{{ favicon_type }}" />
 </head>
-<body{% if not audio_only %} data-hls-url="{{ hls_url }}"{% endif %}{% if audio_hls_url %} data-audio-hls-url="{{ audio_hls_url }}"{% endif %} data-audio-only="{{ '1' if audio_only else '0' }}" data-status-url="{{ url_for('status') }}" data-audio-status-url="{{ url_for('audio_status') }}" data-client-log-url="{{ url_for('client_log') }}" data-debug="{{ '1' if debug_enabled else '0' }}" data-schedule-base-url="{{ schedule_base_url }}">
+<body{% if not audio_only %} data-hls-url="{{ hls_url }}"{% endif %}{% if audio_hls_url %} data-audio-hls-url="{{ audio_hls_url }}"{% endif %} data-audio-only="{{ '1' if audio_only else '0' }}" data-status-url="{{ url_for('status') }}" data-audio-status-url="{{ url_for('audio_status') }}" data-client-log-url="{{ url_for('client_log') }}" data-debug="{{ '1' if debug_enabled else '0' }}" data-schedule-base-url="{{ schedule_base_url }}" data-scaleway-enabled="{{ '1' if scaleway_enabled else '0' }}" data-scaleway-default-zone="{{ scaleway_default_zone }}" data-scaleway-default-type="{{ scaleway_default_type }}" data-scaleway-server-limit="{{ scaleway_server_limit }}">
 
   <!-- Skip to main content -->
   <a href="#main" class="sr-only">Zum Hauptinhalt springen</a>
@@ -149,47 +149,6 @@
             <p class="card-footnote">Änderungen vorbehalten</p>
           </div>
 
-        </div>
-      </div>
-    </section>
-
-    <!-- Stats Section (Debug) -->
-    <section class="stats-section{% if not debug_enabled %} hidden{% endif %}" id="stats-section">
-      <div class="container">
-        <div class="stats-card">
-          <h2 class="stats-title">Online-Statistik</h2>
-          <span class="stats-range"></span>
-          <div class="stats-content">
-            <canvas id="stats-canvas" width="600" height="120" aria-label="Online-Verlauf"></canvas>
-            <p id="stats-empty" class="stats-empty" hidden>Noch keine Daten verfügbar.</p>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- Satellites Section (Debug) -->
-    <section class="satellites-section hidden" id="satellite-section">
-      <div class="container">
-        <h2 class="section-title">Server-Status</h2>
-        <div class="table-wrapper">
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th>Server</th>
-                <th>Zuschauer</th>
-                <th>CPU</th>
-                <th>Bandbreite</th>
-                <th>Status</th>
-                <th>DNS</th>
-                <th>Health</th>
-                <th>HLS</th>
-                <th>Signal</th>
-              </tr>
-            </thead>
-            <tbody id="satellite-body">
-              <tr><td colspan="9" class="empty-state">Keine Server verbunden</td></tr>
-            </tbody>
-          </table>
         </div>
       </div>
     </section>

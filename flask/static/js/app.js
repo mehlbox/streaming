@@ -30,8 +30,18 @@ const statsRangeEl = document.querySelector(".stats-range");
 const statsSection = document.getElementById("stats-section");
 const satelliteSection = document.getElementById("satellite-section");
 const satelliteBody = document.getElementById("satellite-body");
+const scalewaySection = document.getElementById("scaleway-section");
+const scalewayForm = document.getElementById("scaleway-form");
+const scalewayZoneEl = document.getElementById("scaleway-zone");
+const scalewayTypeEl = document.getElementById("scaleway-type");
+const scalewayLoadBtn = document.getElementById("scaleway-load");
+const scalewayCreateBtn = document.getElementById("scaleway-create");
+const scalewayBody = document.getElementById("scaleway-body");
+const scalewayStatusEl = document.getElementById("scaleway-status");
+const scalewayMetaEl = document.getElementById("scaleway-meta");
 const statusUrl = document.body?.dataset?.statusUrl || "/status";
 const audioStatusUrl = document.body?.dataset?.audioStatusUrl || "/audio-status";
+const adminMode = document.body?.dataset?.admin === "1";
 const scheduleTheme = document.documentElement?.dataset?.theme || "ocean";
 const scheduleBaseUrl = (document.body?.dataset?.scheduleBaseUrl || "/data").replace(/\/$/, "");
 const scheduleUrl = document.body?.dataset?.scheduleUrl || `${scheduleBaseUrl}/schedule-${scheduleTheme}.json`;
@@ -82,6 +92,10 @@ const statusPollIntervalMs = 10000;
 const statusFailureGraceMs = 20000;
 let allowAutoplay = true;
 const debugEnabled = document.body?.dataset?.debug === "1";
+const scalewayEnabled = document.body?.dataset?.scalewayEnabled === "1";
+const scalewayServerLimit = Number(document.body?.dataset?.scalewayServerLimit || "5") || 5;
+const pendingScalewayDeletes = new Set();
+let scalewayLastPayload = null;
 let scheduleData = [];
 let audioAvailable = false;
 let audioLive = null;
@@ -1009,7 +1023,7 @@ const renderSatelliteTable = (satellites) => {
       : (sat.heartbeat_healthy ? "sat-degraded" : "sat-unhealthy");
     const healthLabel = sat.healthy
       ? "OK"
-      : (sat.heartbeat_healthy ? "Heartbeat" : "Offline");
+      : (sat.heartbeat_healthy ? "Unhealthy" : "Offline");
     const dnsClass = sat.dns_ok ? "sat-healthy" : "sat-unhealthy";
     const dnsLabel = sat.dns_label || (sat.dns_ok ? "OK" : "Fehler");
     const probeHealthClass = sat.local ? "sat-healthy" : (sat.health_ok ? "sat-healthy" : "sat-unhealthy");
@@ -1065,6 +1079,140 @@ const initSatellites = () => {
   if (!satelliteSection || !debugEnabled) return;
   fetchSatellites();
   setInterval(fetchSatellites, 10000);
+};
+
+const setScalewayStatus = (message, isError = false) => {
+  if (!scalewayStatusEl) return;
+  scalewayStatusEl.textContent = message;
+  scalewayStatusEl.classList.toggle("scw-status-error", !!isError);
+};
+
+const scalewayRequest = async (url, options = {}) => {
+  const resp = await fetch(url, { ...options, headers: options.headers || {}, cache: "no-store" });
+  if (resp.ok) {
+    const text = await resp.text();
+    return text ? JSON.parse(text) : {};
+  }
+  const errorText = (await resp.text()).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  throw new Error(errorText || `HTTP ${resp.status}`);
+};
+
+const renderScalewayTable = (payload) => {
+  if (!scalewayBody) return;
+  scalewayLastPayload = payload;
+  const servers = payload?.servers || [];
+  if (scalewayMetaEl) {
+    const count = Number(payload?.count || servers.length || 0);
+    const managedCount = Number(payload?.managed_count || 0);
+    scalewayMetaEl.textContent = `${count} sichtbar | ${managedCount} / ${payload?.max_servers || scalewayServerLimit} verwaltet`;
+  }
+  if (!servers.length) {
+    scalewayBody.innerHTML = '<tr><td colspan="6" class="satellite-empty">Keine Scaleway-Server im Projekt sichtbar.</td></tr>';
+    return;
+  }
+  scalewayBody.innerHTML = servers.map((server) => {
+    const state = String(server.state || "unknown");
+    const stateClass = state === "running"
+      ? "sat-healthy"
+      : (state === "starting" || state === "stopped in place" ? "sat-degraded" : "sat-unhealthy");
+    const errorTitle = escapeHtml(server.error || "");
+    const deletePending = pendingScalewayDeletes.has(String(server.id || ""));
+    return `<tr>
+      <td>${escapeHtml(server.name || server.id)}</td>
+      <td>${escapeHtml(server.zone || "")}</td>
+      <td title="${errorTitle}"><span class="sat-health ${stateClass}">${escapeHtml(state)}</span></td>
+      <td>${escapeHtml(server.public_ip || "-")}</td>
+      <td>${escapeHtml(server.commercial_type || "-")}</td>
+      <td>${server.managed
+        ? `<button type="button" class="scw-inline-button${deletePending ? " scw-inline-button-pending" : ""}" data-server-id="${escapeHtml(server.id)}"${deletePending ? " disabled" : ""}>${deletePending ? "Pending" : "Löschen"}</button>`
+        : '<span class="scw-external-label">Extern</span>'}</td>
+    </tr>`;
+  }).join("");
+};
+
+const fetchScalewayServers = async () => {
+  if (!scalewaySection || !debugEnabled) return;
+  if (!scalewayEnabled) {
+    setScalewayStatus("Scaleway-Verwaltung ist serverseitig nicht konfiguriert.", true);
+    return;
+  }
+  setScalewayStatus("Lade Scaleway-Server ...");
+  try {
+    const payload = await scalewayRequest("/api/scaleway/servers");
+    renderScalewayTable(payload);
+    setScalewayStatus("Scaleway-Server geladen.");
+  } catch (error) {
+    renderScalewayTable({ servers: [], count: 0, managed_count: 0, max_servers: scalewayServerLimit });
+    setScalewayStatus(`Scaleway-Liste fehlgeschlagen: ${error.message}`, true);
+  }
+};
+
+const createScalewayServer = async () => {
+  if (!scalewayForm) return;
+  const payload = {
+    zone: scalewayZoneEl?.value?.trim() || "",
+    commercial_type: scalewayTypeEl?.value?.trim() || ""
+  };
+  setScalewayStatus("Erstelle Scaleway-Server ...");
+  if (scalewayCreateBtn) scalewayCreateBtn.disabled = true;
+  try {
+    await scalewayRequest("/api/scaleway/servers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    setScalewayStatus("Scaleway-Server erstellt. Cloud-init wurde hinterlegt und verifiziert.");
+    await fetchScalewayServers();
+  } catch (error) {
+    setScalewayStatus(`Scaleway-Erstellung fehlgeschlagen: ${error.message}`, true);
+  } finally {
+    if (scalewayCreateBtn) scalewayCreateBtn.disabled = false;
+  }
+};
+
+const deleteScalewayServer = async (serverId) => {
+  if (!serverId) return;
+  if (pendingScalewayDeletes.has(serverId)) return;
+  pendingScalewayDeletes.add(serverId);
+  if (scalewayLastPayload) {
+    renderScalewayTable(scalewayLastPayload);
+  }
+  setScalewayStatus(`Lösche ${serverId} ...`);
+  try {
+    await scalewayRequest(`/api/scaleway/servers/${encodeURIComponent(serverId)}`, {
+      method: "DELETE"
+    });
+    setScalewayStatus(`Scaleway-Server ${serverId} gelöscht.`);
+    pendingScalewayDeletes.delete(serverId);
+    await fetchScalewayServers();
+  } catch (error) {
+    setScalewayStatus(`Scaleway-Löschen fehlgeschlagen: ${error.message}`, true);
+    pendingScalewayDeletes.delete(serverId);
+    await fetchScalewayServers();
+  }
+};
+
+const initScaleway = () => {
+  if (!scalewaySection || !debugEnabled) return;
+  if (scalewayLoadBtn) {
+    scalewayLoadBtn.addEventListener("click", () => {
+      fetchScalewayServers();
+    });
+  }
+  if (scalewayForm) {
+    scalewayForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      createScalewayServer();
+    });
+  }
+  if (scalewayBody) {
+    scalewayBody.addEventListener("click", (event) => {
+      const button = event.target?.closest?.("[data-server-id]");
+      if (!button) return;
+      deleteScalewayServer(button.getAttribute("data-server-id"));
+    });
+  }
+  fetchScalewayServers();
 };
 
 const markStall = () => {
@@ -1213,8 +1361,10 @@ setInterval(() => {
   forceReload();
   clearStallState();
 }, 10000);
-loadSchedule();
-setInterval(refreshScheduleUI, 60000);
+if (!adminMode) {
+  loadSchedule();
+  setInterval(refreshScheduleUI, 60000);
+}
 if (debugEnabled) {
   if (statsSection) statsSection.classList.remove("hidden");
   initStats();
@@ -1222,6 +1372,7 @@ if (debugEnabled) {
   statsSection.classList.add("hidden");
 }
 initSatellites();
+initScaleway();
 document.addEventListener("visibilitychange", syncAudioVisualizer);
 
 if (autostartToggle) {
@@ -1826,6 +1977,10 @@ const handleStatus = (live, audioLiveStatus) => {
   if (previousLiveStatus !== lastLiveStatus || previousAudioStatus !== lastAudioLiveStatus) {
     emitClientDebug("status_update", { live: lastLiveStatus, audioLive: lastAudioLiveStatus });
   }
+  if (adminMode) {
+    setStatus(!!live);
+    return;
+  }
   if (tabLocked) {
     if (audioOnlyEnabled) {
       setStatus(!!audioLive);
@@ -1871,9 +2026,11 @@ const handleStatus = (live, audioLiveStatus) => {
   }
 };
 
-initTabControl();
-if (claimOnLoad) {
-  claimActiveTab("manual-reload");
+if (!adminMode) {
+  initTabControl();
+  if (claimOnLoad) {
+    claimActiveTab("manual-reload");
+  }
 }
 
 let statusFailureTimer = null;

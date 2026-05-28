@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="de" data-theme="{{ theme }}">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="light dark" />
+  <title>{{ page_title }}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&family=Crimson+Text:ital@0;1&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}" />
+  <link rel="icon" href="{{ favicon_url }}" type="{{ favicon_type }}" />
+</head>
+<body data-admin="1" data-audio-only="{{ '1' if audio_only else '0' }}" data-status-url="{{ url_for('status') }}" data-audio-status-url="{{ url_for('audio_status') }}" data-client-log-url="{{ url_for('client_log') }}" data-debug="1" data-schedule-base-url="{{ schedule_base_url }}" data-scaleway-enabled="{{ '1' if scaleway_enabled else '0' }}" data-scaleway-default-zone="{{ scaleway_default_zone }}" data-scaleway-default-type="{{ scaleway_default_type }}" data-scaleway-server-limit="{{ scaleway_server_limit }}">
+
+  <a href="#main" class="sr-only">Zum Hauptinhalt springen</a>
+
+  <nav class="navbar" role="navigation" aria-label="Hauptnavigation">
+    <div class="navbar-container">
+      <div class="navbar-brand">
+        <img src="{{ logo_url }}" alt="{{ logo_alt }}" class="navbar-logo" />
+        <div class="navbar-text">
+          <h1 class="site-title">{{ site_title }} Admin</h1>
+          <p class="site-subtitle"><a href="{{ url_for('index') }}" class="footer-link">Zur Stream-Seite</a></p>
+        </div>
+      </div>
+      <div class="navbar-status">
+        <form method="post" action="{{ url_for('admin_logout') }}" class="admin-logout-form">
+          <button type="submit" class="scw-button scw-button-secondary">Abmelden</button>
+        </form>
+        <div id="status" class="status-badge status-offline">● Offline</div>
+      </div>
+    </div>
+  </nav>
+
+  <main id="main" role="main" class="main-content">
+    <section class="content-section">
+      <div class="container">
+        <div class="content-grid">
+          <div class="info-card card-primary">
+            <h2 class="card-title">Admin</h2>
+            <ul class="card-list">
+              <li><span>Diese Seite zeigt nur Betriebsdaten und Verwaltung.</span></li>
+              <li><span>Der eigentliche Stream bleibt auf der öffentlichen Startseite.</span></li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="stats-section" id="stats-section">
+      <div class="container">
+        <div class="stats-card">
+          <h2 class="stats-title">Online-Statistik</h2>
+          <span class="stats-range"></span>
+          <div class="stats-content">
+            <canvas id="stats-canvas" width="600" height="120" aria-label="Online-Verlauf"></canvas>
+            <p id="stats-empty" class="stats-empty" hidden>Noch keine Daten verfügbar.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="satellites-section hidden" id="satellite-section">
+      <div class="container">
+        <h2 class="section-title">Server-Status</h2>
+        <div class="table-wrapper">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Server</th>
+                <th>Zuschauer</th>
+                <th>CPU</th>
+                <th>Bandbreite</th>
+                <th>Status</th>
+                <th>DNS</th>
+                <th>Health</th>
+                <th>HLS</th>
+                <th>Signal</th>
+              </tr>
+            </thead>
+            <tbody id="satellite-body">
+              <tr><td colspan="9" class="empty-state">Keine Server verbunden</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="satellites-section" id="scaleway-section">
+      <div class="container">
+        <h2 class="section-title">Scaleway</h2>
+        <div class="scw-card">
+          <details class="scw-catalog">
+            <summary class="scw-catalog-summary">Server-Typen anzeigen</summary>
+            <div class="table-wrapper">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Typ</th>
+                    <th>Preis</th>
+                    <th>vCPU</th>
+                    <th>RAM</th>
+                    <th>Bandbreite</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for server_type in scaleway_server_types %}
+                  <tr>
+                    <td>{{ server_type.name }}</td>
+                    <td>{{ server_type.price_hour }}</td>
+                    <td>{{ server_type.vcpus }}</td>
+                    <td>{{ server_type.memory }}</td>
+                    <td>{{ server_type.bandwidth }}</td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </details>
+          <form id="scaleway-form" class="scw-form">
+            <label class="scw-field">
+              <span>Zone</span>
+              <select id="scaleway-zone">
+                {% for zone in scaleway_zone_options %}
+                <option value="{{ zone.id }}"{% if zone.id == scaleway_default_zone %} selected{% endif %}>{{ zone.label }}</option>
+                {% endfor %}
+              </select>
+            </label>
+            <label class="scw-field">
+              <span>Typ</span>
+              <select id="scaleway-type">
+                {% for server_type in scaleway_server_types %}
+                <option value="{{ server_type.name }}"{% if server_type.name == scaleway_default_type %} selected{% endif %}>{{ server_type.name }}</option>
+                {% endfor %}
+              </select>
+            </label>
+            <div class="scw-actions">
+              <button id="scaleway-load" type="button" class="scw-button scw-button-secondary">Aktualisieren</button>
+              <button id="scaleway-create" type="submit" class="scw-button">Server erstellen</button>
+            </div>
+          </form>
+          <p id="scaleway-meta" class="scw-meta">Maximal {{ scaleway_server_limit }} verwaltete Server.</p>
+          <p id="scaleway-status" class="scw-status">{% if not scaleway_enabled %}Scaleway-Verwaltung ist noch nicht konfiguriert.{% else %}Bereit zum Erstellen von Instanzen.{% endif %}</p>
+          <div class="table-wrapper">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Zone</th>
+                  <th>State</th>
+                  <th>IP</th>
+                  <th>Typ</th>
+                  <th>Aktion</th>
+                </tr>
+              </thead>
+              <tbody id="scaleway-body">
+                <tr><td colspan="6" class="empty-state">Noch keine verwalteten Scaleway-Server geladen.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container">
+      <div class="footer-content">
+        <a href="{{ footer_url }}" target="_blank" rel="noopener noreferrer" class="footer-link">{{ footer_text }}</a>
+        <span class="footer-sep">•</span>
+        <span class="footer-text">Admin</span>
+      </div>
+    </div>
+  </footer>
+
+  <script src="{{ url_for('static', filename='js/app.js') }}" defer></script>
+</body>
+</html>

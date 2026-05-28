@@ -12,10 +12,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock, Thread
 from urllib.parse import parse_qs, urlparse
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import urlopen
 
-from flask import Flask, Response, abort, jsonify, make_response, render_template, request, url_for
+from flask import Flask, Response, abort, jsonify, make_response, redirect, render_template, request, session, url_for
+from scaleway import ScalewayAPIError, ScalewayConfig, ScalewayManager
 try:
     import dns.exception
     import dns.resolver
@@ -90,6 +90,10 @@ SCHEDULE_BASE_URL = get_env_default("SCHEDULE_BASE_URL", "/static/data")
 STREAMING_HOST = os.getenv("STREAMING_HOST", "").strip()
 SATELLITE_API_KEY = os.getenv("SATELLITE_API_KEY", "").strip()
 SATELLITE_BOOTSTRAP_TOKEN = os.getenv("SATELLITE_BOOTSTRAP_TOKEN", "").strip()
+ADMIN_TOKEN = (
+    os.getenv("ADMIN_TOKEN", "").strip()
+    or os.getenv("SCW_MANAGE_TOKEN", "").strip()
+)
 SATELLITE_BOOTSTRAP_ORIGIN_URL = (
     os.getenv("SATELLITE_BOOTSTRAP_ORIGIN_URL", "").strip()
     or os.getenv("PUBLIC_BASE_URL", "").strip()
@@ -232,6 +236,7 @@ def init_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_satellites_last_heartbeat "
                 "ON satellites(last_heartbeat)"
             )
+            scaleway.ensure_db(conn)
             satellite_columns = {
                 str(row["name"])
                 for row in conn.execute("PRAGMA table_info(satellites)").fetchall()
@@ -242,31 +247,44 @@ def init_db() -> None:
                 )
         db_ready = True
 
-def render_index(debug_enabled: bool):
+def render_page_context(debug_enabled: bool) -> dict[str, object]:
     audio_hls_url = None
     if AUDIO_HLS_URL:
         audio_hls_url = AUDIO_HLS_URL
     elif AUDIO_STREAM_NAME:
         audio_hls_url = f"/hls/{AUDIO_STREAM_NAME}.m3u8"
     favicon_url = FAVICON_URL or url_for("static", filename="favicon.svg")
+    return {
+        "hls_url": f"/hls/{STREAM_NAME}.m3u8",
+        "audio_hls_url": audio_hls_url,
+        "theme": THEME,
+        "site_title": SITE_TITLE,
+        "site_subtitle": SITE_SUBTITLE,
+        "page_title": PAGE_TITLE,
+        "logo_url": LOGO_URL,
+        "logo_alt": LOGO_ALT,
+        "favicon_url": favicon_url,
+        "favicon_type": FAVICON_TYPE,
+        "audio_only": AUDIO_ONLY,
+        "debug_enabled": debug_enabled,
+        "footer_url": FOOTER_URL,
+        "footer_text": FOOTER_TEXT,
+        "schedule_base_url": SCHEDULE_BASE_URL,
+        "scaleway_enabled": scaleway.feature_enabled(),
+        "scaleway_default_zone": scaleway.config.default_zone,
+        "scaleway_default_type": scaleway.config.default_commercial_type,
+        "scaleway_server_limit": scaleway.config.server_limit,
+        "scaleway_allowed_zones": scaleway.config.allowed_zones,
+        "scaleway_zone_options": scaleway.available_zones(),
+        "scaleway_server_types": scaleway.available_server_types(),
+    }
+
+
+def render_index(debug_enabled: bool):
     response = make_response(
         render_template(
             "index.html",
-            hls_url=f"/hls/{STREAM_NAME}.m3u8",
-            audio_hls_url=audio_hls_url,
-            theme=THEME,
-            site_title=SITE_TITLE,
-            site_subtitle=SITE_SUBTITLE,
-            page_title=PAGE_TITLE,
-            logo_url=LOGO_URL,
-            logo_alt=LOGO_ALT,
-            favicon_url=favicon_url,
-            favicon_type=FAVICON_TYPE,
-            audio_only=AUDIO_ONLY,
-            debug_enabled=debug_enabled,
-            footer_url=FOOTER_URL,
-            footer_text=FOOTER_TEXT,
-            schedule_base_url=SCHEDULE_BASE_URL,
+            **render_page_context(debug_enabled),
         )
     )
     current_viewer_cookie = request.cookies.get(HLS_VIEWER_COOKIE, "").strip()
@@ -285,16 +303,73 @@ def render_index(debug_enabled: bool):
     return response
 
 
+def admin_authenticated() -> bool:
+    return bool(session.get("admin_authenticated"))
+
+
+def require_admin() -> None:
+    if not ADMIN_TOKEN:
+        abort(503, "Admin token is not configured")
+    if not admin_authenticated():
+        abort(403, "Admin token required")
+
+
+def render_admin_login(login_error: str, status_code: int = 200):
+    context = render_page_context(False)
+    context["page_title"] = f"{PAGE_TITLE} Admin Login"
+    context["login_error"] = login_error
+    return render_template("admin_login.html", **context), status_code
+
+
 @app.get("/")
 def index():
     return render_index(False)
 
 
-@app.get("/debug")
-def debug_index():
-    return render_index(True)
+@app.route("/admin", methods=["GET", "POST"])
+def admin_index():
+    if request.method == "POST":
+        if not ADMIN_TOKEN:
+            abort(503, "Admin token is not configured")
+        submitted = request.form.get("token", "").strip()
+        if submitted and secrets.compare_digest(submitted, ADMIN_TOKEN):
+            session["admin_authenticated"] = True
+            return redirect(url_for("admin_index"))
+        return render_admin_login("Ungültiger Admin-Token.", 403)
+    if not admin_authenticated():
+        return render_admin_login("", 200)
+    return render_admin()
 
 
+@app.post("/admin/logout")
+def admin_logout():
+    session.pop("admin_authenticated", None)
+    return redirect(url_for("admin_index"))
+
+
+def render_admin():
+    context = render_page_context(True)
+    context["page_title"] = f"{PAGE_TITLE} Admin"
+    response = make_response(
+        render_template(
+            "admin.html",
+            **context,
+        )
+    )
+    current_viewer_cookie = request.cookies.get(HLS_VIEWER_COOKIE, "").strip()
+    should_set_viewer_cookie = (not current_viewer_cookie) or bool(HLS_VIEWER_COOKIE_DOMAIN)
+    if should_set_viewer_cookie:
+        response.set_cookie(
+            HLS_VIEWER_COOKIE,
+            current_viewer_cookie or secrets.token_urlsafe(18),
+            max_age=60 * 60 * 24 * 30,
+            httponly=True,
+            secure=not APP_DEBUG,
+            samesite="Lax",
+            path="/",
+            domain=HLS_VIEWER_COOKIE_DOMAIN or None,
+        )
+    return response
 def is_live() -> bool:
     hls_path = Path(HLS_DIR) / f"{STREAM_NAME}.m3u8"
     if not hls_path.exists():
@@ -392,6 +467,21 @@ def require_http_url(value: str, field_name: str, allow_path: bool) -> str:
     if not allow_path and path:
         abort(400, f"Invalid {field_name}")
     return f"{parsed.scheme}://{parsed.netloc}{path}"
+
+
+scaleway = ScalewayManager(
+    config=ScalewayConfig.from_env(
+        streaming_host=STREAMING_HOST,
+        public_origin_url=PUBLIC_ORIGIN_URL,
+        satellite_api_key=SATELLITE_API_KEY,
+        satellite_bootstrap_token=SATELLITE_BOOTSTRAP_TOKEN,
+    ),
+    connect_db=connect_db,
+    init_db=init_db,
+    shorten=shorten,
+    normalize_ip_address=normalize_ip_address,
+    request_external_base_url=request_external_base_url,
+)
 
 
 def normalize_satellite_public_url(value: str) -> str:
@@ -1278,6 +1368,7 @@ def client_log():
 
 @app.get("/stats")
 def stats():
+    require_admin()
     init_db()
     minutes = request.args.get("minutes", "60")
     try:
@@ -1715,11 +1806,41 @@ def satellite_assign():
 
 @app.get("/api/satellites")
 def satellite_list():
+    require_admin()
     init_db()
     now = time.time()
     with connect_db() as conn:
         rows = conn.execute("SELECT * FROM satellites ORDER BY name ASC, id ASC").fetchall()
     return jsonify({"satellites": [satellite_info(row, now) for row in rows]})
+
+
+@app.get("/api/scaleway/servers")
+def scaleway_server_list():
+    require_admin()
+    scaleway.validate_manage_token()
+    return jsonify(scaleway.list_payload())
+
+
+@app.post("/api/scaleway/servers")
+def scaleway_server_create_route():
+    require_admin()
+    scaleway.validate_manage_token()
+    try:
+        payload = scaleway.create_payload()
+    except ScalewayAPIError as exc:
+        abort(exc.status_code, exc.message)
+    return jsonify(payload), 201
+
+
+@app.delete("/api/scaleway/servers/<server_id>")
+def scaleway_server_delete_route(server_id: str):
+    require_admin()
+    scaleway.validate_manage_token()
+    try:
+        payload = scaleway.delete_payload(server_id)
+    except ScalewayAPIError as exc:
+        abort(exc.status_code, exc.message)
+    return jsonify(payload)
 
 
 @app.get("/api/satellite/bootstrap.sh")

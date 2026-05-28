@@ -82,6 +82,27 @@ Notes:
 - The installer writes its files to `/opt/streaming-satellite`, configures local nginx on loopback, configures Caddy for public HTTPS, and starts the agent automatically.
 - You can still override installer-local defaults at execution time, for example `INSTALL_DIR=/srv/sat1 SATELLITE_PORT=8088 ... | sh`.
 
+## Scaleway provisioning
+
+The `/debug` page now includes a Scaleway section that can create and delete managed Instances for satellite nodes.
+
+Set these on the main server to enable it:
+
+- `SCW_MANAGE_TOKEN` to enable the feature on the server side
+- `SCW_SECRET_KEY` with your Scaleway API secret
+- `SCW_DEFAULT_PROJECT_ID` for the target Scaleway project
+- optionally `SCW_DEFAULT_ZONE`, `SCW_DEFAULT_COMMERCIAL_TYPE`, `SCW_DEFAULT_IMAGE`, `SCW_ROOT_VOLUME_TYPE`, `SCW_ROOT_VOLUME_SIZE_GB`, and `SCW_SERVER_NAME_PREFIX`
+
+Behavior:
+
+- The backend enforces a hard limit of `5` managed Scaleway servers.
+- Created instances are named automatically as `instance1`, `instance2`, ...
+- New Instances receive the current [satellite/cloud-init.example.yaml](satellite/cloud-init.example.yaml) as Scaleway `cloud-init` user-data, and the backend reads the `cloud-init` key back from the Scaleway API before reporting success.
+- The created VM still uses the existing bootstrap flow, so the main server auto-assigns `node1`, `node2`, ... by IP and persists the mapping in the JSON node map.
+- Root storage defaults to cheap local SSD (`l_ssd`) with `10 GB`, which matches the low-cost local-storage setup better than block storage.
+- The UI does not expose image selection; it always creates Debian 12 (`debian_bookworm`) nodes.
+- This integration currently uses the Scaleway secret key for API requests; the access key is not required by the HTTP calls themselves.
+
 ## Notes
 
 - The schedule and offline messages are configured in `flask/static/js/app.js`.
