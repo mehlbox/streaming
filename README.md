@@ -62,11 +62,12 @@ Set these on the main server:
 - `SATELLITE_API_KEY` with the shared satellite secret
 - `SATELLITE_BOOTSTRAP_TOKEN` with a separate download token for the installer endpoint
 - `SATELLITE_BOOTSTRAP_ORIGIN_URL=https://streaming.example.com` if the main app is behind Traefik or another TLS terminator
+- `SATELLITE_BOOTSTRAP_PUBLIC_URL_TEMPLATE=https://{name}.example.com/hls` so the main app can assign `node1`, `node2`, ...
 
 Then a new server can join with a single command:
 
 ```bash
-curl -fsSL "https://streaming.example.com/api/satellite/bootstrap.sh?token=BOOTSTRAP_TOKEN&public_url=https://sat1.example.com/hls&name=sat1" | sh
+curl -fsSL "https://streaming.example.com/api/satellite/bootstrap.sh?token=BOOTSTRAP_TOKEN" | sh
 ```
 
 For cloud-init based provisioning, see [satellite/cloud-init.example.yaml](satellite/cloud-init.example.yaml).
@@ -74,11 +75,11 @@ For cloud-init based provisioning, see [satellite/cloud-init.example.yaml](satel
 Notes:
 
 - Docker is not required on the satellite VM. The installer sets up `nginx`, `caddy`, `python3`, a virtualenv, and a system service directly on the host.
-- `public_url` is required and should be the DNS URL viewers will use for that satellite, for example `https://sat1.example.com/hls`.
+- The bootstrap endpoint assigns the node name and `public_url` itself and reuses the same node number for known IPs via the persisted JSON node map.
 - `public_url` must use `https://`. The satellite obtains and renews its own certificate locally through Caddy.
 - If the main app is behind a reverse proxy, set `SATELLITE_BOOTSTRAP_ORIGIN_URL` so satellites pull HLS from the public HTTPS origin instead of an internal HTTP URL that may redirect.
 - The installer writes its files to `/opt/streaming-satellite`, configures local nginx on loopback, configures Caddy for public HTTPS, and starts the agent automatically.
-- You can override defaults at execution time, for example `INSTALL_DIR=/srv/sat1 SATELLITE_PORT=8088 ... | sh`.
+- You can still override installer-local defaults at execution time, for example `INSTALL_DIR=/srv/sat1 SATELLITE_PORT=8088 ... | sh`.
 
 ## Notes
 

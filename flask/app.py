@@ -1,5 +1,6 @@
 import ipaddress
 import http.client
+import json
 import os
 import secrets
 import re
@@ -110,8 +111,16 @@ SATELLITE_BOOTSTRAP_INSTALL_DIR = (
     os.getenv("SATELLITE_BOOTSTRAP_INSTALL_DIR", "/opt/streaming-satellite").strip()
     or "/opt/streaming-satellite"
 )
+SATELLITE_BOOTSTRAP_NAME_PREFIX = get_env_default("SATELLITE_BOOTSTRAP_NAME_PREFIX", "node")
+SATELLITE_BOOTSTRAP_PUBLIC_URL_TEMPLATE = os.getenv(
+    "SATELLITE_BOOTSTRAP_PUBLIC_URL_TEMPLATE", ""
+).strip()
 SATELLITE_BOOTSTRAP_DIR = Path(
     os.getenv("SATELLITE_BOOTSTRAP_DIR", "/bootstrap/satellite").strip() or "/bootstrap/satellite"
+)
+SATELLITE_NODE_MAP_PATH = Path(
+    os.getenv("SATELLITE_NODE_MAP_PATH", "").strip()
+    or str(Path(STATE_DB).with_name("satellite-nodes.json"))
 )
 SATELLITE_PROBE_TIMEOUT_SECONDS = max(
     1.0,
@@ -143,6 +152,7 @@ dns_cache_lock = Lock()
 dns_cache: dict[str, tuple[float, dict[str, object]]] = {}
 probe_cache_lock = Lock()
 probe_cache: dict[str, tuple[float, dict[str, object]]] = {}
+node_map_lock = Lock()
 
 
 class FixedAddressHTTPConnection(http.client.HTTPConnection):
@@ -385,13 +395,296 @@ def require_http_url(value: str, field_name: str, allow_path: bool) -> str:
 
 
 def normalize_satellite_public_url(value: str) -> str:
-    base = require_http_url((value or "").strip(), "public_url", allow_path=True)
-    if base.endswith("/hls"):
-        return base
-    parsed = urlparse(base)
-    if parsed.path not in {"", "/"}:
-        abort(400, "public_url must point to the satellite /hls base")
+    normalized = try_normalize_satellite_public_url(value)
+    if normalized:
+        return normalized
+    abort(400, "public_url must point to the satellite /hls base")
+
+
+def try_normalize_satellite_public_url(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    if parsed.query or parsed.fragment:
+        return ""
+    path = parsed.path.rstrip("/")
+    if path.endswith("/hls"):
+        return f"{parsed.scheme}://{parsed.netloc}{path}"
+    if path not in {"", "/"}:
+        return ""
     return f"{parsed.scheme}://{parsed.netloc}/hls"
+
+
+def satellite_bootstrap_public_url_template() -> str:
+    if SATELLITE_BOOTSTRAP_PUBLIC_URL_TEMPLATE:
+        return SATELLITE_BOOTSTRAP_PUBLIC_URL_TEMPLATE
+    if HLS_VIEWER_COOKIE_DOMAIN:
+        return f"https://{{name}}.{HLS_VIEWER_COOKIE_DOMAIN}/hls"
+    host = STREAMING_HOST.strip().strip(".")
+    if not host:
+        return ""
+    parts = [part for part in host.split(".") if part]
+    if len(parts) >= 3:
+        zone = ".".join(parts[1:])
+    elif len(parts) == 2:
+        zone = host
+    else:
+        zone = ""
+    return f"https://{{name}}.{zone}/hls" if zone else ""
+
+
+def extract_satellite_node_number(name: str) -> int | None:
+    prefix = SATELLITE_BOOTSTRAP_NAME_PREFIX
+    if not prefix:
+        return None
+    match = re.fullmatch(rf"{re.escape(prefix)}(\d+)", str(name or "").strip())
+    if not match:
+        return None
+    try:
+        number = int(match.group(1))
+    except ValueError:
+        return None
+    return number if number > 0 else None
+
+
+def bootstrap_public_url_for_name(name: str, number: int | None = None) -> str:
+    template = satellite_bootstrap_public_url_template()
+    if not template:
+        abort(
+            400,
+            "Missing public_url and SATELLITE_BOOTSTRAP_PUBLIC_URL_TEMPLATE is not configured",
+        )
+    try:
+        rendered = template.format(name=name, number=number or "")
+    except (IndexError, KeyError, ValueError):
+        abort(500, "Invalid SATELLITE_BOOTSTRAP_PUBLIC_URL_TEMPLATE")
+    public_url = try_normalize_satellite_public_url(rendered)
+    if public_url:
+        return public_url
+    abort(500, "SATELLITE_BOOTSTRAP_PUBLIC_URL_TEMPLATE did not render a valid satellite URL")
+
+
+def node_record_public_host(record: dict[str, object]) -> str:
+    parsed = urlparse(str(record.get("public_url", "") or "").strip())
+    return parsed.hostname or ""
+
+
+def normalize_node_record(record: object) -> dict[str, object] | None:
+    if not isinstance(record, dict):
+        return None
+    name = shorten(record.get("name", ""), 120) or ""
+    observed_ip = normalize_ip_address(str(record.get("observed_ip", "") or ""))
+    public_url = try_normalize_satellite_public_url(str(record.get("public_url", "") or ""))
+    if not name and not observed_ip and not public_url:
+        return None
+    number = record.get("number")
+    try:
+        parsed_number = int(number)
+    except (TypeError, ValueError):
+        parsed_number = extract_satellite_node_number(name)
+    else:
+        if parsed_number <= 0:
+            parsed_number = extract_satellite_node_number(name)
+    assigned_at_raw = record.get("assigned_at", time.time())
+    updated_at_raw = record.get("updated_at", assigned_at_raw)
+    try:
+        assigned_at = float(assigned_at_raw)
+    except (TypeError, ValueError):
+        assigned_at = time.time()
+    try:
+        updated_at = float(updated_at_raw)
+    except (TypeError, ValueError):
+        updated_at = assigned_at
+    return {
+        "name": name,
+        "number": parsed_number,
+        "public_url": public_url,
+        "host": node_record_public_host({"public_url": public_url}),
+        "observed_ip": observed_ip,
+        "assigned_at": assigned_at,
+        "updated_at": max(updated_at, assigned_at),
+    }
+
+
+def read_node_records_unlocked() -> list[dict[str, object]]:
+    if not SATELLITE_NODE_MAP_PATH.exists():
+        return []
+    try:
+        raw = json.loads(SATELLITE_NODE_MAP_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        app.logger.warning("Unable to read satellite node map %s: %s", SATELLITE_NODE_MAP_PATH, exc)
+        return []
+    if isinstance(raw, dict):
+        entries = raw.get("nodes", [])
+    elif isinstance(raw, list):
+        entries = raw
+    else:
+        entries = []
+    normalized: list[dict[str, object]] = []
+    for entry in entries:
+        record = normalize_node_record(entry)
+        if record is not None:
+            normalized.append(record)
+    return normalized
+
+
+def write_node_records_unlocked(records: list[dict[str, object]]) -> None:
+    SATELLITE_NODE_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "nodes": records,
+        "updated_at": time.time(),
+    }
+    tmp_path = SATELLITE_NODE_MAP_PATH.with_suffix(f"{SATELLITE_NODE_MAP_PATH.suffix}.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(SATELLITE_NODE_MAP_PATH)
+
+
+def load_node_records() -> list[dict[str, object]]:
+    with node_map_lock:
+        return read_node_records_unlocked()
+
+
+def find_node_record(
+    records: list[dict[str, object]],
+    *,
+    observed_ip: str = "",
+    name: str = "",
+    public_url: str = "",
+) -> dict[str, object] | None:
+    normalized_ip = normalize_ip_address(observed_ip)
+    normalized_name = str(name or "").strip()
+    normalized_url = try_normalize_satellite_public_url(public_url)
+    normalized_host = urlparse(normalized_url).hostname or ""
+    if normalized_ip:
+        for record in records:
+            if str(record.get("observed_ip", "") or "") == normalized_ip:
+                return record
+    for record in records:
+        if normalized_name and str(record.get("name", "") or "").strip() == normalized_name:
+            return record
+    for record in records:
+        if normalized_url and str(record.get("public_url", "") or "") == normalized_url:
+            return record
+    for record in records:
+        if normalized_host and str(record.get("host", "") or "") == normalized_host:
+            return record
+    return None
+
+
+def upsert_node_record(name: str, public_url: str, observed_ip: str) -> dict[str, object]:
+    normalized_name = shorten(name, 120) or ""
+    normalized_url = try_normalize_satellite_public_url(public_url)
+    normalized_ip = normalize_ip_address(observed_ip)
+    if not normalized_name and not normalized_url and not normalized_ip:
+        return {}
+    with node_map_lock:
+        records = read_node_records_unlocked()
+        existing = find_node_record(
+            records,
+            observed_ip=normalized_ip,
+            name=normalized_name,
+            public_url=normalized_url,
+        )
+        current = time.time()
+        if existing is None:
+            record = normalize_node_record(
+                {
+                    "name": normalized_name,
+                    "public_url": normalized_url,
+                    "observed_ip": normalized_ip,
+                    "assigned_at": current,
+                    "updated_at": current,
+                }
+            )
+            if record is None:
+                return {}
+            records.append(record)
+            write_node_records_unlocked(records)
+            return dict(record)
+        if normalized_name:
+            existing["name"] = normalized_name
+        if normalized_url:
+            existing["public_url"] = normalized_url
+            existing["host"] = node_record_public_host(existing)
+        if normalized_ip:
+            existing["observed_ip"] = normalized_ip
+        if not existing.get("number"):
+            existing["number"] = extract_satellite_node_number(str(existing.get("name", "") or ""))
+        existing["updated_at"] = current
+        write_node_records_unlocked(records)
+        return dict(existing)
+
+
+def assign_bootstrap_node(observed_ip: str) -> dict[str, object]:
+    normalized_ip = normalize_ip_address(observed_ip)
+    with node_map_lock:
+        records = read_node_records_unlocked()
+        current = time.time()
+        highest = 0
+        for record in records:
+            number = record.get("number")
+            if isinstance(number, int) and number > highest:
+                highest = number
+        existing = find_node_record(records, observed_ip=normalized_ip)
+        if existing is not None:
+            existing_number = existing.get("number")
+            if not isinstance(existing_number, int) or existing_number <= 0:
+                highest += 1
+                existing_number = highest
+                existing["number"] = existing_number
+            existing_name = str(existing.get("name", "") or "").strip()
+            if not existing_name:
+                existing_name = f"{SATELLITE_BOOTSTRAP_NAME_PREFIX}{existing_number}"
+                existing["name"] = existing_name
+            existing_url = str(existing.get("public_url", "") or "").strip()
+            if not existing_url:
+                existing_url = bootstrap_public_url_for_name(existing_name, existing_number)
+                existing["public_url"] = existing_url
+                existing["host"] = node_record_public_host(existing)
+            existing["updated_at"] = current
+            write_node_records_unlocked(records)
+            return dict(existing)
+        next_number = highest + 1
+        name = f"{SATELLITE_BOOTSTRAP_NAME_PREFIX}{next_number}"
+        public_url = bootstrap_public_url_for_name(name, next_number)
+        record = normalize_node_record(
+            {
+                "name": name,
+                "number": next_number,
+                "public_url": public_url,
+                "observed_ip": normalized_ip,
+                "assigned_at": current,
+                "updated_at": current,
+            }
+        )
+        if record is None:
+            abort(500, "Unable to allocate satellite node")
+        records.append(record)
+        write_node_records_unlocked(records)
+        return dict(record)
+
+
+def bootstrap_satellite_identity(observed_ip: str) -> tuple[str, str]:
+    normalized_ip = normalize_ip_address(observed_ip)
+    if request.args.get("name", "").strip() or request.args.get("public_url", "").strip():
+        abort(400, "Bootstrap identity is auto-assigned by the main server")
+    assigned = assign_bootstrap_node(normalized_ip)
+    return str(assigned.get("name", "") or ""), str(assigned.get("public_url", "") or "")
+
+
+def expected_node_ip(name: str, url: str, observed_ip: str = "") -> str:
+    record = find_node_record(
+        load_node_records(),
+        observed_ip=observed_ip,
+        name=name,
+        public_url=url,
+    )
+    if record is None:
+        return ""
+    return normalize_ip_address(str(record.get("observed_ip", "") or ""))
 
 
 def bootstrap_upstream_target(origin_url: str) -> tuple[str, str]:
@@ -692,17 +985,14 @@ def render_satellite_bootstrap_script() -> str:
     except ValueError:
         abort(400, "Invalid capacity")
     install_dir = shorten(request.args.get("install_dir", SATELLITE_BOOTSTRAP_INSTALL_DIR), 240)
-    name = shorten(request.args.get("name", ""), 120)
+    observed_ip = observed_request_ip()
     default_origin_url = SATELLITE_BOOTSTRAP_ORIGIN_URL or request_external_base_url()
     origin_url = require_http_url(
         request.args.get("origin_url", "") or default_origin_url,
         "origin_url",
         allow_path=False,
     )
-    raw_public_url = shorten(request.args.get("public_url", ""), 500) or ""
-    if not raw_public_url:
-        abort(400, "Missing public_url")
-    public_url = normalize_satellite_public_url(raw_public_url)
+    name, public_url = bootstrap_satellite_identity(observed_ip)
     origin_upstream_url, origin_upstream_host = bootstrap_upstream_target(origin_url)
     nginx_template = bootstrap_file_text("nginx.host.conf.template")
 
@@ -1119,11 +1409,19 @@ def resolve_dns_addresses(host: str) -> dict[str, object]:
         }
 
 
-def dns_status_for_url(url: str, observed_ip: str = "", now: float | None = None) -> dict[str, object]:
+def dns_status_for_url(
+    url: str,
+    observed_ip: str = "",
+    now: float | None = None,
+    expected_ip: str = "",
+) -> dict[str, object]:
     current = time.time() if now is None else now
     host = urlparse(str(url or "").strip()).hostname or ""
     normalized_observed_ip = normalize_ip_address(observed_ip)
-    observed_public = bool(normalized_observed_ip) and not is_private_addr(normalized_observed_ip)
+    normalized_expected_ip = normalize_ip_address(expected_ip)
+    comparison_ip = normalized_expected_ip or normalized_observed_ip
+    comparison_public = bool(comparison_ip) and not is_private_addr(comparison_ip)
+    comparison_source = "node-map" if normalized_expected_ip else "observed"
     if not host:
         return {
             "dns_ok": False,
@@ -1132,6 +1430,7 @@ def dns_status_for_url(url: str, observed_ip: str = "", now: float | None = None
             "dns_addresses": [],
             "dns_matches_observed": False,
             "observed_ip": normalized_observed_ip,
+            "expected_ip": normalized_expected_ip,
             "dns_source": "",
         }
     try:
@@ -1139,15 +1438,18 @@ def dns_status_for_url(url: str, observed_ip: str = "", now: float | None = None
     except ValueError:
         pass
     else:
-        matches_observed = (not observed_public) or normalized_host_ip == normalized_observed_ip
+        matches_observed = (not comparison_public) or normalized_host_ip == comparison_ip
         return {
             "dns_ok": matches_observed,
-            "dns_label": "Direct IP" if not observed_public else ("Match" if matches_observed else "Mismatch"),
+            "dns_label": (
+                "Direct IP" if not comparison_public else ("Match" if matches_observed else "Mismatch")
+            ),
             "dns_host": host,
             "dns_addresses": [normalized_host_ip],
             "dns_matches_observed": matches_observed,
             "observed_ip": normalized_observed_ip,
-            "dns_source": "direct-ip",
+            "expected_ip": normalized_expected_ip,
+            "dns_source": "direct-ip" if not comparison_public else f"direct-ip ({comparison_source})",
         }
 
     resolved: dict[str, object] | None = None
@@ -1172,7 +1474,8 @@ def dns_status_for_url(url: str, observed_ip: str = "", now: float | None = None
             "dns_addresses": addresses,
             "dns_matches_observed": False,
             "observed_ip": normalized_observed_ip,
-            "dns_source": dns_source,
+            "expected_ip": normalized_expected_ip,
+            "dns_source": dns_source if not comparison_ip else f"{dns_source} ({comparison_source})",
         }
     if not addresses:
         return {
@@ -1182,20 +1485,22 @@ def dns_status_for_url(url: str, observed_ip: str = "", now: float | None = None
             "dns_addresses": [],
             "dns_matches_observed": False,
             "observed_ip": normalized_observed_ip,
-            "dns_source": dns_source,
+            "expected_ip": normalized_expected_ip,
+            "dns_source": dns_source if not comparison_ip else f"{dns_source} ({comparison_source})",
         }
 
-    matches_observed = (not observed_public) or normalized_observed_ip in addresses
+    matches_observed = (not comparison_public) or comparison_ip in addresses
     data = {
         "dns_ok": matches_observed,
         "dns_label": (
-            "Resolved" if not observed_public else ("Match" if matches_observed else "Mismatch")
+            "Resolved" if not comparison_public else ("Match" if matches_observed else "Mismatch")
         ),
         "dns_host": host,
         "dns_addresses": addresses,
         "dns_matches_observed": matches_observed,
         "observed_ip": normalized_observed_ip,
-        "dns_source": dns_source,
+        "expected_ip": normalized_expected_ip,
+        "dns_source": dns_source if not comparison_ip else f"{dns_source} ({comparison_source})",
     }
     return data
 
@@ -1206,11 +1511,17 @@ def satellite_info(row: sqlite3.Row, now: float | None = None) -> dict[str, str 
     age = round(current - last_heartbeat, 1)
     heartbeat_healthy = satellite_heartbeat_healthy(row, current)
     local_satellite = is_local_satellite(row)
+    expected_ip = expected_node_ip(
+        str(row["name"] or ""),
+        str(row["url"] or ""),
+        str(row["observed_ip"] or ""),
+    )
     info = {
         "id": row["id"],
         "name": row["name"],
         "url": row["url"],
         "observed_ip": normalize_ip_address(str(row["observed_ip"] or "")),
+        "expected_ip": expected_ip,
         "viewer_count": int(row["viewer_count"]),
         "cpu_percent": float(row["cpu_percent"]),
         "bandwidth_mbps": float(row["bandwidth_mbps"]),
@@ -1219,7 +1530,14 @@ def satellite_info(row: sqlite3.Row, now: float | None = None) -> dict[str, str 
         "heartbeat_healthy": heartbeat_healthy,
         "local": local_satellite,
     }
-    info.update(dns_status_for_url(str(row["url"] or ""), str(row["observed_ip"] or ""), current))
+    info.update(
+        dns_status_for_url(
+            str(row["url"] or ""),
+            str(row["observed_ip"] or ""),
+            current,
+            expected_ip,
+        )
+    )
     if local_satellite:
         info.update(local_probe_status_for_url(str(row["url"] or "")))
         info["healthy"] = bool(info["heartbeat_healthy"]) and bool(info["dns_ok"])
@@ -1240,6 +1558,7 @@ def satellite_register():
         abort(400, "Missing satellite url")
     sat_id = str(uuid.uuid4())
     now = time.time()
+    upsert_node_record(name or "", url or "", observed_ip)
     with connect_db() as conn:
         with conn:
             conn.execute(
@@ -1281,6 +1600,7 @@ def satellite_heartbeat(sat_id):
     data = validate_satellite_api_key()
     updated_at = time.time()
     observed_ip = observed_request_ip()
+    row = None
     with connect_db() as conn:
         with conn:
             cur = conn.execute(
@@ -1302,6 +1622,12 @@ def satellite_heartbeat(sat_id):
             )
         if cur.rowcount == 0:
             abort(404, "Unknown satellite")
+        row = conn.execute(
+            "SELECT name, url FROM satellites WHERE id = ?",
+            (sat_id,),
+        ).fetchone()
+    if row is not None:
+        upsert_node_record(str(row["name"] or ""), str(row["url"] or ""), observed_ip)
     return jsonify({"ok": True, "stream_active": is_live()})
 
 
@@ -1336,7 +1662,16 @@ def satellite_assign():
     def local_candidate(row: dict[str, object]) -> tuple[float, dict[str, object] | None]:
         if not satellite_heartbeat_healthy(row, now):
             return -1.0, None
-        dns_status = dns_status_for_url(str(row["url"] or ""), str(row["observed_ip"] or ""), now)
+        dns_status = dns_status_for_url(
+            str(row["url"] or ""),
+            str(row["observed_ip"] or ""),
+            now,
+            expected_node_ip(
+                str(row.get("name", "") or ""),
+                str(row.get("url", "") or ""),
+                str(row.get("observed_ip", "") or ""),
+            ),
+        )
         if not bool(dns_status["dns_ok"]):
             return -1.0, None
         return satellite_score(row), row
