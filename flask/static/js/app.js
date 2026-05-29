@@ -27,6 +27,9 @@ const offlineSubEl = document.getElementById("offline-sub");
 const statsCanvas = document.getElementById("stats-canvas");
 const statsEmptyEl = document.getElementById("stats-empty");
 const statsRangeEl = document.querySelector(".stats-range");
+const statsMinutesEl = document.getElementById("stats-minutes");
+const statsBucketEl = document.getElementById("stats-bucket");
+const statsRefreshBtn = document.getElementById("stats-refresh");
 const statsSection = document.getElementById("stats-section");
 const satelliteSection = document.getElementById("satellite-section");
 const satelliteBody = document.getElementById("satellite-body");
@@ -57,7 +60,7 @@ const longDateFormatter = new Intl.DateTimeFormat(scheduleLocale, {
   day: "2-digit",
   month: "long"
 });
-const statsMinutes = 60;
+const defaultStatsMinutes = 60;
 let hls = null;
 let started = false;
 let isLive = false;
@@ -96,6 +99,8 @@ const scalewayEnabled = document.body?.dataset?.scalewayEnabled === "1";
 const scalewayServerLimit = Number(document.body?.dataset?.scalewayServerLimit || "5") || 5;
 const pendingScalewayDeletes = new Set();
 let scalewayLastPayload = null;
+let statsMinutes = Number.parseInt(statsMinutesEl?.value || `${defaultStatsMinutes}`, 10);
+let statsBucketMinutes = Number.parseInt(statsBucketEl?.value || "5", 10);
 let scheduleData = [];
 let audioAvailable = false;
 let audioLive = null;
@@ -908,10 +913,10 @@ const restartPlayerForSourceChange = (reason) => {
 const statsColors = () => {
   const styles = getComputedStyle(document.documentElement);
   return {
-    line: styles.getPropertyValue("--wine").trim() || "#8b2b2e",
-    fill: styles.getPropertyValue("--wine").trim() || "#8b2b2e",
+    bar: styles.getPropertyValue("--primary").trim() || "#2c3e50",
+    barHover: styles.getPropertyValue("--primary-light").trim() || "#34495e",
     grid: styles.getPropertyValue("--stroke").trim() || "rgba(0,0,0,0.12)",
-    text: styles.getPropertyValue("--muted").trim() || "#6f6760"
+    text: styles.getPropertyValue("--text-secondary").trim() || "#7f8c8d"
   };
 };
 
@@ -931,7 +936,7 @@ const drawStats = (points) => {
   if (!statsCanvas) return;
   const ctx = statsCanvas.getContext("2d");
   if (!ctx) return;
-  const { line, fill, grid, text } = statsColors();
+  const { bar, barHover, grid, text } = statsColors();
   const width = statsCanvas.getBoundingClientRect().width;
   const height = statsCanvas.getBoundingClientRect().height;
   ctx.clearRect(0, 0, width, height);
@@ -941,13 +946,10 @@ const drawStats = (points) => {
   }
   if (statsEmptyEl) statsEmptyEl.hidden = true;
 
-  const now = Date.now() / 1000;
-  const minTs = now - statsMinutes * 60;
-  const maxTs = now;
-  const counts = points.map((p) => p.count);
+  const counts = points.map((p) => Math.max(0, Number(p.count) || 0));
   const maxCount = Math.max(1, ...counts);
 
-  const padding = 12;
+  const padding = 24;
   const chartWidth = width - padding * 2;
   const chartHeight = height - padding * 2;
 
@@ -958,41 +960,39 @@ const drawStats = (points) => {
   ctx.lineTo(width - padding, height - padding);
   ctx.stroke();
 
-  const toX = (ts) => padding + ((ts - minTs) / (maxTs - minTs)) * chartWidth;
-  const toY = (count) => height - padding - (count / maxCount) * chartHeight;
+  const yScale = chartHeight / maxCount;
+  const barGap = Math.max(1, Math.min(6, chartWidth / Math.max(3, points.length * 3)));
+  const barWidth = Math.max(1, (chartWidth - (points.length - 1) * barGap) / Math.max(1, points.length));
 
-  ctx.beginPath();
   points.forEach((point, index) => {
-    const x = toX(Math.min(Math.max(point.ts, minTs), maxTs));
-    const y = toY(point.count);
-    if (index === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
+    const count = Math.max(0, Number(point.count) || 0);
+    const x = padding + index * (barWidth + barGap);
+    const barHeight = Math.max(1, count * yScale);
+    const y = height - padding - barHeight;
+    ctx.fillStyle = index === points.length - 1 ? barHover : bar;
+    ctx.fillRect(x, y, barWidth, barHeight);
   });
-  ctx.strokeStyle = line;
-  ctx.lineWidth = 2;
-  ctx.stroke();
-
-  const last = points[points.length - 1];
-  const lastX = toX(Math.min(Math.max(last.ts, minTs), maxTs));
-  const lastY = toY(last.count);
-  ctx.fillStyle = fill;
-  ctx.beginPath();
-  ctx.arc(lastX, lastY, 3, 0, Math.PI * 2);
-  ctx.fill();
 
   ctx.fillStyle = text;
   ctx.font = "11px \"Space Grotesk\", sans-serif";
-  ctx.fillText(`${last.count} Online`, padding, padding + 2);
+  const last = points[points.length - 1];
+  ctx.fillText(`${last.count} Online`, padding, padding - 8);
 };
 
 const fetchStats = async () => {
   if (!statsCanvas) return;
   try {
-    const response = await fetch(`/stats?minutes=${statsMinutes}`, { cache: "no-store" });
+    statsMinutes = Math.max(1, Number.parseInt(statsMinutesEl?.value || `${statsMinutes}`, 10) || defaultStatsMinutes);
+    statsBucketMinutes = Math.max(1, Number.parseInt(statsBucketEl?.value || `${statsBucketMinutes}`, 10) || 1);
+    const response = await fetch(`/stats?minutes=${statsMinutes}&bucket_minutes=${statsBucketMinutes}`, { cache: "no-store" });
     if (!response.ok) return;
     const data = await response.json();
     drawStats(data.points || []);
-    if (statsRangeEl) statsRangeEl.textContent = `Letzte ${data.minutes || statsMinutes} Minuten`;
+    if (statsRangeEl) {
+      const minutes = data.minutes || statsMinutes;
+      const bucket = data.bucket_minutes || statsBucketMinutes;
+      statsRangeEl.textContent = `Letzte ${minutes} Minuten • Balken je ${bucket} Minute${bucket === 1 ? "" : "n"}`;
+    }
   } catch (error) {
     console.log("Stats fetch failed:", error);
   }
@@ -1006,6 +1006,9 @@ const initStats = () => {
     resizeStatsCanvas();
     fetchStats();
   });
+  if (statsMinutesEl) statsMinutesEl.addEventListener("change", fetchStats);
+  if (statsBucketEl) statsBucketEl.addEventListener("change", fetchStats);
+  if (statsRefreshBtn) statsRefreshBtn.addEventListener("click", fetchStats);
   setInterval(fetchStats, 60000);
 };
 
@@ -1515,6 +1518,8 @@ const setStatus = (live) => {
   }
   statusEl.textContent = live ? "● Online" : "● Offline";
   statusEl.className = live ? "status-badge status-online" : "status-badge status-offline";
+  const statusKpiEl = document.getElementById("status-kpi");
+  if (statusKpiEl) statusKpiEl.textContent = live ? "Online" : "Offline";
   updatePlayerClass();
   updateAutostartUI();
   updateOfflineMessage();
@@ -1525,7 +1530,7 @@ const setStatus = (live) => {
 const updateViewerCount = (count) => {
   if (!clientsEl) return;
   const normalized = Number.isFinite(count) ? count : 0;
-  clientsEl.textContent = `👥 ${normalized} Online`;
+  clientsEl.textContent = adminMode ? `${normalized} Online` : `👥 ${normalized} Online`;
 };
 
 if (unmuteBtn) {

@@ -37,12 +37,22 @@
     <section class="content-section">
       <div class="container">
         <div class="content-grid">
-          <div class="info-card card-primary">
-            <h2 class="card-title">Admin</h2>
-            <ul class="card-list">
-              <li><span>Diese Seite zeigt nur Betriebsdaten und Verwaltung.</span></li>
-              <li><span>Der eigentliche Stream bleibt auf der öffentlichen Startseite.</span></li>
-            </ul>
+          <div class="info-card card-primary admin-summary-card">
+            <h2 class="card-title">Betriebsübersicht</h2>
+            <div class="admin-kpi-grid">
+              <div class="admin-kpi">
+                <span class="admin-kpi-label">Status</span>
+                <strong id="status-kpi">Offline</strong>
+              </div>
+              <div class="admin-kpi">
+                <span class="admin-kpi-label">Aktuelle Zuschauer</span>
+                <strong id="clients">0 Online</strong>
+              </div>
+              <div class="admin-kpi">
+                <span class="admin-kpi-label">Bereich</span>
+                <strong>Streaming Verwaltung</strong>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -51,10 +61,33 @@
     <section class="stats-section" id="stats-section">
       <div class="container">
         <div class="stats-card">
-          <h2 class="stats-title">Online-Statistik</h2>
+          <div class="stats-header">
+            <h2 class="stats-title">User-Visits</h2>
+            <div class="stats-controls" role="group" aria-label="Statistikfilter">
+              <label class="stats-control">
+                <span>Zeitraum</span>
+                <select id="stats-minutes">
+                  <option value="30">30 Minuten</option>
+                  <option value="60" selected>60 Minuten</option>
+                  <option value="180">3 Stunden</option>
+                  <option value="240">4 Stunden</option>
+                </select>
+              </label>
+              <label class="stats-control">
+                <span>Aggregation</span>
+                <select id="stats-bucket">
+                  <option value="1">1 Minute</option>
+                  <option value="5" selected>5 Minuten</option>
+                  <option value="15">15 Minuten</option>
+                  <option value="30">30 Minuten</option>
+                </select>
+              </label>
+              <button type="button" id="stats-refresh" class="scw-button scw-button-secondary">Aktualisieren</button>
+            </div>
+          </div>
           <span class="stats-range"></span>
           <div class="stats-content">
-            <canvas id="stats-canvas" width="600" height="120" aria-label="Online-Verlauf"></canvas>
+            <canvas id="stats-canvas" width="600" height="220" aria-label="User-Visit Balkendiagramm"></canvas>
             <p id="stats-empty" class="stats-empty" hidden>Noch keine Daten verfügbar.</p>
           </div>
         </div>

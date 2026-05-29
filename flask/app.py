@@ -1371,20 +1371,39 @@ def stats():
     require_admin()
     init_db()
     minutes = request.args.get("minutes", "60")
+    bucket_minutes = request.args.get("bucket_minutes", "1")
     try:
         minutes_int = max(1, min(240, int(minutes)))
     except ValueError:
         minutes_int = 60
+    try:
+        bucket_minutes_int = max(1, min(60, int(bucket_minutes)))
+    except ValueError:
+        bucket_minutes_int = 1
+    bucket_minutes_int = min(bucket_minutes_int, minutes_int)
     cutoff = int(time.time()) - minutes_int * 60
     with connect_db() as conn:
         rows = conn.execute(
             "SELECT ts, count FROM viewer_stats WHERE ts >= ? ORDER BY ts ASC",
             (cutoff,),
         ).fetchall()
+    bucket_seconds = bucket_minutes_int * 60
+    aggregated_points: dict[int, int] = {}
+    for row in rows:
+        ts = int(row["ts"])
+        count = int(row["count"])
+        bucket_ts = ts - (ts % bucket_seconds)
+        previous_count = aggregated_points.get(bucket_ts)
+        aggregated_points[bucket_ts] = count if previous_count is None else max(previous_count, count)
+    points = [
+        {"ts": ts, "count": count}
+        for ts, count in sorted(aggregated_points.items())
+    ]
     return jsonify(
         {
-            "points": [{"ts": int(row["ts"]), "count": int(row["count"])} for row in rows],
+            "points": points,
             "minutes": minutes_int,
+            "bucket_minutes": bucket_minutes_int,
         }
     )
 

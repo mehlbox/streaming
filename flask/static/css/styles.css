@@ -194,6 +194,30 @@ a:hover {
   align-items: center;
 }
 
+body[data-admin="1"] {
+  background: #f4f6f8;
+  color: #1f2933;
+}
+
+body[data-admin="1"] .navbar,
+body[data-admin="1"] .stats-card,
+body[data-admin="1"] .scw-card,
+body[data-admin="1"] .info-card,
+body[data-admin="1"] .table-wrapper {
+  border-radius: 8px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+  border-color: #d5dce5;
+}
+
+body[data-admin="1"] .site-title {
+  font-size: 1.8rem;
+  letter-spacing: 0;
+}
+
+body[data-admin="1"] .main-content {
+  gap: var(--spacing-md);
+}
+
 /* ============================================================================
    STATUS BADGE
    ============================================================================ */
@@ -782,6 +806,70 @@ a:hover {
   color: var(--text-secondary);
 }
 
+.stats-header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: end;
+  gap: var(--spacing-md);
+  margin-bottom: var(--spacing-sm);
+}
+
+.stats-controls {
+  display: flex;
+  gap: var(--spacing-sm);
+  align-items: end;
+  flex-wrap: wrap;
+}
+
+.stats-control {
+  display: grid;
+  gap: 6px;
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.stats-control select {
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  min-height: 38px;
+  padding: 0 12px;
+  font: inherit;
+  color: var(--text-primary);
+  background: var(--bg-light);
+}
+
+.admin-summary-card {
+  padding: var(--spacing-md);
+}
+
+.admin-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--spacing-sm);
+}
+
+.admin-kpi {
+  background: var(--bg-light);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 0.7rem 0.9rem;
+}
+
+.admin-kpi-label {
+  display: block;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-secondary);
+}
+
+.admin-kpi strong {
+  font-size: 1.05rem;
+}
+
 /* ============================================================================
    SATELLITES SECTION
    ============================================================================ */
@@ -975,6 +1063,31 @@ a:hover {
   color: var(--text-secondary);
   font-size: 0.85rem;
   font-weight: 600;
+}
+
+body[data-admin="1"] .data-table {
+  font-size: 0.82rem;
+}
+
+body[data-admin="1"] .data-table th,
+body[data-admin="1"] .data-table td {
+  padding: 0.6rem 0.65rem;
+}
+
+body[data-admin="1"] .section-title,
+body[data-admin="1"] .card-title {
+  font-size: 1.2rem;
+}
+
+body[data-admin="1"] .content-section,
+body[data-admin="1"] .stats-section,
+body[data-admin="1"] .satellites-section {
+  padding: var(--spacing-md) 0;
+}
+
+body[data-admin="1"] .stats-title {
+  margin-bottom: 0;
+  font-size: 1.35rem;
 }
 
 .scw-button:hover,
