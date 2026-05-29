@@ -914,7 +914,6 @@ const statsColors = () => {
   const styles = getComputedStyle(document.documentElement);
   return {
     bar: styles.getPropertyValue("--primary").trim() || "#2c3e50",
-    barHover: styles.getPropertyValue("--primary-light").trim() || "#34495e",
     grid: styles.getPropertyValue("--stroke").trim() || "rgba(0,0,0,0.12)",
     text: styles.getPropertyValue("--text-secondary").trim() || "#7f8c8d"
   };
@@ -936,7 +935,7 @@ const drawStats = (points) => {
   if (!statsCanvas) return;
   const ctx = statsCanvas.getContext("2d");
   if (!ctx) return;
-  const { bar, barHover, grid, text } = statsColors();
+  const { bar, grid, text } = statsColors();
   const width = statsCanvas.getBoundingClientRect().width;
   const height = statsCanvas.getBoundingClientRect().height;
   ctx.clearRect(0, 0, width, height);
@@ -961,7 +960,7 @@ const drawStats = (points) => {
   ctx.stroke();
 
   const yScale = chartHeight / maxCount;
-  const barGap = Math.max(1, Math.min(6, chartWidth / Math.max(3, points.length * 3)));
+  const barGap = Math.max(1, Math.min(chartWidth * 0.02, 6));
   const barWidth = Math.max(1, (chartWidth - (points.length - 1) * barGap) / Math.max(1, points.length));
 
   points.forEach((point, index) => {
@@ -969,7 +968,7 @@ const drawStats = (points) => {
     const x = padding + index * (barWidth + barGap);
     const barHeight = Math.max(1, count * yScale);
     const y = height - padding - barHeight;
-    ctx.fillStyle = index === points.length - 1 ? barHover : bar;
+    ctx.fillStyle = bar;
     ctx.fillRect(x, y, barWidth, barHeight);
   });
 
@@ -987,11 +986,17 @@ const fetchStats = async () => {
     const response = await fetch(`/stats?minutes=${statsMinutes}&bucket_minutes=${statsBucketMinutes}`, { cache: "no-store" });
     if (!response.ok) return;
     const data = await response.json();
-    drawStats(data.points || []);
+    const points = data.points || [];
+    drawStats(points);
     if (statsRangeEl) {
       const minutes = data.minutes || statsMinutes;
       const bucket = data.bucket_minutes || statsBucketMinutes;
       statsRangeEl.textContent = `Letzte ${minutes} Minuten • Balken je ${bucket} Minute${bucket === 1 ? "" : "n"}`;
+    }
+    const statsPeakEl = document.getElementById("stats-peak");
+    if (statsPeakEl) {
+      const peak = points.reduce((max, point) => Math.max(max, Number(point.count) || 0), 0);
+      statsPeakEl.textContent = `${peak} Online`;
     }
   } catch (error) {
     console.log("Stats fetch failed:", error);

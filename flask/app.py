@@ -1380,6 +1380,7 @@ def stats():
         bucket_minutes_int = max(1, min(60, int(bucket_minutes)))
     except ValueError:
         bucket_minutes_int = 1
+    # Größere Buckets als der gewählte Zeitraum sind nicht sinnvoll.
     bucket_minutes_int = min(bucket_minutes_int, minutes_int)
     cutoff = int(time.time()) - minutes_int * 60
     with connect_db() as conn:
@@ -1388,16 +1389,19 @@ def stats():
             (cutoff,),
         ).fetchall()
     bucket_seconds = bucket_minutes_int * 60
-    aggregated_points: dict[int, int] = {}
+    aggregated_points: dict[int, tuple[int, int]] = {}
     for row in rows:
         ts = int(row["ts"])
         count = int(row["count"])
         bucket_ts = ts - (ts % bucket_seconds)
-        previous_count = aggregated_points.get(bucket_ts)
-        aggregated_points[bucket_ts] = count if previous_count is None else max(previous_count, count)
+        sum_count, sample_count = aggregated_points.get(bucket_ts, (0, 0))
+        aggregated_points[bucket_ts] = (sum_count + count, sample_count + 1)
     points = [
-        {"ts": ts, "count": count}
-        for ts, count in sorted(aggregated_points.items())
+        {
+            "ts": ts,
+            "count": max(0, round(sum_count / sample_count)) if sample_count > 0 else 0,
+        }
+        for ts, (sum_count, sample_count) in sorted(aggregated_points.items())
     ]
     return jsonify(
         {
