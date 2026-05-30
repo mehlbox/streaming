@@ -1,4 +1,5 @@
 import ipaddress
+import base64
 import http.client
 import json
 import os
@@ -126,6 +127,12 @@ SATELLITE_NODE_MAP_PATH = Path(
     os.getenv("SATELLITE_NODE_MAP_PATH", "").strip()
     or str(Path(STATE_DB).with_name("satellite-nodes.json"))
 )
+SATELLITE_CERT_CACHE_DIR = Path(
+    os.getenv("SATELLITE_CERT_CACHE_DIR", "").strip()
+    or str(Path(STATE_DB).with_name("satellite-certs"))
+)
+SATELLITE_CERT_CACHE_MAX_FILE_BYTES = 1024 * 1024
+SATELLITE_CERT_CACHE_MAX_TOTAL_BYTES = 5 * 1024 * 1024
 SATELLITE_PROBE_TIMEOUT_SECONDS = max(
     1.0,
     float(os.getenv("SATELLITE_PROBE_TIMEOUT_SECONDS", "5")),
@@ -225,6 +232,7 @@ def init_db() -> None:
                     observed_ip TEXT NOT NULL DEFAULT '',
                     cpu_percent REAL NOT NULL DEFAULT 0,
                     bandwidth_mbps REAL NOT NULL DEFAULT 0,
+                    speedtest_upload_mbps REAL NOT NULL DEFAULT 0,
                     viewer_count INTEGER NOT NULL DEFAULT 0,
                     capacity_max_viewers INTEGER NOT NULL DEFAULT 100,
                     last_heartbeat REAL NOT NULL,
@@ -245,6 +253,10 @@ def init_db() -> None:
                 conn.execute(
                     "ALTER TABLE satellites ADD COLUMN observed_ip TEXT NOT NULL DEFAULT ''"
                 )
+            if "speedtest_upload_mbps" not in satellite_columns:
+                conn.execute(
+                    "ALTER TABLE satellites ADD COLUMN speedtest_upload_mbps REAL NOT NULL DEFAULT 0"
+                )
         db_ready = True
 
 def render_page_context(debug_enabled: bool) -> dict[str, object]:
@@ -257,6 +269,7 @@ def render_page_context(debug_enabled: bool) -> dict[str, object]:
     return {
         "hls_url": f"/hls/{STREAM_NAME}.m3u8",
         "audio_hls_url": audio_hls_url,
+        "local_satellite_name": LOCAL_SATELLITE_NAME,
         "theme": THEME,
         "site_title": SITE_TITLE,
         "site_subtitle": SITE_SUBTITLE,
@@ -635,6 +648,17 @@ def write_node_records_unlocked(records: list[dict[str, object]]) -> None:
 def load_node_records() -> list[dict[str, object]]:
     with node_map_lock:
         return read_node_records_unlocked()
+
+
+def node_name_for_ip(ip_addr: str) -> str:
+    normalized_ip = normalize_ip_address(ip_addr)
+    if not normalized_ip:
+        return ""
+    for record in load_node_records():
+        observed_ip = normalize_ip_address(str(record.get("observed_ip", "") or ""))
+        if observed_ip == normalized_ip:
+            return str(record.get("name", "") or "").strip()
+    return ""
 
 
 def find_node_record(
@@ -1422,6 +1446,81 @@ def validate_satellite_api_key():
     return data
 
 
+def satellite_cert_cache_host(data: dict[str, object]) -> str:
+    host = shorten(str(data.get("host", "") or "").strip().lower(), 253)
+    if not host:
+        public_url = str(data.get("url", "") or data.get("public_url", "") or "").strip()
+        host = (urlparse(public_url).hostname or "").strip().lower()
+    if not host:
+        abort(400, "Missing certificate host")
+    if len(host) > 253 or not re.fullmatch(r"[a-z0-9.-]+", host):
+        abort(400, "Invalid certificate host")
+    if host.startswith(".") or host.endswith(".") or ".." in host:
+        abort(400, "Invalid certificate host")
+    return host
+
+
+def satellite_cert_cache_path(host: str) -> Path:
+    return SATELLITE_CERT_CACHE_DIR / f"{host}.json"
+
+
+def validate_cert_cache_relpath(value: object) -> str:
+    relpath = str(value or "").strip()
+    if not relpath or relpath.startswith("/") or "\\" in relpath:
+        abort(400, "Invalid certificate file path")
+    parts = Path(relpath).parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        abort(400, "Invalid certificate file path")
+    if len(relpath) > 500:
+        abort(400, "Certificate file path too long")
+    return relpath
+
+
+def validate_cert_cache_files(value: object) -> dict[str, str]:
+    if not isinstance(value, dict) or not value:
+        abort(400, "Missing certificate files")
+    files: dict[str, str] = {}
+    total = 0
+    for raw_path, raw_content in value.items():
+        relpath = validate_cert_cache_relpath(raw_path)
+        if not isinstance(raw_content, str) or not raw_content:
+            abort(400, "Invalid certificate file content")
+        try:
+            decoded = base64.b64decode(raw_content.encode("ascii"), validate=True)
+        except Exception:
+            abort(400, "Invalid certificate file encoding")
+        size = len(decoded)
+        if size <= 0 or size > SATELLITE_CERT_CACHE_MAX_FILE_BYTES:
+            abort(400, "Certificate file too large")
+        total += size
+        if total > SATELLITE_CERT_CACHE_MAX_TOTAL_BYTES:
+            abort(400, "Certificate cache upload too large")
+        files[relpath] = raw_content
+    return files
+
+
+def write_satellite_cert_cache(host: str, payload: dict[str, object]) -> None:
+    SATELLITE_CERT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    target = satellite_cert_cache_path(host)
+    tmp = target.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(target)
+
+
+def read_satellite_cert_cache(host: str) -> dict[str, object] | None:
+    path = satellite_cert_cache_path(host)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        app.logger.warning("Unable to read satellite certificate cache %s: %s", path, exc)
+        return None
+    if not isinstance(raw, dict) or raw.get("host") != host or not isinstance(raw.get("files"), dict):
+        return None
+    return raw
+
+
 def satellite_score(row: sqlite3.Row) -> float:
     now = time.time()
     last_heartbeat = float(row["last_heartbeat"])
@@ -1639,6 +1738,7 @@ def satellite_info(row: sqlite3.Row, now: float | None = None) -> dict[str, str 
         "viewer_count": int(row["viewer_count"]),
         "cpu_percent": float(row["cpu_percent"]),
         "bandwidth_mbps": float(row["bandwidth_mbps"]),
+        "speedtest_upload_mbps": float(row["speedtest_upload_mbps"]),
         "capacity_max_viewers": int(row["capacity_max_viewers"]),
         "last_heartbeat_age": age,
         "heartbeat_healthy": heartbeat_healthy,
@@ -1679,14 +1779,15 @@ def satellite_register():
                 """
                 INSERT INTO satellites(
                     id, name, url, observed_ip, cpu_percent, bandwidth_mbps,
-                    viewer_count, capacity_max_viewers, last_heartbeat, registered_at
-                ) VALUES(?, ?, ?, ?, 0, 0, 0, ?, ?, ?)
+                    speedtest_upload_mbps, viewer_count, capacity_max_viewers, last_heartbeat, registered_at
+                ) VALUES(?, ?, ?, ?, 0, 0, ?, 0, ?, ?, ?)
                 """,
                 (
                     sat_id,
                     name,
                     url,
                     observed_ip,
+                    max(0.0, float(data.get("speedtest_upload_mbps", 0))),
                     int(data.get("capacity_max_viewers", 100)),
                     now,
                     now,
@@ -1721,7 +1822,7 @@ def satellite_heartbeat(sat_id):
                 """
                 UPDATE satellites
                 SET observed_ip = ?, cpu_percent = ?, bandwidth_mbps = ?, viewer_count = ?,
-                    capacity_max_viewers = ?, last_heartbeat = ?
+                    speedtest_upload_mbps = ?, capacity_max_viewers = ?, last_heartbeat = ?
                 WHERE id = ?
                 """,
                 (
@@ -1729,6 +1830,7 @@ def satellite_heartbeat(sat_id):
                     min(100.0, max(0.0, float(data.get("cpu_percent", 0)))),
                     max(0.0, float(data.get("bandwidth_mbps", 0))),
                     max(0, int(data.get("viewer_count", 0))),
+                    max(0.0, float(data.get("speedtest_upload_mbps", 0))),
                     max(1, int(data.get("capacity_max_viewers", 100))),
                     updated_at,
                     sat_id,
@@ -1757,6 +1859,48 @@ def satellite_deregister(sat_id):
     if removed:
         app.logger.info("Satellite deregistered: %s", sat_id)
     return jsonify({"ok": True})
+
+
+@app.post("/api/satellite/cert-cache/upload")
+def satellite_cert_cache_upload():
+    data = validate_satellite_api_key()
+    host = satellite_cert_cache_host(data)
+    files = validate_cert_cache_files(data.get("files"))
+    payload = {
+        "host": host,
+        "name": shorten(str(data.get("name", "") or ""), 120),
+        "public_url": shorten(str(data.get("public_url", "") or data.get("url", "") or ""), 500),
+        "fingerprint": shorten(str(data.get("fingerprint", "") or ""), 128),
+        "uploaded_at": time.time(),
+        "files": files,
+    }
+    write_satellite_cert_cache(host, payload)
+    app.logger.info(
+        "Satellite certificate cache uploaded: host=%s files=%d name=%s",
+        host,
+        len(files),
+        payload["name"] or "-",
+    )
+    return jsonify({"ok": True, "host": host, "files": len(files)})
+
+
+@app.post("/api/satellite/cert-cache/download")
+def satellite_cert_cache_download():
+    data = validate_satellite_api_key()
+    host = satellite_cert_cache_host(data)
+    payload = read_satellite_cert_cache(host)
+    if payload is None:
+        return jsonify({"ok": True, "found": False, "host": host, "files": {}})
+    return jsonify(
+        {
+            "ok": True,
+            "found": True,
+            "host": host,
+            "uploaded_at": payload.get("uploaded_at"),
+            "fingerprint": payload.get("fingerprint", ""),
+            "files": payload.get("files", {}),
+        }
+    )
 
 
 @app.get("/api/satellite/assign")
@@ -1841,7 +1985,14 @@ def satellite_list():
 def scaleway_server_list():
     require_admin()
     scaleway.validate_manage_token()
-    return jsonify(scaleway.list_payload())
+    payload = scaleway.list_payload()
+    servers = payload.get("servers")
+    if isinstance(servers, list):
+        for server in servers:
+            if not isinstance(server, dict):
+                continue
+            server["node_name"] = node_name_for_ip(str(server.get("public_ip", "") or ""))
+    return jsonify(payload)
 
 
 @app.post("/api/scaleway/servers")

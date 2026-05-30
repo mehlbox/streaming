@@ -107,9 +107,9 @@ class ScalewayConfig:
                 return default
 
         try:
-            server_limit = max(1, min(5, int(os.getenv("SCW_SERVER_LIMIT", "5"))))
+            server_limit = max(1, min(10, int(os.getenv("SCW_SERVER_LIMIT", "10"))))
         except ValueError:
-            server_limit = 5
+            server_limit = 10
         return cls(
             api_base_url=os.getenv("SCW_API_BASE_URL", "https://api.scaleway.com").strip().rstrip("/"),
             access_key=os.getenv("SCW_ACCESS_KEY", "").strip(),

@@ -8,6 +8,7 @@ Env vars:
   SATELLITE_NAME           Human-readable name for this satellite
   SATELLITE_PUBLIC_URL     Public HLS base URL viewers will connect to
   SATELLITE_MAX_VIEWERS    Max viewer capacity (default 200)
+  SATELLITE_SPEEDTEST_UPLOAD_MBPS  Average bootstrap upload speed test result
   HEARTBEAT_INTERVAL       Seconds between heartbeats (overridden by server)
   NGINX_STATUS_URL         Local nginx stub_status URL (default http://127.0.0.1:80/nginx-status)
   HLS_ACCESS_LOG           Path to nginx HLS access log (IP + msec format); if set, used instead of stub_status
@@ -20,6 +21,10 @@ import signal
 import time
 import logging
 import re
+import base64
+import hashlib
+from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 import psutil
@@ -36,13 +41,24 @@ API_KEY = os.environ.get("SATELLITE_API_KEY", "")
 SATELLITE_NAME = os.environ.get("SATELLITE_NAME", "satellite-1")
 SATELLITE_PUBLIC_URL = os.environ.get("SATELLITE_PUBLIC_URL", "")
 MAX_VIEWERS = int(os.environ.get("SATELLITE_MAX_VIEWERS", "200"))
+SPEEDTEST_UPLOAD_MBPS = max(0.0, float(os.environ.get("SATELLITE_SPEEDTEST_UPLOAD_MBPS", "0") or "0"))
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "10"))
 NGINX_STATUS_URL = os.environ.get("NGINX_STATUS_URL", "http://127.0.0.1:80/nginx-status")
 HLS_ACCESS_LOG = os.environ.get("HLS_ACCESS_LOG", "").strip()
 HLS_VIEWER_WINDOW = int(os.environ.get("HLS_VIEWER_WINDOW", "15"))
+CADDY_CERTIFICATES_DIR = os.environ.get(
+    "CADDY_CERTIFICATES_DIR",
+    "/var/lib/caddy/.local/share/caddy/certificates",
+).strip()
+CERT_SYNC_RETRY_SECONDS = int(os.environ.get("CERT_SYNC_RETRY_SECONDS", "30"))
+CERT_SYNC_INTERVAL = int(os.environ.get("CERT_SYNC_INTERVAL", "3600"))
+CERT_SYNC_MAX_FILE_BYTES = 1024 * 1024
+CERT_SYNC_MAX_TOTAL_BYTES = 5 * 1024 * 1024
 
 satellite_id = None
 running = True
+last_cert_sync_attempt = 0.0
+last_uploaded_cert_fingerprint = ""
 
 
 def get_active_connections():
@@ -123,6 +139,94 @@ def get_bandwidth_mbps():
         return 0
 
 
+def satellite_public_host():
+    return (urlparse(SATELLITE_PUBLIC_URL).hostname or "").strip().lower()
+
+
+def discover_caddy_certificate_bundle():
+    host = satellite_public_host()
+    if not host or not CADDY_CERTIFICATES_DIR:
+        return None
+    base = Path(CADDY_CERTIFICATES_DIR)
+    if not base.exists():
+        return None
+    candidates = []
+    try:
+        candidates = [
+            path for path in base.glob(f"*/{host}/{host}.crt")
+            if path.is_file()
+        ]
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    cert_path = max(candidates, key=lambda path: path.stat().st_mtime)
+    cert_dir = cert_path.parent
+    key_path = cert_dir / f"{host}.key"
+    if not key_path.is_file():
+        return None
+
+    files = {}
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        for path in sorted(cert_dir.iterdir()):
+            if not path.is_file():
+                continue
+            data = path.read_bytes()
+            if not data or len(data) > CERT_SYNC_MAX_FILE_BYTES:
+                continue
+            total += len(data)
+            if total > CERT_SYNC_MAX_TOTAL_BYTES:
+                log.warning("Certificate cache upload skipped: bundle too large")
+                return None
+            relpath = path.relative_to(base).as_posix()
+            files[relpath] = base64.b64encode(data).decode("ascii")
+            digest.update(relpath.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(data)
+    except OSError as exc:
+        log.warning("Certificate cache scan failed: %s", exc)
+        return None
+
+    if not files:
+        return None
+    return host, digest.hexdigest(), files
+
+
+def maybe_sync_caddy_certificate():
+    global last_cert_sync_attempt, last_uploaded_cert_fingerprint
+    now = time.time()
+    interval = CERT_SYNC_INTERVAL if last_uploaded_cert_fingerprint else CERT_SYNC_RETRY_SECONDS
+    if now - last_cert_sync_attempt < max(5, interval):
+        return
+    last_cert_sync_attempt = now
+
+    bundle = discover_caddy_certificate_bundle()
+    if not bundle:
+        return
+    host, fingerprint, files = bundle
+    if fingerprint == last_uploaded_cert_fingerprint:
+        return
+
+    url = f"{MAIN_SERVER_URL}/api/satellite/cert-cache/upload"
+    payload = {
+        "api_key": API_KEY,
+        "name": SATELLITE_NAME,
+        "public_url": SATELLITE_PUBLIC_URL,
+        "host": host,
+        "fingerprint": fingerprint,
+        "files": files,
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=15)
+        resp.raise_for_status()
+        last_uploaded_cert_fingerprint = fingerprint
+        log.info("Uploaded Caddy certificate cache for %s (%d files)", host, len(files))
+    except Exception as exc:
+        log.warning("Certificate cache upload failed: %s", exc)
+
+
 def register():
     """Register this satellite with the main server. Returns satellite ID."""
     url = f"{MAIN_SERVER_URL}/api/satellite/register"
@@ -131,6 +235,7 @@ def register():
         "name": SATELLITE_NAME,
         "url": SATELLITE_PUBLIC_URL,
         "capacity_max_viewers": MAX_VIEWERS,
+        "speedtest_upload_mbps": SPEEDTEST_UPLOAD_MBPS,
     }
     while running:
         try:
@@ -158,6 +263,7 @@ def heartbeat(sat_id, interval):
             "api_key": API_KEY,
             "cpu_percent": cpu,
             "bandwidth_mbps": bandwidth,
+            "speedtest_upload_mbps": SPEEDTEST_UPLOAD_MBPS,
             "viewer_count": viewers,
             "capacity_max_viewers": MAX_VIEWERS,
         }
@@ -167,6 +273,7 @@ def heartbeat(sat_id, interval):
                 log.warning("Server lost registration, re-registering…")
                 return False  # trigger re-register
             resp.raise_for_status()
+            maybe_sync_caddy_certificate()
             data = resp.json()
             stream = data.get("stream_active", False)
             log.info(

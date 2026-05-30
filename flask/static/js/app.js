@@ -18,6 +18,7 @@ const autostartLabel = document.getElementById("autostart-label");
 const autostartTextEl = autostartLabel?.querySelector(".autostart-text");
 const audioOnlyToggle = document.getElementById("audio-only");
 const clientsEl = document.getElementById("clients");
+const nodeNameEl = document.getElementById("node-name");
 const reloadBtn = document.getElementById("reload");
 const scheduleCardEl = document.getElementById("schedule-card");
 const scheduleEl = document.getElementById("schedule");
@@ -37,7 +38,6 @@ const scalewaySection = document.getElementById("scaleway-section");
 const scalewayForm = document.getElementById("scaleway-form");
 const scalewayZoneEl = document.getElementById("scaleway-zone");
 const scalewayTypeEl = document.getElementById("scaleway-type");
-const scalewayLoadBtn = document.getElementById("scaleway-load");
 const scalewayCreateBtn = document.getElementById("scaleway-create");
 const scalewayBody = document.getElementById("scaleway-body");
 const scalewayStatusEl = document.getElementById("scaleway-status");
@@ -51,6 +51,7 @@ const scheduleUrl = document.body?.dataset?.scheduleUrl || `${scheduleBaseUrl}/s
 const scheduleLocale = "de-DE";
 const clientLogUrl = document.body?.dataset?.clientLogUrl || "/client-log";
 const audioOnlyForced = document.body?.dataset?.audioOnly === "1";
+const localNodeName = document.body?.dataset?.localNodeName || "main";
 const timeFormatter = new Intl.DateTimeFormat(scheduleLocale, { hour: "2-digit", minute: "2-digit" });
 const dayFormatter = new Intl.DateTimeFormat(scheduleLocale, { day: "2-digit" });
 const monthFormatter = new Intl.DateTimeFormat(scheduleLocale, { month: "short" });
@@ -72,10 +73,8 @@ let mediaRecoveryAttempts = 0;
 let lastMediaRecoveryAt = 0;
 let satelliteUrl = null;
 let satelliteAssigned = false;
-let satelliteAssignAttempts = 0;
-const satelliteAssignMaxAttempts = 5;
-const satelliteAssignRetryMs = 15000;
-const satelliteStartupManifestRetryScheduleMs = [400];
+const satelliteAssignPollIntervalMs = 5000;
+const satelliteExcludeCooldownMs = 30000;
 const audioOnlyStorageKey = "audioOnly";
 const autostartAttemptsKey = "autostartAttempts";
 const autostartStorageKey = "autostartEnabled";
@@ -89,10 +88,14 @@ const startupBufferTimeoutMs = 6000;
 const liveStartOffsetSeconds = 4.5;
 const stallReloadGraceMs = 60000;
 const stallRecoveryCooldownMs = 4000;
+const satelliteStallFailoverMs = 10000;
+const satelliteStartupSwitchTimeoutMs = 10000;
 const playbackProgressEpsilonSeconds = 0.12;
 const playbackProgressGraceMs = 15000;
 const statusPollIntervalMs = 10000;
 const statusFailureGraceMs = 20000;
+const unmuteWatchIntervalMs = 250;
+const scalewayPollIntervalMs = 10000;
 let allowAutoplay = true;
 const debugEnabled = document.body?.dataset?.debug === "1";
 const scalewayEnabled = document.body?.dataset?.scalewayEnabled === "1";
@@ -120,9 +123,18 @@ let lastStallRecoveryAt = 0;
 let playerStartedAt = 0;
 let lastPlaybackProgressAt = 0;
 let lastPlaybackPosition = null;
-let satelliteStartupManifestRetryCount = 0;
-let satelliteStartupManifestRetryTimer = null;
 let currentExcludeSatelliteUrl = null;
+let currentExcludeSatelliteUntil = 0;
+let satelliteAssignmentPromise = null;
+let satelliteSwitchPromise = null;
+let satelliteStartupSwitchTimer = null;
+let satelliteStartupSwitchTargetUrl = null;
+let satelliteAssignmentRequestToken = 0;
+let pendingPlaybackRequest = {
+  shouldPlay: true,
+  immediate: false,
+  restoreAudio: false
+};
 const debugFlowMaxLines = 80;
 const debugImportantMaxLines = 40;
 const debugLogDefaultThrottleMs = 1500;
@@ -233,126 +245,320 @@ const debugSatelliteLabel = (value) => {
   }
 };
 
+const activeNodeName = () => (satelliteAssigned ? debugSatelliteLabel(satelliteUrl) : localNodeName);
+
+const updateNodeName = () => {
+  if (!nodeNameEl) return;
+  nodeNameEl.textContent = `${activeNodeName()}`;
+};
+
+const logNodeSwitchConsole = (event, details = {}) => {
+  const payload = {
+    ts: new Date().toISOString(),
+    event,
+    activeNode: activeNodeName(),
+    satelliteAssigned,
+    satelliteUrl: satelliteUrl || null,
+    activeHlsUrl: activeHlsUrl || null,
+    started,
+    isLive,
+    playbackActive,
+    muted: mediaEl?.muted ?? null,
+    paused: mediaEl?.paused ?? null,
+    currentSrc: mediaEl?.currentSrc || mediaEl?.src || null,
+    ...details
+  };
+  const logger = event.includes("error") || event.includes("failed") || event.includes("fallback")
+    ? console.warn
+    : console.info;
+  logger("[node-switch]", payload);
+};
+
 const resolveHlsUrl = (baseUrl) => {
   if (!satelliteUrl) return baseUrl;
   const filename = baseUrl.split("/").pop();
   return `${satelliteUrl.replace(/\/$/, "")}/${filename}`;
 };
 
-const resetSatelliteStartupRetries = () => {
-  satelliteStartupManifestRetryCount = 0;
-  if (satelliteStartupManifestRetryTimer) {
-    clearTimeout(satelliteStartupManifestRetryTimer);
-    satelliteStartupManifestRetryTimer = null;
+const resetSatelliteStartupRetries = () => {};
+
+const clearSatelliteStartupSwitchTimer = () => {
+  if (satelliteStartupSwitchTimer) {
+    clearTimeout(satelliteStartupSwitchTimer);
+    satelliteStartupSwitchTimer = null;
   }
+  satelliteStartupSwitchTargetUrl = null;
 };
 
-const retrySatelliteStartupLoad = (reason) => {
-  if (!satelliteAssigned) return false;
-  if (satelliteStartupManifestRetryCount >= satelliteStartupManifestRetryScheduleMs.length) {
+const scheduleSatelliteStartupSwitchCheck = (reason) => {
+  if (!satelliteAssigned || !satelliteUrl) return;
+  clearSatelliteStartupSwitchTimer();
+  const targetUrl = satelliteUrl;
+  satelliteStartupSwitchTargetUrl = targetUrl;
+  satelliteStartupSwitchTimer = setTimeout(() => {
+    satelliteStartupSwitchTimer = null;
+    if (!satelliteAssigned || satelliteUrl !== targetUrl) return;
+    const stillNotPlaying = !playbackActive || !mediaEl || mediaEl.readyState < 2;
+    if (!stillNotPlaying) return;
+    logNodeSwitchConsole("startup-switch-timeout", {
+      reason,
+      targetUrl,
+      readyState: mediaEl?.readyState ?? null
+    });
+    void switchToAlternateSatellite(`startup timeout ${satelliteStartupSwitchTimeoutMs}ms (${reason})`);
+  }, satelliteStartupSwitchTimeoutMs);
+};
+
+const performSourceSwitch = (reason, updateSource) => {
+  const previousMediaEl = mediaEl;
+  const previousActiveHlsUrl = activeHlsUrl;
+  const shouldPlay = !!started;
+  const restoreAudio = !!(started && previousMediaEl && !previousMediaEl.muted && currentVolume > 0);
+  const previousNode = activeNodeName();
+
+  updateSource();
+
+  if (!started) return;
+  if (mediaEl !== previousMediaEl || !activeHlsUrl || activeHlsUrl === previousActiveHlsUrl) {
+    return;
+  }
+
+  debugLog(`source switch: ${reason}`);
+  logNodeSwitchConsole("perform-source-switch", {
+    reason,
+    previousNode,
+    nextNode: activeNodeName(),
+    previousActiveHlsUrl,
+    nextActiveHlsUrl: activeHlsUrl,
+    shouldPlay,
+    restoreAudio
+  });
+  setPendingPlaybackRequest({
+    shouldPlay,
+    immediate: shouldPlay,
+    restoreAudio
+  });
+  clearStallState();
+  resetPlaybackProgressTracking();
+  playerStartedAt = Date.now();
+  playbackActive = false;
+  if (mediaEl) {
+    mediaEl.crossOrigin = satelliteAssigned ? "use-credentials" : "";
+    applyPendingAudioState();
+  }
+
+  if (hls) {
+    restartPlayerForSourceChange(reason, {
+      shouldPlay,
+      immediate: shouldPlay,
+      restoreAudio
+    });
+    return;
+  }
+
+  if (mediaEl && mediaEl.canPlayType("application/vnd.apple.mpegurl")) {
+    mediaEl.addEventListener("loadedmetadata", () => {
+      seekToNearLiveStart(mediaEl);
+      continuePendingPlayback();
+    }, { once: true });
+    mediaEl.src = activeHlsUrl;
+    mediaEl.load();
+    updateUnmute();
+    updateAudioControls();
+    return;
+  }
+
+  restartPlayerForSourceChange(reason, {
+    shouldPlay,
+    immediate: shouldPlay,
+    restoreAudio
+  });
+};
+
+const requestSatelliteAssignment = async ({ forceFresh = false, excludeUrl = null } = {}) => {
+  if (!forceFresh && satelliteAssignmentPromise) {
+    logNodeSwitchConsole("assignment-reused-promise");
+    return satelliteAssignmentPromise;
+  }
+
+  const requestToken = ++satelliteAssignmentRequestToken;
+  let effectiveExcludeUrl = excludeUrl ?? currentExcludeSatelliteUrl;
+  const requestPromise = (async () => {
+    try {
+      const previousSatelliteUrl = satelliteUrl;
+      const previousAssigned = satelliteAssigned;
+      if (effectiveExcludeUrl && currentExcludeSatelliteUntil && Date.now() >= currentExcludeSatelliteUntil) {
+        currentExcludeSatelliteUrl = null;
+        currentExcludeSatelliteUntil = 0;
+        effectiveExcludeUrl = null;
+      }
+      debugLog("satellite assignment: checking");
+      logNodeSwitchConsole("assignment-check", {
+        excludeUrl: effectiveExcludeUrl,
+        excludeUntil: currentExcludeSatelliteUntil || null,
+        forceFresh
+      });
+      const assignUrl = effectiveExcludeUrl
+        ? `/api/satellite/assign?exclude=${encodeURIComponent(effectiveExcludeUrl)}`
+        : "/api/satellite/assign";
+      const resp = await fetch(assignUrl, { cache: "no-store" });
+      if (!resp.ok) {
+        logNodeSwitchConsole("assignment-failed-response", {
+          status: resp.status,
+          assignUrl
+        });
+        return;
+      }
+      const data = await resp.json();
+      if (requestToken !== satelliteAssignmentRequestToken) {
+        logNodeSwitchConsole("assignment-stale-ignored", {
+          requestToken,
+          latestToken: satelliteAssignmentRequestToken,
+          assignUrl,
+          assignedUrl: data?.satellite_url || null
+        });
+        return undefined;
+      }
+      logNodeSwitchConsole("assignment-result", {
+        assignUrl,
+        assignedUrl: data?.satellite_url || null,
+        previousAssigned,
+        previousSatelliteUrl
+      });
+      return data?.satellite_url ? data.satellite_url.replace(/\/$/, "") : null;
+    } catch (error) {
+      debugLog(`satellite assign failed, streaming direct: ${error?.message || error}`);
+      logNodeSwitchConsole("assignment-error", {
+        message: error?.message || String(error)
+      });
+      return undefined;
+    } finally {
+      if (satelliteAssignmentPromise === requestPromise) {
+        satelliteAssignmentPromise = null;
+      }
+    }
+  })();
+
+  satelliteAssignmentPromise = requestPromise;
+  return requestPromise;
+};
+
+const applySatelliteAssignment = (assignedUrl, reason = "assignment") => {
+  const previousSatelliteUrl = satelliteUrl;
+  const previousAssigned = satelliteAssigned;
+  const previousSourceLabel = previousAssigned ? (previousSatelliteUrl || "main") : "main";
+
+  if (assignedUrl === undefined) return false;
+  if (!assignedUrl) {
+    if (!satelliteAssigned) {
+      debugLog("no satellite available, streaming direct");
+      logNodeSwitchConsole("assignment-no-satellite");
+    }
     return false;
   }
-  const delayMs = satelliteStartupManifestRetryScheduleMs[satelliteStartupManifestRetryCount];
-  satelliteStartupManifestRetryCount += 1;
-  debugLog(`satellite retry ${satelliteStartupManifestRetryCount}/${satelliteStartupManifestRetryScheduleMs.length}: ${reason}`);
-  if (hls) {
-    hls.destroy();
-    hls = null;
+
+  const normalizedUrl = assignedUrl.replace(/\/$/, "");
+  if (normalizedUrl === window.location.origin) {
+    resetSatelliteStartupRetries();
+    debugLog("satellite assignment: main");
+    performSourceSwitch(`${reason} ${previousSourceLabel} -> main`, () => {
+      satelliteUrl = null;
+      satelliteAssigned = false;
+      setActiveMedia();
+    });
+    return true;
   }
-  started = false;
-  if (satelliteStartupManifestRetryTimer) {
-    clearTimeout(satelliteStartupManifestRetryTimer);
-  }
-  satelliteStartupManifestRetryTimer = setTimeout(() => {
-    satelliteStartupManifestRetryTimer = null;
-    if (!satelliteAssigned || started) return;
-    startPlayer();
-  }, delayMs);
+
+  resetSatelliteStartupRetries();
+  currentExcludeSatelliteUrl = null;
+  currentExcludeSatelliteUntil = 0;
+  debugLog(`satellite assignment: ${debugSatelliteLabel(normalizedUrl)}`);
+  performSourceSwitch(`${reason} ${previousSourceLabel} -> ${normalizedUrl}`, () => {
+    satelliteUrl = normalizedUrl;
+    satelliteAssigned = true;
+    setActiveMedia();
+  });
   return true;
 };
 
-const fetchSatelliteAssignment = async () => {
-  try {
-    const previousSatelliteUrl = satelliteUrl;
-    const previousAssigned = satelliteAssigned;
-    const previousActiveHlsUrl = activeHlsUrl;
-    debugLog("satellite assignment: checking");
-    const assignUrl = currentExcludeSatelliteUrl
-      ? `/api/satellite/assign?exclude=${encodeURIComponent(currentExcludeSatelliteUrl)}`
-      : "/api/satellite/assign";
-    const resp = await fetch(assignUrl, { cache: "no-store" });
-    if (!resp.ok) return;
-    const data = await resp.json();
-    if (data.satellite_url) {
-      const assignedUrl = data.satellite_url.replace(/\/$/, "");
-      satelliteAssignAttempts = satelliteAssignMaxAttempts;
-      if (assignedUrl === window.location.origin) {
-        satelliteUrl = null;
-        satelliteAssigned = false;
-        resetSatelliteStartupRetries();
-        debugLog("satellite assignment: main");
-      } else {
-        satelliteUrl = assignedUrl;
-        satelliteAssigned = true;
-        resetSatelliteStartupRetries();
-        currentExcludeSatelliteUrl = null;
-        debugLog(`satellite assignment: ${debugSatelliteLabel(satelliteUrl)}`);
-      }
-      setActiveMedia();
-      if (started && activeHlsUrl !== previousActiveHlsUrl) {
-        restartPlayerForSourceChange(
-          `assignment ${previousAssigned ? (previousSatelliteUrl || "main") : "main"} -> ${satelliteAssigned ? satelliteUrl : "main"}`
-        );
-      }
-    } else {
-      satelliteAssignAttempts++;
-      if (satelliteAssignAttempts < satelliteAssignMaxAttempts) {
-        debugLog(`no satellite yet, retry ${satelliteAssignAttempts}/${satelliteAssignMaxAttempts} in ${satelliteAssignRetryMs / 1000}s`);
-        setTimeout(fetchSatelliteAssignment, satelliteAssignRetryMs);
-      } else {
-        satelliteUrl = null;
-        satelliteAssigned = false;
-        debugLog("no satellite available, streaming direct");
-      }
-    }
-  } catch (error) {
-    satelliteUrl = null;
-    satelliteAssigned = false;
-    debugLog(`satellite assign failed, streaming direct: ${error?.message || error}`);
-  }
+const fetchSatelliteAssignment = async (options = {}) => {
+  const assignedUrl = await requestSatelliteAssignment(options);
+  applySatelliteAssignment(assignedUrl, "assignment");
+  return assignedUrl;
 };
 
 const switchToAlternateSatellite = async (reason) => {
-  const failedSatelliteUrl = satelliteUrl;
-  if (!failedSatelliteUrl) {
-    fallbackToMainServer();
-    return;
+  if (satelliteSwitchPromise) {
+    logNodeSwitchConsole("switch-reused-promise", { reason });
+    return satelliteSwitchPromise;
   }
-  debugLog(`stream load failed on ${debugSatelliteLabel(failedSatelliteUrl)}; switching`);
-  currentExcludeSatelliteUrl = failedSatelliteUrl;
-  resetSatelliteStartupRetries();
-  await fetchSatelliteAssignment();
-  if (satelliteUrl === failedSatelliteUrl || !satelliteAssigned) {
-    debugLog(`stream load failed on ${debugSatelliteLabel(failedSatelliteUrl)}; fallback to main`);
-    fallbackToMainServer();
-    if (hls) {
-      hls.destroy();
-      hls = null;
+
+  satelliteSwitchPromise = (async () => {
+    const failedSatelliteUrl = satelliteUrl;
+    if (!failedSatelliteUrl) {
+      logNodeSwitchConsole("switch-no-failed-satellite", { reason });
+      fallbackToMainServer();
+      return;
     }
-    started = false;
-    startPlayer();
-    return;
-  }
-  debugLog(`switch complete: ${debugSatelliteLabel(failedSatelliteUrl)} -> ${debugSatelliteLabel(satelliteUrl)}`);
+    debugLog(`stream load failed on ${debugSatelliteLabel(failedSatelliteUrl)}; switching`);
+    logNodeSwitchConsole("switch-start", {
+      reason,
+      failedNode: debugSatelliteLabel(failedSatelliteUrl),
+      failedSatelliteUrl
+    });
+    currentExcludeSatelliteUrl = failedSatelliteUrl;
+    currentExcludeSatelliteUntil = Date.now() + satelliteExcludeCooldownMs;
+    resetSatelliteStartupRetries();
+
+    const assignedUrl = await requestSatelliteAssignment({
+      forceFresh: true,
+      excludeUrl: failedSatelliteUrl
+    });
+    if (
+      assignedUrl
+      && assignedUrl !== window.location.origin
+      && assignedUrl !== failedSatelliteUrl
+    ) {
+      applySatelliteAssignment(assignedUrl, "failover");
+    }
+    if (satelliteUrl === failedSatelliteUrl || !satelliteAssigned) {
+      debugLog(`stream load failed on ${debugSatelliteLabel(failedSatelliteUrl)}; fallback to main`);
+      logNodeSwitchConsole("switch-fallback-main", {
+        reason,
+        failedNode: debugSatelliteLabel(failedSatelliteUrl),
+        failedSatelliteUrl,
+        assignedUrl: assignedUrl || null
+      });
+      fallbackToMainServer();
+      return;
+    }
+    debugLog(`switch complete: ${debugSatelliteLabel(failedSatelliteUrl)} -> ${debugSatelliteLabel(satelliteUrl)}`);
+    logNodeSwitchConsole("switch-complete", {
+      reason,
+      failedNode: debugSatelliteLabel(failedSatelliteUrl),
+      nextNode: activeNodeName(),
+      nextSatelliteUrl: satelliteUrl
+    });
+    scheduleSatelliteStartupSwitchCheck(reason);
+  })().finally(() => {
+    satelliteSwitchPromise = null;
+  });
+
+  return satelliteSwitchPromise;
 };
 
 const fallbackToMainServer = () => {
   if (!satelliteAssigned) return;
   resetSatelliteStartupRetries();
   debugLog(`satellite fallback: reverting to main server from ${satelliteUrl || "unknown"}`);
-  satelliteUrl = null;
-  satelliteAssigned = false;
-  setActiveMedia();
+  logNodeSwitchConsole("fallback-main", {
+    previousSatelliteUrl: satelliteUrl
+  });
+  performSourceSwitch("satellite -> main", () => {
+    satelliteUrl = null;
+    satelliteAssigned = false;
+    setActiveMedia();
+  });
 };
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
@@ -413,6 +619,57 @@ const hlsErrorSummary = (data) => {
   }
   if (responseText) parts.push(`response=${responseText}`);
   return parts.join(" ");
+};
+
+const hlsErrorRequestUrl = (data) => (
+  data?.context?.url
+  || data?.url
+  || data?.networkDetails?.responseURL
+  || data?.networkDetails?.url
+  || ""
+);
+
+const isSameUrlOrigin = (left, right) => {
+  if (!left || !right) return false;
+  try {
+    const leftUrl = new URL(left, window.location.href);
+    const rightUrl = new URL(right, window.location.href);
+    return leftUrl.origin === rightUrl.origin;
+  } catch {
+    return false;
+  }
+};
+
+const isHlsSegmentUrl = (value) => {
+  if (!value) return false;
+  try {
+    return /\.(?:ts|m4s|mp4|aac)(?:[?#]|$)/i.test(new URL(value, window.location.href).pathname);
+  } catch {
+    return /\.(?:ts|m4s|mp4|aac)(?:[?#]|$)/i.test(String(value));
+  }
+};
+
+const isHlsRequestUrl = (value) => {
+  if (!value) return false;
+  try {
+    const path = new URL(value, window.location.href).pathname;
+    return /\.m3u8$/i.test(path) || /\.(?:ts|m4s|mp4|aac)$/i.test(path);
+  } catch {
+    return /\.(?:m3u8|ts|m4s|mp4|aac)(?:[?#]|$)/i.test(String(value));
+  }
+};
+
+const triggerSatelliteRequestFailover = (reason, requestUrl, failedSatelliteUrl = satelliteUrl, details = {}) => {
+  if (!satelliteAssigned || !failedSatelliteUrl || !requestUrl) return;
+  if (failedSatelliteUrl !== satelliteUrl) return;
+  if (!isSameUrlOrigin(requestUrl, failedSatelliteUrl) || !isHlsRequestUrl(requestUrl)) return;
+  logNodeSwitchConsole("request-triggered-switch", {
+    reason,
+    requestUrl,
+    failedSatelliteUrl,
+    ...details
+  });
+  void switchToAlternateSatellite(`${reason} ${requestUrl}`);
 };
 
 const probeManifestRequest = async (url, credentialsMode) => {
@@ -599,6 +856,50 @@ const applyVolume = () => {
 };
 
 let currentVolume = loadVolume();
+
+const setPendingPlaybackRequest = ({
+  shouldPlay = true,
+  immediate = false,
+  restoreAudio = false
+} = {}) => {
+  pendingPlaybackRequest = {
+    shouldPlay: !!shouldPlay,
+    immediate: !!immediate,
+    restoreAudio: !!restoreAudio
+  };
+};
+
+const syncPlaybackIntentFromElement = (element) => {
+  if (!element) return;
+  if (!element.muted && element.volume > 0) {
+    allowAutoplay = false;
+  }
+};
+
+const applyPendingAudioState = () => {
+  if (!mediaEl) return;
+  applyVolume();
+  if (pendingPlaybackRequest.restoreAudio && currentVolume > 0) {
+    mediaEl.muted = false;
+    allowAutoplay = false;
+  }
+};
+
+const continuePendingPlayback = () => {
+  applyPendingAudioState();
+  if (!pendingPlaybackRequest.shouldPlay) {
+    updateUnmute();
+    updateAudioControls();
+    return;
+  }
+  if (pendingPlaybackRequest.immediate) {
+    attemptPlay(mediaEl);
+  } else {
+    waitForStartupBuffer(mediaEl, () => attemptPlay(mediaEl));
+  }
+  setTimeout(updateUnmute, 100);
+  updateAudioControls();
+};
 
 const loadAutostartAttempts = () => {
   const stored = sessionStorage.getItem(autostartAttemptsKey);
@@ -897,17 +1198,27 @@ const setActiveMedia = () => {
   }
   debugLog(`source selected: ${audioOnlyEnabled ? "audio" : "video"} via ${debugSatelliteLabel(satelliteUrl)}`);
   resetPlaybackProgressTracking();
+  updateNodeName();
   updatePlayerClass();
   updateAutostartUI();
   applyVolume();
 };
 
-const restartPlayerForSourceChange = (reason) => {
+const restartPlayerForSourceChange = (reason, playbackRequest = null) => {
   if (!started) return;
-  const shouldForcePlay = playbackActive || !mediaEl?.paused;
+  const shouldPlay = playbackRequest?.shouldPlay ?? !!(mediaEl && !mediaEl.paused && !mediaEl.ended);
+  const immediate = playbackRequest?.immediate ?? shouldPlay;
+  const restoreAudio = playbackRequest?.restoreAudio ?? !!(mediaEl && !mediaEl.muted && currentVolume > 0);
   debugLog(`source switch: ${reason}`);
+  logNodeSwitchConsole("restart-player-for-source-change", {
+    reason,
+    shouldPlay,
+    immediate,
+    restoreAudio
+  });
+  setPendingPlaybackRequest({ shouldPlay, immediate, restoreAudio });
   stopPlayer();
-  startPlayerWithOptions({ forcePlay: shouldForcePlay });
+  startPlayerWithOptions({ forcePlay: immediate, shouldPlay, restoreAudio });
 };
 
 const statsColors = () => {
@@ -1026,6 +1337,11 @@ const renderSatelliteTable = (satellites) => {
   }
   if (satelliteSection) satelliteSection.classList.remove("hidden");
   satelliteBody.innerHTML = satellites.map((sat) => {
+    const liveBandwidth = Number(sat.bandwidth_mbps || 0);
+    const averageBandwidth = Number(sat.speedtest_upload_mbps || 0);
+    const bandwidthLabel = averageBandwidth > 0
+      ? `${liveBandwidth.toFixed(1)} / ${averageBandwidth.toFixed(1)} Mbps`
+      : `${liveBandwidth.toFixed(1)} Mbps`;
     const healthClass = sat.healthy
       ? "sat-healthy"
       : (sat.heartbeat_healthy ? "sat-degraded" : "sat-unhealthy");
@@ -1061,7 +1377,7 @@ const renderSatelliteTable = (satellites) => {
       <td>${escapeHtml(sat.name || sat.id.slice(0, 8))}</td>
       <td>${sat.viewer_count} / ${sat.capacity_max_viewers}</td>
       <td>${sat.cpu_percent.toFixed(1)}%</td>
-      <td>${sat.bandwidth_mbps.toFixed(1)} Mbps</td>
+      <td>${bandwidthLabel}</td>
       <td><span class="sat-health ${healthClass}">${healthLabel}</span></td>
       <td title="${dnsTitle}"><span class="sat-health ${dnsClass}">${escapeHtml(dnsLabel)}</span></td>
       <td title="${healthTitle}"><span class="sat-health ${probeHealthClass}">${escapeHtml(probeHealthLabel)}</span></td>
@@ -1115,7 +1431,7 @@ const renderScalewayTable = (payload) => {
     scalewayMetaEl.textContent = `${count} sichtbar | ${managedCount} / ${payload?.max_servers || scalewayServerLimit} verwaltet`;
   }
   if (!servers.length) {
-    scalewayBody.innerHTML = '<tr><td colspan="6" class="satellite-empty">Keine Scaleway-Server im Projekt sichtbar.</td></tr>';
+    scalewayBody.innerHTML = '<tr><td colspan="7" class="satellite-empty">Keine Scaleway-Server im Projekt sichtbar.</td></tr>';
     return;
   }
   scalewayBody.innerHTML = servers.map((server) => {
@@ -1127,28 +1443,33 @@ const renderScalewayTable = (payload) => {
     const deletePending = pendingScalewayDeletes.has(String(server.id || ""));
     return `<tr>
       <td>${escapeHtml(server.name || server.id)}</td>
+      <td>${escapeHtml(server.node_name || "-")}</td>
       <td>${escapeHtml(server.zone || "")}</td>
       <td title="${errorTitle}"><span class="sat-health ${stateClass}">${escapeHtml(state)}</span></td>
       <td>${escapeHtml(server.public_ip || "-")}</td>
       <td>${escapeHtml(server.commercial_type || "-")}</td>
       <td>${server.managed
-        ? `<button type="button" class="scw-inline-button${deletePending ? " scw-inline-button-pending" : ""}" data-server-id="${escapeHtml(server.id)}"${deletePending ? " disabled" : ""}>${deletePending ? "Pending" : "Löschen"}</button>`
+        ? `<button type="button" class="scw-inline-button${deletePending ? " scw-inline-button-pending" : ""}" data-server-id="${escapeHtml(server.id)}"${deletePending ? " disabled" : ""}>${deletePending ? "Pending" : "Remove"}</button>`
         : '<span class="scw-external-label">Extern</span>'}</td>
     </tr>`;
   }).join("");
 };
 
-const fetchScalewayServers = async () => {
+const fetchScalewayServers = async ({ quiet = false } = {}) => {
   if (!scalewaySection || !debugEnabled) return;
   if (!scalewayEnabled) {
     setScalewayStatus("Scaleway-Verwaltung ist serverseitig nicht konfiguriert.", true);
     return;
   }
-  setScalewayStatus("Lade Scaleway-Server ...");
+  if (!quiet) {
+    setScalewayStatus("Lade Scaleway-Server ...");
+  }
   try {
     const payload = await scalewayRequest("/api/scaleway/servers");
     renderScalewayTable(payload);
-    setScalewayStatus("Scaleway-Server geladen.");
+    if (!quiet) {
+      setScalewayStatus("Scaleway-Server geladen.");
+    }
   } catch (error) {
     renderScalewayTable({ servers: [], count: 0, managed_count: 0, max_servers: scalewayServerLimit });
     setScalewayStatus(`Scaleway-Liste fehlgeschlagen: ${error.message}`, true);
@@ -1202,11 +1523,6 @@ const deleteScalewayServer = async (serverId) => {
 
 const initScaleway = () => {
   if (!scalewaySection || !debugEnabled) return;
-  if (scalewayLoadBtn) {
-    scalewayLoadBtn.addEventListener("click", () => {
-      fetchScalewayServers();
-    });
-  }
   if (scalewayForm) {
     scalewayForm.addEventListener("submit", (event) => {
       event.preventDefault();
@@ -1221,6 +1537,9 @@ const initScaleway = () => {
     });
   }
   fetchScalewayServers();
+  setInterval(() => {
+    fetchScalewayServers({ quiet: true });
+  }, scalewayPollIntervalMs);
 };
 
 const markStall = () => {
@@ -1233,6 +1552,7 @@ const clearStallState = () => {
   stallStartedAt = 0;
   lastStallRecoveryAt = 0;
   mediaRecoveryAttempts = 0;
+  clearSatelliteStartupSwitchTimer();
 };
 
 const resetPlaybackProgressTracking = () => {
@@ -1299,6 +1619,13 @@ const attemptMediaRecovery = () => {
   if (!isLive) return;
   markStall();
   const now = Date.now();
+  if (satelliteAssigned && stallStartedAt && now - stallStartedAt >= satelliteStallFailoverMs) {
+    logNodeSwitchConsole("stall-triggered-switch", {
+      stallAgeMs: now - stallStartedAt
+    });
+    void switchToAlternateSatellite(`stall ${now - stallStartedAt}ms`);
+    return;
+  }
   if (now - lastMediaRecoveryAt > 30000) {
     mediaRecoveryAttempts = 0;
   }
@@ -1351,7 +1678,11 @@ if (audioOnlyToggle) {
 setActiveMedia();
 fetchSatelliteAssignment();
 setInterval(() => {
-  if (tabSuppressed || audioOnlyEnabled || !autostartEnabled || !isLive) return;
+  if (satelliteAssigned) return;
+  void fetchSatelliteAssignment();
+}, satelliteAssignPollIntervalMs);
+setInterval(() => {
+  if (tabSuppressed || !isLive) return;
   const element = mediaEl;
   if (!element || !started || element.ended) return;
   const isPlaying = isPlaybackRunning(element);
@@ -1362,6 +1693,13 @@ setInterval(() => {
   if (element.paused) return;
   markStall();
   const stallAge = Date.now() - stallStartedAt;
+  if (satelliteAssigned && stallAge >= satelliteStallFailoverMs) {
+    logNodeSwitchConsole("watchdog-triggered-switch", {
+      stallAgeMs: stallAge
+    });
+    void switchToAlternateSatellite(`watchdog stall ${stallAge}ms`);
+    return;
+  }
   if (stallAge < stallReloadGraceMs) {
     tryInlineStallRecovery("watchdog");
     return;
@@ -1381,7 +1719,11 @@ if (debugEnabled) {
 }
 initSatellites();
 initScaleway();
-document.addEventListener("visibilitychange", syncAudioVisualizer);
+document.addEventListener("visibilitychange", () => {
+  syncAudioVisualizer();
+  updateUnmute();
+});
+setInterval(watchUnmuteState, unmuteWatchIntervalMs);
 
 if (autostartToggle) {
   autostartToggle.addEventListener("change", () => {
@@ -1453,15 +1795,24 @@ const updateUnmute = () => {
   if (!unmuteEl) return;
   if (!mediaEl) return;
   if (audioOnlyEnabled) {
-    unmuteEl.className = "unmute-overlay hidden";
+    if (unmuteEl.className !== "unmute-overlay hidden") {
+      unmuteEl.className = "unmute-overlay hidden";
+    }
     updateAudioControls();
     return;
   }
-  const isPlaying = started && playbackActive;
-  const show = isLive && isPlaying && mediaEl.muted;
-  unmuteEl.className = show ? "unmute-overlay" : "unmute-overlay hidden";
+  const hasSource = !!(mediaEl.currentSrc || mediaEl.src);
+  const show = isLive && started && hasSource && mediaEl.muted;
+  const nextClass = show ? "unmute-overlay" : "unmute-overlay hidden";
+  if (unmuteEl.className !== nextClass) {
+    unmuteEl.className = nextClass;
+  }
   updateAudioControls();
 };
+
+function watchUnmuteState() {
+  updateUnmute();
+}
 
 const attemptPlay = (element) => {
   if (!element) return;
@@ -1544,6 +1895,7 @@ if (unmuteBtn) {
     mediaEl.muted = false;
     attemptPlay(mediaEl);
     allowAutoplay = false;
+    syncPlaybackIntentFromElement(mediaEl);
     updateUnmute();
   });
 }
@@ -1572,12 +1924,14 @@ if (audioToggleBtn) {
       setActiveMedia();
       allowAutoplay = false;
       mediaEl.muted = false;
+      syncPlaybackIntentFromElement(mediaEl);
       startPlayerWithOptions({ forcePlay: true });
       updateAudioControls();
       return;
     }
     if (mediaEl.muted || mediaEl.paused || mediaEl.ended) {
       mediaEl.muted = false;
+      syncPlaybackIntentFromElement(mediaEl);
       attemptPlay(mediaEl);
     } else {
       stopPlayer();
@@ -1596,6 +1950,7 @@ if (volumeSlider) {
     if (mediaEl) {
       mediaEl.volume = currentVolume;
       mediaEl.muted = currentVolume === 0;
+      syncPlaybackIntentFromElement(mediaEl);
     }
     updateAudioControls();
     updateUnmute();
@@ -1608,7 +1963,12 @@ if (volumeSlider) {
     if (event.currentTarget !== mediaEl) return;
     capturePlaybackProgress(event.currentTarget);
   });
-  element.addEventListener("volumechange", updateUnmute);
+  element.addEventListener("volumechange", (event) => {
+    if (event.currentTarget === mediaEl) {
+      syncPlaybackIntentFromElement(event.currentTarget);
+    }
+    updateUnmute();
+  });
   element.addEventListener("play", updateUnmute);
   element.addEventListener("playing", (event) => {
     if (event.currentTarget !== mediaEl) return;
@@ -1652,6 +2012,15 @@ if (volumeSlider) {
     }
     if (event.currentTarget === mediaEl) {
       playbackActive = false;
+      if (satelliteAssigned) {
+        logNodeSwitchConsole("media-error-triggered-switch", {
+          code,
+          message: err?.message || ""
+        });
+        void switchToAlternateSatellite(`media error code=${code}`);
+        updateUnmute();
+        return;
+      }
       updateUnmute();
     }
   });
@@ -1675,7 +2044,12 @@ if (volumeSlider) {
       updateUnmute();
     }
   });
-  element.addEventListener("canplay", () => debugLog("player ready"));
+  element.addEventListener("canplay", (event) => {
+    if (event.currentTarget === mediaEl) {
+      clearSatelliteStartupSwitchTimer();
+    }
+    debugLog("player ready");
+  });
 });
 
 const resetMediaElement = (element) => {
@@ -1846,7 +2220,11 @@ const startPlayer = () => {
   startPlayerWithOptions({ forcePlay: false });
 };
 
-const startPlayerWithOptions = ({ forcePlay }) => {
+const startPlayerWithOptions = ({
+  forcePlay,
+  shouldPlay = true,
+  restoreAudio = !!(mediaEl && !mediaEl.muted && currentVolume > 0)
+}) => {
   if (started) return;
   if (tabLocked) {
     debugLog("tab locked, skip start");
@@ -1864,28 +2242,41 @@ const startPlayerWithOptions = ({ forcePlay }) => {
   setActiveMedia();
   if (!activeHlsUrl) {
     debugLog("no media source available");
+    logNodeSwitchConsole("start-player-no-source", {
+      forcePlay,
+      shouldPlay,
+      restoreAudio
+    });
     updateAudioControls();
     return;
   }
+  logNodeSwitchConsole("start-player", {
+    forcePlay,
+    shouldPlay,
+    restoreAudio,
+    mediaType: audioOnlyEnabled ? "audio" : "video"
+  });
   started = true;
   playerStartedAt = Date.now();
   setStatus(true);
+  setPendingPlaybackRequest({
+    shouldPlay,
+    immediate: !!forcePlay,
+    restoreAudio
+  });
   if (mediaEl) {
     mediaEl.crossOrigin = satelliteAssigned ? "use-credentials" : "";
+    applyPendingAudioState();
   }
 
   if (mediaEl && mediaEl.canPlayType("application/vnd.apple.mpegurl")) {
     mediaEl.src = activeHlsUrl;
-    if (forcePlay) {
+    if (shouldPlay && forcePlay) {
       attemptPlay(mediaEl);
     }
     mediaEl.addEventListener("loadedmetadata", () => {
       seekToNearLiveStart(mediaEl);
-      if (forcePlay) {
-        attemptPlay(mediaEl);
-      } else {
-        waitForStartupBuffer(mediaEl, () => attemptPlay(mediaEl));
-      }
+      continuePendingPlayback();
     }, { once: true });
     return;
   }
@@ -1899,8 +2290,99 @@ const startPlayerWithOptions = ({ forcePlay }) => {
       maxBufferLength: 30,
       maxMaxBufferLength: 60,
       backBufferLength: 30,
-      xhrSetup: (xhr) => {
+      manifestLoadingTimeOut: satelliteAssigned ? 10000 : 15000,
+      manifestLoadingMaxRetry: 0,
+      levelLoadingTimeOut: satelliteAssigned ? 10000 : 15000,
+      levelLoadingMaxRetry: 0,
+      fragLoadingTimeOut: satelliteAssigned ? 10000 : 15000,
+      fragLoadingMaxRetry: 0,
+      manifestLoadPolicy: {
+        default: {
+          maxTimeToFirstByteMs: satelliteAssigned ? 10000 : 15000,
+          maxLoadTimeMs: satelliteAssigned ? 10000 : 15000,
+          timeoutRetry: {
+            maxNumRetry: 0,
+            retryDelayMs: 0,
+            maxRetryDelayMs: 0
+          },
+          errorRetry: {
+            maxNumRetry: 0,
+            retryDelayMs: 0,
+            maxRetryDelayMs: 0
+          }
+        }
+      },
+      playlistLoadPolicy: {
+        default: {
+          maxTimeToFirstByteMs: satelliteAssigned ? 10000 : 15000,
+          maxLoadTimeMs: satelliteAssigned ? 10000 : 15000,
+          timeoutRetry: {
+            maxNumRetry: 0,
+            retryDelayMs: 0,
+            maxRetryDelayMs: 0
+          },
+          errorRetry: {
+            maxNumRetry: 0,
+            retryDelayMs: 0,
+            maxRetryDelayMs: 0
+          }
+        }
+      },
+      fragLoadPolicy: {
+        default: {
+          maxTimeToFirstByteMs: satelliteAssigned ? 10000 : 15000,
+          maxLoadTimeMs: satelliteAssigned ? 10000 : 15000,
+          timeoutRetry: {
+            maxNumRetry: 0,
+            retryDelayMs: 0,
+            maxRetryDelayMs: 0
+          },
+          errorRetry: {
+            maxNumRetry: 0,
+            retryDelayMs: 0,
+            maxRetryDelayMs: 0
+          }
+        }
+      },
+      keyLoadPolicy: {
+        default: {
+          maxTimeToFirstByteMs: satelliteAssigned ? 10000 : 15000,
+          maxLoadTimeMs: satelliteAssigned ? 10000 : 15000,
+          timeoutRetry: {
+            maxNumRetry: 0,
+            retryDelayMs: 0,
+            maxRetryDelayMs: 0
+          },
+          errorRetry: {
+            maxNumRetry: 0,
+            retryDelayMs: 0,
+            maxRetryDelayMs: 0
+          }
+        }
+      },
+      xhrSetup: (xhr, url) => {
         xhr.withCredentials = satelliteAssigned;
+        const requestUrl = url || "";
+        const failedSatelliteUrl = satelliteUrl;
+        if (!satelliteAssigned || !failedSatelliteUrl || !isHlsRequestUrl(requestUrl)) return;
+        let failoverTriggered = false;
+        const failover = (reason) => {
+          if (failoverTriggered) return;
+          failoverTriggered = true;
+          triggerSatelliteRequestFailover(reason, requestUrl, failedSatelliteUrl, {
+            status: xhr.status || 0,
+            readyState: xhr.readyState
+          });
+        };
+        xhr.addEventListener("error", () => failover("xhr-error"));
+        xhr.addEventListener("timeout", () => failover("xhr-timeout"));
+        xhr.addEventListener("abort", () => failover("xhr-abort"));
+        xhr.addEventListener("loadend", () => {
+          const status = xhr.status || 0;
+          if (status === 0 || status >= 400) {
+            failover(`xhr-status-${status}`);
+          }
+        });
       },
       fetchSetup: (context, initParams) => (
         new Request(context.url, {
@@ -1913,22 +2395,45 @@ const startPlayerWithOptions = ({ forcePlay }) => {
     if (mediaEl) {
       hls.attachMedia(mediaEl);
     }
-    if (forcePlay) {
+    if (shouldPlay && forcePlay) {
       attemptPlay(mediaEl);
     }
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       resetSatelliteStartupRetries();
       jumpToLiveEdge(hls, mediaEl);
-      if (forcePlay) {
-        attemptPlay(mediaEl);
-      } else {
-        waitForStartupBuffer(mediaEl, () => attemptPlay(mediaEl));
-      }
-      setTimeout(updateUnmute, 100);
+      continuePendingPlayback();
     });
     hls.on(Hls.Events.ERROR, (event, data) => {
       const details = data?.details || "";
+      const requestUrl = hlsErrorRequestUrl(data);
+      const responseCode = data?.response?.code ?? data?.networkDetails?.status ?? 0;
+      const failedSatelliteSegment = (
+        satelliteAssigned
+        && isHlsSegmentUrl(requestUrl)
+        && isSameUrlOrigin(requestUrl, satelliteUrl)
+      );
+      const isNetworkLoadFailure = (
+        data?.type === Hls.ErrorTypes.NETWORK_ERROR
+        || [
+          "manifestLoadError",
+          "manifestLoadTimeOut",
+          "levelLoadError",
+          "levelLoadTimeOut",
+          "fragLoadError",
+          "fragLoadTimeOut",
+          "keyLoadError",
+          "keyLoadTimeOut"
+        ].includes(details)
+      );
       debugLog(`hls load failed: ${details || data?.type || "unknown"}`);
+      logNodeSwitchConsole("hls-error", {
+        type: data?.type || "unknown",
+        details: details || "unknown",
+        fatal: !!data?.fatal,
+        responseCode: responseCode || null,
+        requestUrl: requestUrl || null,
+        failedSatelliteSegment
+      });
       debugManifestFailure(data);
       emitClientDebug(
         "hls_error",
@@ -1943,19 +2448,9 @@ const startPlayerWithOptions = ({ forcePlay }) => {
         attemptMediaRecovery();
         return;
       }
-      if (
-        details === "manifestLoadError"
-        || details === "levelLoadError"
-        || details === "manifestLoadTimeOut"
-        || details === "levelLoadTimeOut"
-        || details === "fragLoadTimeOut"
-      ) {
+      if (isNetworkLoadFailure || failedSatelliteSegment) {
         if (satelliteAssigned) {
-          const responseCode = data?.response?.code ?? data?.networkDetails?.status ?? 0;
-          if (retrySatelliteStartupLoad(`${details} status=${responseCode || 0}`)) {
-            return;
-          }
-          void switchToAlternateSatellite(`${details} status=${responseCode || 0}`);
+          void switchToAlternateSatellite(`${details || "segment load failed"} status=${responseCode || 0}`);
           return;
         }
         if (hls) {

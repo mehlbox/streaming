@@ -95,6 +95,7 @@ services:
       HLS_ACCESS_LOG: /hls-logs/hls.log
       NGINX_STATUS_URL: http://nginx/nginx-status
       LOCAL_SATELLITE_NAME: main
+      SATELLITE_CERT_CACHE_DIR: /satellite-certs
     expose:
       - "5000"
     working_dir: /app
@@ -104,6 +105,7 @@ services:
       - ./data:/var/www/data:ro
       - hls_data:/var/www/hls:ro
       - hls_logs:/hls-logs:ro
+      - ./satellite-certs:/satellite-certs
     command:
       - sh
       - -c
@@ -179,9 +181,11 @@ services:
       - satellite
     environment:
       HLS_ACCESS_LOG: /hls-logs/hls.log
+      CADDY_CERTIFICATES_DIR: /caddy-certificates
     volumes:
       - ./satellite:/agent:ro
       - hls_logs:/hls-logs:ro
+      - ${CADDY_CERTIFICATES_DIR:-/var/lib/caddy/.local/share/caddy/certificates}:/caddy-certificates:ro
     depends_on:
       satellite-nginx:
         condition: service_healthy

@@ -25,6 +25,7 @@ HLS_ACCESS_LOG=${HLS_ACCESS_LOG:-/var/log/streaming-satellite/hls.log}
 AGENT_LOG_PATH=${AGENT_LOG_PATH:-/var/log/streaming-satellite/agent.log}
 SERVICE_NAME=${SERVICE_NAME:-streaming-satellite-agent}
 CACHE_DIR=${CACHE_DIR:-/var/cache/nginx/streaming-satellite}
+CADDY_CERTIFICATES_DIR=${CADDY_CERTIFICATES_DIR:-/var/lib/caddy/.local/share/caddy/certificates}
 CADDY_EMAIL=${CADDY_EMAIL:-}
 
 if [ -z "$DEFAULT_SATELLITE_NAME" ]; then
@@ -293,6 +294,72 @@ reload_caddy() {
   fi
 }
 
+restore_caddy_cert_cache() {
+  python3 - "$MAIN_SERVER_URL" "$SATELLITE_API_KEY" "$SATELLITE_PUBLIC_URL" "$CADDY_CERTIFICATES_DIR" <<'PY'
+import base64
+import json
+import os
+import sys
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+from urllib.request import Request, urlopen
+
+main_url, api_key, public_url, cert_dir = sys.argv[1:]
+
+host = (urlparse(public_url).hostname or "").strip().lower()
+if not host:
+    raise SystemExit(0)
+
+request = Request(
+    urljoin(main_url.rstrip("/") + "/", "api/satellite/cert-cache/download"),
+    data=json.dumps({
+        "api_key": api_key,
+        "public_url": public_url,
+        "host": host,
+    }).encode("utf-8"),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+
+try:
+    with urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+except Exception as exc:
+    print(f"Certificate cache restore skipped: {exc}", file=sys.stderr)
+    raise SystemExit(0)
+
+if not payload.get("found"):
+    print(f"No cached certificate found for {host}")
+    raise SystemExit(0)
+
+base = Path(cert_dir).resolve()
+restored = 0
+for relpath, encoded in sorted((payload.get("files") or {}).items()):
+    rel = Path(str(relpath))
+    if rel.is_absolute() or ".." in rel.parts:
+        continue
+    target = (base / rel).resolve()
+    try:
+        target.relative_to(base)
+    except ValueError:
+        continue
+    try:
+        data = base64.b64decode(str(encoded).encode("ascii"), validate=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        os.chmod(target, 0o600 if target.suffix == ".key" else 0o644)
+        restored += 1
+    except Exception as exc:
+        print(f"Skipping cached certificate file {relpath}: {exc}", file=sys.stderr)
+
+if restored:
+    print(f"Restored {restored} cached Caddy certificate files for {host}")
+PY
+  if id caddy >/dev/null 2>&1; then
+    run_root chown -R caddy:caddy "$(dirname "$CADDY_CERTIFICATES_DIR")" >/dev/null 2>&1 || true
+  fi
+}
+
 cleanup_previous_install() {
   if service_exists "$SERVICE_NAME"; then
     run_root systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
@@ -355,6 +422,7 @@ MAIN_SERVER_UPSTREAM_HOST=$MAIN_SERVER_UPSTREAM_HOST
 SATELLITE_PORT=$SATELLITE_PORT
 NGINX_STATUS_URL=http://127.0.0.1:$SATELLITE_PORT/nginx-status
 HLS_ACCESS_LOG=$HLS_ACCESS_LOG
+CADDY_CERTIFICATES_DIR=$CADDY_CERTIFICATES_DIR
 EOF
 
 write_file "$INSTALL_DIR/satellite/agent.py" <<'EOF'
@@ -379,6 +447,7 @@ python3 -m venv "$INSTALL_DIR/venv"
 
 render_nginx_conf | write_file "$NGINX_CONF_PATH"
 render_caddyfile | write_file "$CADDY_CONF_PATH"
+restore_caddy_cert_cache
 
 if command -v systemctl >/dev/null 2>&1; then
   write_file "/etc/systemd/system/$SERVICE_NAME.service" <<EOF

@@ -11,7 +11,7 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}" />
   <link rel="icon" href="{{ favicon_url }}" type="{{ favicon_type }}" />
 </head>
-<body data-admin="1" data-audio-only="{{ '1' if audio_only else '0' }}" data-status-url="{{ url_for('status') }}" data-audio-status-url="{{ url_for('audio_status') }}" data-client-log-url="{{ url_for('client_log') }}" data-debug="1" data-schedule-base-url="{{ schedule_base_url }}" data-scaleway-enabled="{{ '1' if scaleway_enabled else '0' }}" data-scaleway-default-zone="{{ scaleway_default_zone }}" data-scaleway-default-type="{{ scaleway_default_type }}" data-scaleway-server-limit="{{ scaleway_server_limit }}">
+<body data-admin="1" data-audio-only="{{ '1' if audio_only else '0' }}" data-local-node-name="{{ local_satellite_name }}" data-status-url="{{ url_for('status') }}" data-audio-status-url="{{ url_for('audio_status') }}" data-client-log-url="{{ url_for('client_log') }}" data-debug="1" data-schedule-base-url="{{ schedule_base_url }}" data-scaleway-enabled="{{ '1' if scaleway_enabled else '0' }}" data-scaleway-default-zone="{{ scaleway_default_zone }}" data-scaleway-default-type="{{ scaleway_default_type }}" data-scaleway-server-limit="{{ scaleway_server_limit }}">
 
   <a href="#main" class="sr-only">Zum Hauptinhalt springen</a>
 
@@ -46,7 +46,10 @@
               </div>
               <div class="admin-kpi">
                 <span class="admin-kpi-label">Aktuelle Zuschauer</span>
-                <strong id="clients">0 Online</strong>
+                <strong class="admin-kpi-value">
+                  <span id="clients">0 Online</span>
+                </strong>
+                <span id="node-name" class="node-name-tag">{{ local_satellite_name }}</span>
               </div>
               <div class="admin-kpi">
                 <span class="admin-kpi-label">Peak im Zeitraum</span>
@@ -108,8 +111,8 @@
                 <th>Status</th>
                 <th>DNS</th>
                 <th>Health</th>
-                <th>HLS</th>
-                <th>Signal</th>
+                <th>Stream</th>
+                <th>Heartbeat</th>
               </tr>
             </thead>
             <tbody id="satellite-body">
@@ -169,7 +172,6 @@
               </select>
             </label>
             <div class="scw-actions">
-              <button id="scaleway-load" type="button" class="scw-button scw-button-secondary">Aktualisieren</button>
               <button id="scaleway-create" type="submit" class="scw-button">Server erstellen</button>
             </div>
           </form>
@@ -180,15 +182,16 @@
               <thead>
                 <tr>
                   <th>Name</th>
+                  <th>Node</th>
                   <th>Zone</th>
                   <th>State</th>
                   <th>IP</th>
                   <th>Typ</th>
-                  <th>Aktion</th>
+                  <th>Remove</th>
                 </tr>
               </thead>
               <tbody id="scaleway-body">
-                <tr><td colspan="6" class="empty-state">Noch keine verwalteten Scaleway-Server geladen.</td></tr>
+                <tr><td colspan="7" class="empty-state">Noch keine verwalteten Scaleway-Server geladen.</td></tr>
               </tbody>
             </table>
           </div>

@@ -11,7 +11,7 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}" />
   <link rel="icon" href="{{ favicon_url }}" type="{{ favicon_type }}" />
 </head>
-<body{% if not audio_only %} data-hls-url="{{ hls_url }}"{% endif %}{% if audio_hls_url %} data-audio-hls-url="{{ audio_hls_url }}"{% endif %} data-audio-only="{{ '1' if audio_only else '0' }}" data-status-url="{{ url_for('status') }}" data-audio-status-url="{{ url_for('audio_status') }}" data-client-log-url="{{ url_for('client_log') }}" data-debug="{{ '1' if debug_enabled else '0' }}" data-schedule-base-url="{{ schedule_base_url }}" data-scaleway-enabled="{{ '1' if scaleway_enabled else '0' }}" data-scaleway-default-zone="{{ scaleway_default_zone }}" data-scaleway-default-type="{{ scaleway_default_type }}" data-scaleway-server-limit="{{ scaleway_server_limit }}">
+<body{% if not audio_only %} data-hls-url="{{ hls_url }}"{% endif %}{% if audio_hls_url %} data-audio-hls-url="{{ audio_hls_url }}"{% endif %} data-audio-only="{{ '1' if audio_only else '0' }}" data-local-node-name="{{ local_satellite_name }}" data-status-url="{{ url_for('status') }}" data-audio-status-url="{{ url_for('audio_status') }}" data-client-log-url="{{ url_for('client_log') }}" data-debug="{{ '1' if debug_enabled else '0' }}" data-schedule-base-url="{{ schedule_base_url }}" data-scaleway-enabled="{{ '1' if scaleway_enabled else '0' }}" data-scaleway-default-zone="{{ scaleway_default_zone }}" data-scaleway-default-type="{{ scaleway_default_type }}" data-scaleway-server-limit="{{ scaleway_server_limit }}">
 
   <!-- Skip to main content -->
   <a href="#main" class="sr-only">Zum Hauptinhalt springen</a>
@@ -94,7 +94,10 @@
         <!-- Player Controls -->
         <div class="player-controls">
           <div class="control-left">
-            <span id="clients" class="viewer-count">👥 0 Online</span>
+            <span class="viewer-count">
+              <span id="clients">👥 0 Online</span>
+            </span>
+            <span id="node-name" class="node-name-tag">{{ local_satellite_name }}</span>
           </div>
           <div class="control-right">
             <label id="autostart-label" class="control-toggle">

@@ -505,6 +505,19 @@ body[data-admin="1"] .main-content {
   font-size: 0.9rem;
 }
 
+.node-name-tag {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 2px;
+  font-size: 0.72em;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+  color: var(--text-secondary);
+  opacity: 0.6;
+  white-space: nowrap;
+}
+
 /* ============================================================================
    CONTROL TOGGLES
    ============================================================================ */
@@ -868,6 +881,13 @@ body[data-admin="1"] .main-content {
 
 .admin-kpi strong {
   font-size: 1.05rem;
+}
+
+.admin-kpi-value {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.45rem;
+  flex-wrap: wrap;
 }
 
 /* ============================================================================

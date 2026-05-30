@@ -1,6 +1,8 @@
 .env
 data/
 flask/disconnect-debug.log*
+flask/satellite-certs/
+satellite-certs/
 __pycache__
 *.db
 *.db-shm
