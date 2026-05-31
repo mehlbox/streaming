@@ -161,6 +161,7 @@ state_snapshot = {
     "audio_live": False,
     "count": 0,
     "local_count": 0,
+    "cluster_count": 0,
 }
 state_task_started = False
 maintenance_task_started = False
@@ -1246,6 +1247,33 @@ def local_stream_viewer_count(now: float | None = None) -> tuple[int, bool]:
     return 0, False
 
 
+def local_satellite_viewer_count(now: float | None = None) -> tuple[int, bool]:
+    init_db()
+    current = time.time() if now is None else now
+    cutoff = current - SATELLITE_UNHEALTHY_SECONDS
+    with connect_db() as conn:
+        row = conn.execute(
+            """
+            SELECT viewer_count
+            FROM satellites
+            WHERE name = ? AND last_heartbeat >= ?
+            ORDER BY last_heartbeat DESC, id DESC
+            LIMIT 1
+            """,
+            (LOCAL_SATELLITE_NAME, cutoff),
+        ).fetchone()
+    if row is None:
+        return 0, False
+    return max(0, int(row["viewer_count"])), True
+
+
+def effective_local_viewer_count(now: float | None = None) -> tuple[int, bool]:
+    local_satellite_count, local_satellite_observed = local_satellite_viewer_count(now)
+    if local_satellite_observed:
+        return local_satellite_count, True
+    return local_stream_viewer_count(now)
+
+
 def healthy_satellite_viewer_count(
     now: float | None = None,
     exclude_name: str | None = None,
@@ -1280,7 +1308,7 @@ def total_viewer_count(
     local_observed: bool | None = None,
 ) -> int:
     if local_observed is None:
-        computed_local_count, computed_local_observed = local_stream_viewer_count()
+        computed_local_count, computed_local_observed = effective_local_viewer_count()
         local_count = computed_local_count
         local_observed = computed_local_observed
     satellite_count = healthy_satellite_viewer_count(
@@ -1296,15 +1324,17 @@ def build_state_snapshot(
     local_observed: bool | None = None,
 ) -> dict[str, int | bool]:
     if local_observed is None:
-        computed_local_count, computed_local_observed = local_stream_viewer_count()
+        computed_local_count, computed_local_observed = effective_local_viewer_count()
         local_count = computed_local_count
         local_observed = computed_local_observed
     local = max(0, int(local_count or 0)) if local_observed else 0
+    cluster = total_viewer_count(local_count=local, local_observed=bool(local_observed))
     return {
         "live": is_live(),
         "audio_live": is_audio_live(),
-        "count": total_viewer_count(local_count=local, local_observed=bool(local_observed)),
+        "count": cluster,
         "local_count": local,
+        "cluster_count": cluster,
     }
 
 
