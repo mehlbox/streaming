@@ -101,6 +101,7 @@ const debugEnabled = document.body?.dataset?.debug === "1";
 const scalewayEnabled = document.body?.dataset?.scalewayEnabled === "1";
 const scalewayServerLimit = Number(document.body?.dataset?.scalewayServerLimit || "5") || 5;
 const pendingScalewayDeletes = new Set();
+let satelliteLastPayload = [];
 let scalewayLastPayload = null;
 let statsMinutes = Number.parseInt(statsMinutesEl?.value || `${defaultStatsMinutes}`, 10);
 let statsBucketMinutes = Number.parseInt(statsBucketEl?.value || "5", 10);
@@ -1330,6 +1331,7 @@ const initStats = () => {
 
 const renderSatelliteTable = (satellites) => {
   if (!satelliteBody || !debugEnabled) return;
+  satelliteLastPayload = Array.isArray(satellites) ? satellites : [];
   if (!satellites || satellites.length === 0) {
     if (satelliteSection) satelliteSection.classList.remove("hidden");
     satelliteBody.innerHTML = '<tr><td colspan="9" class="satellite-empty">Keine Server verbunden.</td></tr>';
@@ -1338,9 +1340,16 @@ const renderSatelliteTable = (satellites) => {
   if (satelliteSection) satelliteSection.classList.remove("hidden");
   satelliteBody.innerHTML = satellites.map((sat) => {
     const liveBandwidth = Number(sat.bandwidth_mbps || 0);
-    const averageBandwidth = Number(sat.speedtest_upload_mbps || 0);
-    const bandwidthLabel = averageBandwidth > 0
-      ? `${liveBandwidth.toFixed(1)} / ${averageBandwidth.toFixed(1)} Mbps`
+    const measuredBandwidth = Number(sat.speedtest_upload_mbps || 0);
+    const scalewayBandwidth = Number(
+      scalewayLastPayload?.servers?.find((server) => String(server.node_name || server.name || "") === String(sat.name || ""))?.bandwidth_mbps || 0
+    );
+    const maxBandwidth = measuredBandwidth > 0 ? measuredBandwidth : scalewayBandwidth;
+    const maxBandwidthLabel = measuredBandwidth > 0
+      ? `${maxBandwidth.toFixed(1)} Mbps`
+      : `(${maxBandwidth.toFixed(1)} Mbps)`;
+    const bandwidthLabel = maxBandwidth > 0
+      ? `${liveBandwidth.toFixed(1)} / ${maxBandwidthLabel}`
       : `${liveBandwidth.toFixed(1)} Mbps`;
     const healthClass = sat.healthy
       ? "sat-healthy"
@@ -1468,6 +1477,9 @@ const fetchScalewayServers = async ({ quiet = false } = {}) => {
   try {
     const payload = await scalewayRequest("/api/scaleway/servers");
     renderScalewayTable(payload);
+    if (satelliteLastPayload.length) {
+      renderSatelliteTable(satelliteLastPayload);
+    }
     if (!quiet) {
       setScalewayStatus("Scaleway-Server geladen.");
     }

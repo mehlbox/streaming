@@ -5,6 +5,7 @@ from unittest.mock import patch
 os.environ.setdefault("SECRET_KEY", "test-secret-key-that-is-long-enough-for-flask")
 
 import app as streaming_app
+import scaleway as scaleway_module
 
 
 class SatelliteAssignmentTests(unittest.TestCase):
@@ -35,6 +36,12 @@ class SatelliteAssignmentTests(unittest.TestCase):
             url = streaming_app.satellite_manifest_url("https://node1.example.com/hls")
 
         self.assertEqual(url, "https://node1.example.com/hls/event.m3u8")
+
+    def test_scaleway_server_type_bandwidth_uses_catalog(self):
+        self.assertEqual(scaleway_module.server_type_bandwidth_mbps("DEV1-S"), 200.0)
+
+    def test_scaleway_server_type_bandwidth_returns_zero_for_unknown_type(self):
+        self.assertEqual(scaleway_module.server_type_bandwidth_mbps("UNKNOWN"), 0.0)
 
 
 if __name__ == "__main__":

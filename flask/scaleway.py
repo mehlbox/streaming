@@ -55,6 +55,27 @@ SERVER_TYPE_CATALOG = (
     },
 )
 
+
+def server_type_entry(commercial_type: str) -> dict[str, object] | None:
+    normalized_type = str(commercial_type or "").strip()
+    if not normalized_type:
+        return None
+    for entry in SERVER_TYPE_CATALOG:
+        if str(entry.get("name") or "") == normalized_type:
+            return entry
+    return None
+
+
+def server_type_bandwidth_mbps(commercial_type: str) -> float:
+    entry = server_type_entry(commercial_type)
+    if entry is None:
+        return 0.0
+    raw_bandwidth = str(entry.get("bandwidth") or "")
+    match = re.search(r"(\d+(?:\.\d+)?)", raw_bandwidth)
+    if match is None:
+        return 0.0
+    return float(match.group(1))
+
 ZONE_OPTIONS = (
     {"id": "fr-par-1", "label": "fr-par-1"},
     {"id": "nl-ams-1", "label": "nl-ams-1"},
@@ -800,6 +821,7 @@ class ScalewayManager:
         summary["state"] = self._shorten(server.get("state") or "unknown", 40) or "unknown"
         summary["public_ip"] = self.public_ip(server)
         summary["commercial_type"] = self._shorten(server.get("commercial_type") or "", 40) or ""
+        summary["bandwidth_mbps"] = server_type_bandwidth_mbps(summary["commercial_type"])
         summary["allowed_actions"] = (
             server.get("allowed_actions")
             if isinstance(server.get("allowed_actions"), list)
@@ -813,6 +835,7 @@ class ScalewayManager:
         zone: str,
         managed: bool = False,
     ) -> dict[str, object]:
+        commercial_type = self._shorten(server.get("commercial_type") or "", 40) or ""
         return {
             "id": str(server.get("id") or ""),
             "zone": zone,
@@ -823,7 +846,8 @@ class ScalewayManager:
             "public_ip": self.public_ip(server),
             "error": "",
             "managed": managed,
-            "commercial_type": self._shorten(server.get("commercial_type") or "", 40) or "",
+            "commercial_type": commercial_type,
+            "bandwidth_mbps": server_type_bandwidth_mbps(commercial_type),
             "allowed_actions": (
                 server.get("allowed_actions")
                 if isinstance(server.get("allowed_actions"), list)
