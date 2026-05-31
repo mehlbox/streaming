@@ -832,6 +832,7 @@ def http_probe_once(
     url: str,
     headers: dict[str, str] | None = None,
     connect_ip: str = "",
+    method: str = "GET",
 ) -> dict[str, object]:
     parsed = urlparse(url)
     request_headers = {"User-Agent": "streaming-status/1.0"}
@@ -884,7 +885,7 @@ def http_probe_once(
                 "final_url": url,
                 "error": "Unsupported scheme",
             }
-        connection.request("GET", path, headers=request_headers)
+        connection.request(method.upper(), path, headers=request_headers)
         response = connection.getresponse()
         body = response.read(256).decode("utf-8", errors="ignore")
         return {
@@ -942,16 +943,17 @@ def http_probe(
     url: str,
     headers: dict[str, str] | None = None,
     observed_ip: str = "",
+    method: str = "GET",
 ) -> dict[str, object]:
     last_result: dict[str, object] | None = None
     for candidate in probe_candidate_ips(url, observed_ip):
-        result = http_probe_once(url, headers, candidate)
+        result = http_probe_once(url, headers, candidate, method)
         last_result = result
         if int(result.get("status", 0) or 0) > 0:
             return result
     if last_result is not None:
         return last_result
-    return http_probe_once(url, headers)
+    return http_probe_once(url, headers, method=method)
 
 
 def public_probe_status_for_url(value: str, observed_ip: str = "", now: float | None = None) -> dict[str, object]:
@@ -968,6 +970,7 @@ def public_probe_status_for_url(value: str, observed_ip: str = "", now: float | 
             "hls_ok": False,
             "hls_label": "No URL",
             "hls_status": 0,
+            "hls_preflight_status": 0,
             "hls_url": "",
             "hls_allow_origin": "",
             "hls_allow_credentials": "",
@@ -983,6 +986,9 @@ def public_probe_status_for_url(value: str, observed_ip: str = "", now: float | 
     origin_headers = {"Origin": PUBLIC_ORIGIN_URL} if PUBLIC_ORIGIN_URL else {}
     viewer_headers = dict(origin_headers)
     viewer_headers["Cookie"] = f"{HLS_VIEWER_COOKIE}=status-probe"
+    preflight_headers = dict(origin_headers)
+    preflight_headers["Access-Control-Request-Method"] = "GET"
+    preflight_headers["Access-Control-Request-Headers"] = "Range"
 
     health_probe = (
         http_probe(health_url, origin_headers, observed_ip)
@@ -993,6 +999,11 @@ def public_probe_status_for_url(value: str, observed_ip: str = "", now: float | 
         http_probe(hls_url, viewer_headers, observed_ip)
         if hls_url else
         {"status": 0, "body": "", "error": "Missing URL"}
+    )
+    preflight_probe = (
+        http_probe(hls_url, preflight_headers, observed_ip, method="OPTIONS")
+        if hls_url and PUBLIC_ORIGIN_URL else
+        {"status": 0, "headers": {}}
     )
 
     health_body = str(health_probe.get("body", "") or "").strip().lower()
@@ -1008,12 +1019,35 @@ def public_probe_status_for_url(value: str, observed_ip: str = "", now: float | 
     content_type = hls_headers.get("content-type", "").lower()
     allow_origin = hls_headers.get("access-control-allow-origin", "")
     allow_credentials = hls_headers.get("access-control-allow-credentials", "")
+    preflight_status = int(preflight_probe.get("status", 0) or 0)
+    preflight_response_headers = {
+        str(key).lower(): str(value)
+        for key, value in dict(preflight_probe.get("headers", {})).items()
+    }
+    preflight_allow_origin = preflight_response_headers.get("access-control-allow-origin", "")
+    preflight_allow_credentials = preflight_response_headers.get("access-control-allow-credentials", "")
+    preflight_allow_methods = {
+        value.strip().upper()
+        for value in preflight_response_headers.get("access-control-allow-methods", "").split(",")
+    }
+    preflight_allow_headers = {
+        value.strip().lower()
+        for value in preflight_response_headers.get("access-control-allow-headers", "").split(",")
+    }
     manifest_ok = hls_status == 200 and (
         "#EXTM3U" in hls_body or "application/vnd.apple.mpegurl" in content_type
     )
     cors_ok = True
     if PUBLIC_ORIGIN_URL:
-        cors_ok = allow_origin == PUBLIC_ORIGIN_URL and allow_credentials.lower() == "true"
+        cors_ok = (
+            allow_origin == PUBLIC_ORIGIN_URL
+            and allow_credentials.lower() == "true"
+            and preflight_status in {200, 204}
+            and preflight_allow_origin == PUBLIC_ORIGIN_URL
+            and preflight_allow_credentials.lower() == "true"
+            and "GET" in preflight_allow_methods
+            and "range" in preflight_allow_headers
+        )
     hls_ok = manifest_ok and cors_ok
     if hls_ok:
         hls_label = "200"
@@ -1033,6 +1067,7 @@ def public_probe_status_for_url(value: str, observed_ip: str = "", now: float | 
         "hls_ok": hls_ok,
         "hls_label": hls_label,
         "hls_status": hls_status,
+        "hls_preflight_status": preflight_status,
         "hls_url": hls_url,
         "hls_allow_origin": allow_origin,
         "hls_allow_credentials": allow_credentials,
@@ -1052,6 +1087,7 @@ def local_probe_status_for_url(value: str) -> dict[str, object]:
         "hls_ok": True,
         "hls_label": "Same-origin",
         "hls_status": 200,
+        "hls_preflight_status": 200,
         "hls_url": satellite_manifest_url(value),
         "hls_allow_origin": "",
         "hls_allow_credentials": "",

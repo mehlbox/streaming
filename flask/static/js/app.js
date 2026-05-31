@@ -1370,6 +1370,7 @@ const renderSatelliteTable = (satellites) => {
     const hlsTitle = escapeHtml([
       sat.hls_url ? `URL: ${sat.hls_url}` : "",
       sat.hls_status ? `Status: ${sat.hls_status}` : "",
+      sat.hls_preflight_status ? `Preflight: ${sat.hls_preflight_status}` : "",
       sat.hls_allow_origin ? `Allow-Origin: ${sat.hls_allow_origin}` : "",
       sat.hls_allow_credentials ? `Allow-Credentials: ${sat.hls_allow_credentials}` : ""
     ].filter(Boolean).join(" | "));

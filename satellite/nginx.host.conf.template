@@ -13,6 +13,9 @@ server {
   error_page 418 = @missing_viewer_cookie;
 
   location /hls/ {
+    if ($request_method = OPTIONS) {
+      return 204;
+    }
     if ($cookie_stream_viewer = "") {
       return 418;
     }
@@ -39,6 +42,7 @@ server {
     proxy_hide_header Access-Control-Allow-Credentials;
     proxy_hide_header Access-Control-Allow-Methods;
     proxy_hide_header Access-Control-Allow-Headers;
+    proxy_hide_header Access-Control-Max-Age;
     proxy_hide_header Vary;
     proxy_set_header Host __MAIN_SERVER_UPSTREAM_HOST__;
     proxy_set_header X-Real-IP $remote_addr;
@@ -52,6 +56,7 @@ server {
     add_header Access-Control-Allow-Credentials "true" always;
     add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS" always;
     add_header Access-Control-Allow-Headers "Range" always;
+    add_header Access-Control-Max-Age "600" always;
     add_header Vary "Origin" always;
     add_header X-Cache-Status $upstream_cache_status;
   }
