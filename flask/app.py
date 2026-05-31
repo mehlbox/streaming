@@ -3,13 +3,14 @@ import base64
 import http.client
 import json
 import os
+import random
 import secrets
 import re
 import socket
 import sqlite3
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from pathlib import Path
 from threading import Lock, Thread
 from urllib.parse import parse_qs, urlparse
@@ -140,6 +141,10 @@ SATELLITE_PROBE_TIMEOUT_SECONDS = max(
 SATELLITE_PROBE_CACHE_SECONDS = max(
     5.0,
     float(os.getenv("SATELLITE_PROBE_CACHE_SECONDS", "15")),
+)
+SATELLITE_ASSIGN_TIMEOUT_SECONDS = max(
+    0.5,
+    float(os.getenv("SATELLITE_ASSIGN_TIMEOUT_SECONDS", "2")),
 )
 APP_DEBUG = parse_bool(os.getenv("APP_DEBUG", "0"))
 PUBLIC_ORIGIN_URL = (
@@ -824,8 +829,8 @@ def satellite_manifest_url(value: str) -> str:
         return ""
     base_path = parsed.path.rstrip("/")
     if base_path.endswith("/hls"):
-        return f"{parsed.scheme}://{parsed.netloc}{base_path}/live.m3u8"
-    return f"{parsed.scheme}://{parsed.netloc}{base_path}/hls/live.m3u8"
+        return f"{parsed.scheme}://{parsed.netloc}{base_path}/{STREAM_NAME}.m3u8"
+    return f"{parsed.scheme}://{parsed.netloc}{base_path}/hls/{STREAM_NAME}.m3u8"
 
 
 def http_probe_once(
@@ -1569,6 +1574,21 @@ def satellite_score(row: sqlite3.Row) -> float:
     return headroom * (1 - min(cpu, 100.0) / 100.0)
 
 
+def select_weighted_satellite(
+    scored_rows: list[tuple[float, dict[str, object]]],
+) -> dict[str, object] | None:
+    candidates = [(score, row) for score, row in scored_rows if score > 0]
+    if not candidates:
+        return None
+    selection = random.uniform(0, sum(score for score, _row in candidates))
+    cumulative = 0.0
+    for score, row in candidates:
+        cumulative += score
+        if selection <= cumulative:
+            return row
+    return candidates[-1][1]
+
+
 def is_local_satellite(row: sqlite3.Row) -> bool:
     return str(row["name"] or "").strip() == LOCAL_SATELLITE_NAME
 
@@ -1993,14 +2013,21 @@ def satellite_assign():
     if remote_rows:
         max_workers = min(8, len(remote_rows)) or 1
         executor = ThreadPoolExecutor(max_workers=max_workers)
+        healthy_remote_rows = []
         try:
             futures = [executor.submit(remote_candidate, row) for row in remote_rows]
-            for future in as_completed(futures):
-                remote_score, remote_row = future.result()
-                if remote_row is not None and remote_score > 0:
-                    return jsonify({"satellite_url": remote_row["url"]})
+            try:
+                for future in as_completed(futures, timeout=SATELLITE_ASSIGN_TIMEOUT_SECONDS):
+                    remote_score, remote_row = future.result()
+                    if remote_row is not None and remote_score > 0:
+                        healthy_remote_rows.append((remote_score, remote_row))
+            except FuturesTimeoutError:
+                pass
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
+        selected_remote_row = select_weighted_satellite(healthy_remote_rows)
+        if selected_remote_row is not None:
+            return jsonify({"satellite_url": selected_remote_row["url"]})
 
     if best_local_row is not None and best_local_score > 0:
         return jsonify({"satellite_url": best_local_row["url"]})

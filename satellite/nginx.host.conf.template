@@ -4,7 +4,7 @@ proxy_cache_path __NGINX_CACHE_DIR__
   levels=1:2
   keys_zone=hls_cache:10m
   max_size=1g
-  inactive=10s
+  inactive=2m
   use_temp_path=off;
 
 server {
@@ -29,6 +29,9 @@ server {
     proxy_pass __MAIN_SERVER_INTERNAL_URL__/hls/;
     access_log __HLS_ACCESS_LOG__ hls_viewers;
     proxy_cache hls_cache;
+    # The origin prevents browser caching. Satellites still need their shared
+    # private cache so one upstream fetch can serve many viewers.
+    proxy_ignore_headers Cache-Control Expires;
     proxy_cache_valid 200 2s;
     proxy_cache_valid 404 1s;
     proxy_cache_use_stale error timeout updating;
@@ -44,6 +47,9 @@ server {
     proxy_hide_header Access-Control-Allow-Headers;
     proxy_hide_header Access-Control-Max-Age;
     proxy_hide_header Vary;
+    proxy_hide_header Cache-Control;
+    proxy_hide_header Pragma;
+    proxy_hide_header Expires;
     proxy_set_header Host __MAIN_SERVER_UPSTREAM_HOST__;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
