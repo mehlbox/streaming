@@ -33,6 +33,7 @@ Click **Start Streaming** in OBS. The page will show **Online** once HLS segment
 
 ## Environment variables
 
+- `RTMP_PORT` (default: `1935`; each main profile on one machine needs a distinct port)
 - `STREAMING_HOST` (default: `streaming.example.com`; used in Traefik labels)
 - `SITE_TITLE` (default: `docker streaming`)
 - `SITE_SUBTITLE` (optional: subtitle shown below the site title)
@@ -41,11 +42,56 @@ Click **Start Streaming** in OBS. The page will show **Online** once HLS segment
 - `HLS_DIR` (default: `/var/www/hls`)
 - `HLS_STALE_SECONDS` (default: `15`)
 - `SOCKETIO_POLL_SECONDS` (default: `2`)
-- `STATS_DB` (default: `/docker/streaming/flask/stats.db`)
+- `STATE_DB` (default: `/app/state.db`)
 - `STATS_SAMPLE_SECONDS` (default: `60`)
 - `AUDIO_STREAM_NAME` (optional: name of an audio-only stream; enables the "Nur Audio" toggle)
 - `AUDIO_HLS_URL` (optional: full URL to an audio-only HLS playlist; overrides `AUDIO_STREAM_NAME`)
 - `AUDIO_INPUT_URL` (optional: input URL for audio-only ffmpeg; defaults to the shared live HLS playlist file)
+
+## Multiple Compose instances
+
+Use a separate folder for each site. Compose derives the project name from the
+folder name, so containers, networks, volumes, local state, certificate caches,
+and Traefik resources remain separate automatically. Use distinct folder base
+names, such as `streaming` and `stream2`.
+
+For example, keep the existing site in `/docker/streaming` and clone or copy the
+repository into `/docker/stream2`. In `/docker/stream2/.env`, change at least:
+
+```dotenv
+STREAMING_HOST=stream2.bethaus-speyer.de
+RTMP_PORT=1936
+SECRET_KEY=use-a-distinct-random-secret
+STREAM_KEY=use-a-distinct-obs-stream-key
+```
+
+If the second site uses satellites, also set:
+
+```dotenv
+SATELLITE_BOOTSTRAP_ORIGIN_URL=https://stream2.bethaus-speyer.de
+SATELLITE_BOOTSTRAP_NAME_PREFIX=stream2-node
+SATELLITE_BOOTSTRAP_PUBLIC_URL_TEMPLATE=https://{name}.bethaus-speyer.de/hls
+SATELLITE_API_KEY=use-a-distinct-satellite-secret
+SCW_SERVER_NAME_PREFIX=stream2-instance
+```
+
+Start each site from its own folder:
+
+```bash
+cd /docker/streaming
+docker compose up -d
+
+cd /docker/stream2
+docker compose up -d
+```
+
+Publish OBS for the first site to port `1935` and the second site to port
+`1936`, for example `rtmp://stream2.bethaus-speyer.de:1936/live?key=...`.
+
+The external `traefik` network remains shared intentionally. Satellite-profile
+instances must also use distinct `SATELLITE_PORT` values when they bind ports
+on the same machine. Set a distinct `CADDY_CERTIFICATES_DIR` for each edge
+instance when multiple edge agents run on the same machine.
 
 ## Audio-only stream (server-generated)
 
