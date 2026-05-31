@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import unittest
 from unittest.mock import patch
 
@@ -78,6 +79,31 @@ class SatelliteAssignmentTests(unittest.TestCase):
         self.assertEqual(snapshot["count"], 7)
         self.assertEqual(snapshot["local_count"], 0)
         self.assertNotIn("cluster_count", snapshot)
+
+    def test_delete_replaced_satellite_rows_removes_matching_name_or_url(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.execute("CREATE TABLE satellites(id TEXT, name TEXT, url TEXT)")
+        conn.executemany(
+            "INSERT INTO satellites(id, name, url) VALUES(?, ?, ?)",
+            [
+                ("same-name", "node1", "https://old.example.com/hls"),
+                ("same-url", "node2", "https://node1.example.com/hls"),
+                ("other", "node3", "https://node3.example.com/hls"),
+            ],
+        )
+
+        deleted = streaming_app.delete_replaced_satellite_rows(
+            conn,
+            "node1",
+            "https://node1.example.com/hls",
+        )
+
+        self.assertEqual(deleted, 2)
+        self.assertEqual(
+            conn.execute("SELECT id FROM satellites ORDER BY id").fetchall(),
+            [("other",)],
+        )
 
 
 if __name__ == "__main__":

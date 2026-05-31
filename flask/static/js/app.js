@@ -70,11 +70,12 @@ let mediaRecoveryAttempts = 0;
 let lastMediaRecoveryAt = 0;
 let satelliteUrl = null;
 let satelliteAssigned = false;
-const satelliteAssignPollIntervalMs = 5000;
+const satelliteAssignPollIntervalMs = 15000;
 const satelliteExcludeCooldownMs = 30000;
 const audioOnlyStorageKey = "audioOnly";
 const autostartAttemptsKey = "autostartAttempts";
 const autostartMaxAttempts = 10;
+const autostartRetryCooldownMs = 60000;
 const volumeStorageKey = "audioVolume";
 const tabIdStorageKey = "streamTabId";
 const tabBroadcastKey = "streamTabBroadcast";
@@ -106,6 +107,7 @@ let audioAvailable = false;
 let audioLive = null;
 let playbackActive = false;
 let autostartAttempts = 0;
+let autostartRetryTimer = null;
 let tabSuppressed = false;
 let tabLocked = false;
 let lastLiveStatus = false;
@@ -918,6 +920,26 @@ const setAutostartAttempts = (value, reason) => {
   logAutostartStatus(reason);
 };
 
+const resetAutostartRetryState = (reason) => {
+  if (autostartRetryTimer) {
+    clearTimeout(autostartRetryTimer);
+    autostartRetryTimer = null;
+  }
+  autostartEnabled = !tabLocked && !tabSuppressed;
+  setAutostartAttempts(0, reason);
+};
+
+const scheduleAutostartRetry = () => {
+  if (autostartRetryTimer || tabLocked || tabSuppressed) return;
+  autostartRetryTimer = setTimeout(() => {
+    autostartRetryTimer = null;
+    if (tabLocked || tabSuppressed) return;
+    autostartEnabled = true;
+    setAutostartAttempts(0, "retry");
+    handleStatus(lastLiveStatus, lastAudioLiveStatus);
+  }, autostartRetryCooldownMs);
+};
+
 const recordAutostartAttempt = () => {
   if (!autostartEnabled) return;
   const next = autostartAttempts + 1;
@@ -925,12 +947,14 @@ const recordAutostartAttempt = () => {
   if (next >= autostartMaxAttempts) {
     autostartEnabled = false;
     logAutostartStatus("disabled");
+    scheduleAutostartRetry();
   }
 };
 
 autostartAttempts = loadAutostartAttempts();
 if (autostartAttempts >= autostartMaxAttempts) {
   autostartEnabled = false;
+  scheduleAutostartRetry();
 }
 logAutostartStatus("init");
 
@@ -2119,6 +2143,10 @@ const setTabSuppressed = (suppressed, reason) => {
   if (tabSuppressed) {
     tabLocked = true;
     autostartEnabled = false;
+    if (autostartRetryTimer) {
+      clearTimeout(autostartRetryTimer);
+      autostartRetryTimer = null;
+    }
     replacePlayerWithLockMessage();
   }
   if (!tabSuppressed) {
@@ -2481,6 +2509,9 @@ const handleStatus = (live, audioLiveStatus) => {
     return;
   }
   setStatus(false);
+  if (autostartAttempts > 0 || autostartRetryTimer) {
+    resetAutostartRetryState("offline");
+  }
   if (started) {
     stopPlayer();
   }

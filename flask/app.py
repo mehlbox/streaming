@@ -1845,6 +1845,17 @@ def satellite_info(row: sqlite3.Row, now: float | None = None) -> dict[str, str 
     return info
 
 
+def delete_replaced_satellite_rows(conn: sqlite3.Connection, name: str, url: str) -> int:
+    cur = conn.execute(
+        """
+        DELETE FROM satellites
+        WHERE url = ? OR (? != '' AND name = ?)
+        """,
+        (url, name, name),
+    )
+    return cur.rowcount
+
+
 @app.post("/api/satellite/register")
 def satellite_register():
     init_db()
@@ -1859,6 +1870,7 @@ def satellite_register():
     upsert_node_record(name or "", url or "", observed_ip)
     with connect_db() as conn:
         with conn:
+            replaced = delete_replaced_satellite_rows(conn, name or "", url)
             conn.execute(
                 """
                 INSERT INTO satellites(
@@ -1877,6 +1889,13 @@ def satellite_register():
                     now,
                 ),
             )
+    if replaced:
+        app.logger.info(
+            "Satellite registration replaced %d stale row(s): name=%s url=%s",
+            replaced,
+            name or "-",
+            url,
+        )
     ensure_maintenance_tasks()
     app.logger.info(
         "Satellite registered: %s (%s) at %s observed_ip=%s",
