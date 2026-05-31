@@ -67,7 +67,7 @@ class SatelliteAssignmentTests(unittest.TestCase):
 
         self.assertEqual(snapshot["count"], 9)
         self.assertEqual(snapshot["local_count"], 4)
-        self.assertEqual(snapshot["cluster_count"], 9)
+        self.assertNotIn("cluster_count", snapshot)
 
     def test_build_state_snapshot_uses_cluster_total_without_local_observation(self):
         with patch.object(streaming_app, "is_live", return_value=True), \
@@ -77,7 +77,7 @@ class SatelliteAssignmentTests(unittest.TestCase):
 
         self.assertEqual(snapshot["count"], 7)
         self.assertEqual(snapshot["local_count"], 0)
-        self.assertEqual(snapshot["cluster_count"], 7)
+        self.assertNotIn("cluster_count", snapshot)
 
 
 if __name__ == "__main__":

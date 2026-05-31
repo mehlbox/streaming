@@ -161,7 +161,6 @@ state_snapshot = {
     "audio_live": False,
     "count": 0,
     "local_count": 0,
-    "cluster_count": 0,
 }
 state_task_started = False
 maintenance_task_started = False
@@ -1334,7 +1333,6 @@ def build_state_snapshot(
         "audio_live": is_audio_live(),
         "count": cluster,
         "local_count": local,
-        "cluster_count": cluster,
     }
 
 

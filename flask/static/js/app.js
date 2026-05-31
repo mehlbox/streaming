@@ -1300,7 +1300,7 @@ const renderSatelliteTable = (satellites) => {
     const liveBandwidth = Number(sat.bandwidth_mbps || 0);
     const measuredBandwidth = Number(sat.speedtest_upload_mbps || 0);
     const scalewayBandwidth = Number(
-      scalewayLastPayload?.servers?.find((server) => String(server.node_name || server.name || "") === String(sat.name || ""))?.bandwidth_mbps || 0
+      scalewayLastPayload?.servers?.find((server) => String(server.node_name || "") === String(sat.name || ""))?.bandwidth_mbps || 0
     );
     const maxBandwidth = measuredBandwidth > 0 ? measuredBandwidth : scalewayBandwidth;
     const maxBandwidthLabel = measuredBandwidth > 0
