@@ -13,9 +13,6 @@ const audioLabelEl = audioControlsEl?.querySelector(".audio-label");
 const audioTogglePath = audioControlsEl?.querySelector(".audio-toggle-icon path");
 const volumeSlider = document.getElementById("audio-volume");
 const debugPanel = document.getElementById("debug-panel");
-const autostartToggle = document.getElementById("autostart");
-const autostartLabel = document.getElementById("autostart-label");
-const autostartTextEl = autostartLabel?.querySelector(".autostart-text");
 const audioOnlyToggle = document.getElementById("audio-only");
 const clientsEl = document.getElementById("clients");
 const nodeNameEl = document.getElementById("node-name");
@@ -65,7 +62,7 @@ const defaultStatsMinutes = 60;
 let hls = null;
 let started = false;
 let isLive = false;
-let autostartEnabled = autostartToggle?.checked ?? true;
+let autostartEnabled = true;
 let audioOnlyEnabled = audioOnlyForced || (audioOnlyToggle?.checked ?? false);
 let mediaEl = video;
 let activeHlsUrl = hlsUrl;
@@ -918,7 +915,6 @@ const logAutostartStatus = (reason) => {
 const setAutostartAttempts = (value, reason) => {
   autostartAttempts = Math.max(0, value);
   sessionStorage.setItem(autostartAttemptsKey, autostartAttempts.toString());
-  updateAutostartUI();
   logAutostartStatus(reason);
 };
 
@@ -928,16 +924,13 @@ const recordAutostartAttempt = () => {
   setAutostartAttempts(next, "attempt");
   if (next >= autostartMaxAttempts) {
     autostartEnabled = false;
-    if (autostartToggle) autostartToggle.checked = false;
     logAutostartStatus("disabled");
   }
-  updateAutostartUI();
 };
 
 autostartAttempts = loadAutostartAttempts();
 if (autostartAttempts >= autostartMaxAttempts) {
   autostartEnabled = false;
-  if (autostartToggle) autostartToggle.checked = false;
 }
 logAutostartStatus("init");
 
@@ -1142,30 +1135,6 @@ const updatePlayerClass = () => {
   }
 };
 
-const updateAutostartUI = () => {
-  if (!autostartLabel) return;
-  if (audioOnlyEnabled) {
-    autostartLabel.classList.add("hidden");
-  } else {
-    autostartLabel.classList.remove("hidden");
-  }
-  if (autostartTextEl) {
-    if (!autostartEnabled && autostartAttempts >= autostartMaxAttempts) {
-      autostartTextEl.textContent = `Autostart aus (${autostartAttempts}/${autostartMaxAttempts})`;
-    } else {
-      autostartTextEl.textContent = "Autostart";
-    }
-  }
-  if (autostartToggle) {
-    if (tabLocked || tabSuppressed) {
-      autostartToggle.checked = false;
-      autostartToggle.disabled = true;
-    } else {
-      autostartToggle.disabled = false;
-    }
-  }
-};
-
 const setActiveMedia = () => {
   const wantsAudioOnly = audioOnlyForced || (audioOnlyToggle?.checked ?? audioOnlyEnabled);
   if (wantsAudioOnly && audioOnlyToggle && audioOnlyForced) {
@@ -1191,7 +1160,6 @@ const setActiveMedia = () => {
   resetPlaybackProgressTracking();
   updateNodeName();
   updatePlayerClass();
-  updateAutostartUI();
   applyVolume();
 };
 
@@ -1732,7 +1700,6 @@ setInterval(watchUnmuteState, unmuteWatchIntervalMs);
 if (audioOnlyToggle) {
   audioOnlyToggle.addEventListener("change", () => {
     setActiveMedia();
-    updateAutostartUI();
     if (started) {
       stopPlayer();
     }
@@ -1868,7 +1835,6 @@ const setStatus = (live) => {
   const statusKpiEl = document.getElementById("status-kpi");
   if (statusKpiEl) statusKpiEl.textContent = live ? "Online" : "Offline";
   updatePlayerClass();
-  updateAutostartUI();
   updateOfflineMessage();
   updateUnmute();
   updateAudioControls();
@@ -2153,13 +2119,11 @@ const setTabSuppressed = (suppressed, reason) => {
   if (tabSuppressed) {
     tabLocked = true;
     autostartEnabled = false;
-    if (autostartToggle) autostartToggle.checked = false;
     replacePlayerWithLockMessage();
   }
   if (!tabSuppressed) {
     handleStatus(lastLiveStatus, lastAudioLiveStatus);
   }
-  updateAutostartUI();
   updateUnmute();
   updateAudioControls();
   debugLog(`tab ${tabSuppressed ? "suppressed" : "active"}${reason ? ` (${reason})` : ""}`);
