@@ -77,7 +77,6 @@ const satelliteAssignPollIntervalMs = 5000;
 const satelliteExcludeCooldownMs = 30000;
 const audioOnlyStorageKey = "audioOnly";
 const autostartAttemptsKey = "autostartAttempts";
-const autostartStorageKey = "autostartEnabled";
 const autostartMaxAttempts = 10;
 const volumeStorageKey = "audioVolume";
 const tabIdStorageKey = "streamTabId";
@@ -939,15 +938,6 @@ autostartAttempts = loadAutostartAttempts();
 if (autostartAttempts >= autostartMaxAttempts) {
   autostartEnabled = false;
   if (autostartToggle) autostartToggle.checked = false;
-} else {
-  const storedAutostart = sessionStorage.getItem(autostartStorageKey);
-  if (storedAutostart === "0") {
-    autostartEnabled = false;
-    if (autostartToggle) autostartToggle.checked = false;
-  } else if (storedAutostart === "1") {
-    autostartEnabled = true;
-    if (autostartToggle) autostartToggle.checked = true;
-  }
 }
 logAutostartStatus("init");
 
@@ -1738,18 +1728,6 @@ document.addEventListener("visibilitychange", () => {
 });
 setInterval(watchUnmuteState, unmuteWatchIntervalMs);
 
-if (autostartToggle) {
-  autostartToggle.addEventListener("change", () => {
-    autostartEnabled = autostartToggle.checked;
-    sessionStorage.setItem(autostartStorageKey, autostartEnabled ? "1" : "0");
-    if (autostartEnabled) {
-      setAutostartAttempts(0, "user-enable");
-    } else {
-      logAutostartStatus("user-disable");
-    }
-    updateAutostartUI();
-  });
-}
 
 if (audioOnlyToggle) {
   audioOnlyToggle.addEventListener("change", () => {
