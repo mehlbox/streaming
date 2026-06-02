@@ -1109,7 +1109,7 @@ class ScalewayManager:
         if current_state not in {"stopped", "stopped in place"}:
             self.server_action(payload["zone"], server_id, "poweroff")
             self.wait_for_server_state(server_id, payload["zone"], {"stopped", "stopped in place"})
-        cloud_init = self.render_cloud_init().encode("utf-8")
+        cloud_init = self.render_cloud_init(payload["commercial_type"]).encode("utf-8")
         last_error: ScalewayAPIError | None = None
         for delay_seconds in (0, 1, 2):
             if delay_seconds:
@@ -1149,11 +1149,14 @@ class ScalewayManager:
         self.record_pricing_snapshot(summary)
         return summary
 
-    def render_cloud_init(self) -> str:
+    def render_cloud_init(self, commercial_type: str | None = None) -> str:
         bootstrap_token = self.config.satellite_bootstrap_token or self.config.satellite_api_key
         if not bootstrap_token:
             abort(500, "Satellite bootstrap token is not configured")
         host = self.bootstrap_host()
+        designed_bandwidth = (
+            server_type_bandwidth_mbps(commercial_type) if commercial_type else 0.0
+        )
         cloud_init_path = Path(self.config.satellite_bootstrap_dir) / "cloud-init.example.yaml"
         if not cloud_init_path.exists():
             fallback_path = Path(__file__).resolve().parent.parent / "satellite" / "cloud-init.example.yaml"
@@ -1168,6 +1171,12 @@ class ScalewayManager:
         text = re.sub(
             r'^(\s*BOOTSTRAP_TOKEN=)"[^"]*"$',
             lambda match: f'{match.group(1)}"{bootstrap_token}"',
+            text,
+            flags=re.MULTILINE,
+        )
+        text = re.sub(
+            r'^(\s*SATELLITE_DESIGNED_BANDWIDTH_MBPS=)"[^"]*"$',
+            lambda match: f'{match.group(1)}"{designed_bandwidth:g}"',
             text,
             flags=re.MULTILINE,
         )

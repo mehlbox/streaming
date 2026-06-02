@@ -91,6 +91,23 @@ class SatelliteAssignmentTests(unittest.TestCase):
     def test_scaleway_server_type_bandwidth_returns_zero_for_unknown_type(self):
         self.assertEqual(scaleway_module.server_type_bandwidth_mbps("UNKNOWN"), 0.0)
 
+    def test_render_cloud_init_injects_designed_bandwidth(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.make_scaleway_manager(os.path.join(temp_dir, "scaleway-costs.json"))
+
+            text = manager.render_cloud_init("DEV1-S")
+
+        self.assertIn('SATELLITE_DESIGNED_BANDWIDTH_MBPS="200"', text)
+        self.assertIn("export SATELLITE_DESIGNED_BANDWIDTH_MBPS", text)
+
+    def test_render_cloud_init_defaults_bandwidth_to_zero_when_type_unknown(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.make_scaleway_manager(os.path.join(temp_dir, "scaleway-costs.json"))
+
+            text = manager.render_cloud_init()
+
+        self.assertIn('SATELLITE_DESIGNED_BANDWIDTH_MBPS="0"', text)
+
     def test_scaleway_hourly_pricing_includes_ipv4_and_storage(self):
         pricing = scaleway_module.server_price_details(
             "DEV1-S",
