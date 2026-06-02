@@ -1414,16 +1414,16 @@ const scalewayRequest = async (url, options = {}) => {
 
 const renderScalewayFooter = (payload) => {
   if (!scalewayFooter) return;
-  const currentTotal = escapeHtml(payload?.pricing?.current_total_price_hour || "€0/hour");
-  const overallTotal = escapeHtml(payload?.pricing?.overall_total_price_hour || "€0/hour");
+  const currentTotal = escapeHtml(payload?.pricing?.current_total_rate_hour || payload?.pricing?.current_total_price_hour || "€0/hour");
+  const overallTotal = escapeHtml(payload?.pricing?.overall_billed_cost || payload?.pricing?.overall_total_price_hour || "€0");
   const overallInstances = Number(payload?.pricing?.persisted_instance_count || 0);
   scalewayFooter.innerHTML = `<tr class="scw-total-row">
-      <td colspan="6">Aktuell sichtbare Summe</td>
+      <td colspan="6">Aktuelle Kostenrate</td>
       <td class="scw-total-value">${currentTotal}</td>
       <td>-</td>
     </tr>
     <tr class="scw-total-row">
-      <td colspan="6">Persistierte Gesamtsumme (nicht zurückgesetzt, ${overallInstances} Instanzen)</td>
+      <td colspan="6">Historische Kosten (verwaltet, nicht zurückgesetzt, ${overallInstances} Instanzen)</td>
       <td class="scw-total-value">${overallTotal}</td>
       <td>-</td>
     </tr>`;
@@ -1436,9 +1436,9 @@ const renderScalewayTable = (payload) => {
   if (scalewayMetaEl) {
     const count = Number(payload?.count || servers.length || 0);
     const managedCount = Number(payload?.managed_count || 0);
-    const currentTotal = payload?.pricing?.current_total_price_hour || "€0/hour";
-    const overallTotal = payload?.pricing?.overall_total_price_hour || "€0/hour";
-    scalewayMetaEl.textContent = `${count} sichtbar | ${managedCount} / ${payload?.max_servers || scalewayServerLimit} verwaltet | aktuell ${currentTotal} | historisch ${overallTotal}`;
+    const currentTotal = payload?.pricing?.current_total_rate_hour || payload?.pricing?.current_total_price_hour || "€0/hour";
+    const overallTotal = payload?.pricing?.overall_billed_cost || payload?.pricing?.overall_total_price_hour || "€0";
+    scalewayMetaEl.textContent = `${count} sichtbar | ${managedCount} / ${payload?.max_servers || scalewayServerLimit} verwaltet | Rate ${currentTotal} | historisch ${overallTotal}`;
   }
   if (!servers.length) {
     scalewayBody.innerHTML = '<tr><td colspan="8" class="satellite-empty">Keine Scaleway-Server im Projekt sichtbar.</td></tr>';
@@ -1460,7 +1460,7 @@ const renderScalewayTable = (payload) => {
       <td title="${errorTitle}"><span class="sat-health ${stateClass}">${escapeHtml(state)}</span></td>
       <td>${escapeHtml(server.public_ip || "-")}</td>
       <td>${escapeHtml(server.commercial_type || "-")}</td>
-      <td>${escapeHtml(server.total_price_hour || "€0/hour")}</td>
+      <td>${escapeHtml(server.current_rate_hour || server.total_price_hour || "€0/hour")}</td>
       <td>${server.managed
         ? `<button type="button" class="scw-inline-button${deletePending ? " scw-inline-button-pending" : ""}" data-server-id="${escapeHtml(server.id)}"${deletePending ? " disabled" : ""}>${deletePending ? "Pending" : "Remove"}</button>`
         : '<span class="scw-external-label">Extern</span>'}</td>

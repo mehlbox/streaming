@@ -147,44 +147,48 @@ class SatelliteAssignmentTests(unittest.TestCase):
             totals_path = os.path.join(temp_dir, "scaleway-costs.json")
             manager = self.make_scaleway_manager(totals_path)
 
-            manager.record_pricing_snapshot(
-                {
-                    "id": "srv-1",
-                    "name": "instance1",
-                    "commercial_type": "DEV1-S",
-                    "zone": "fr-par-1",
-                    "created_at": 1.0,
-                    "storage_kind": "Local Storage",
-                    "storage_size_gb": 10.0,
-                    "storage_size_label": "10 GB",
-                    "base_price_hour_eur": 0.00898,
-                    "ipv4_price_hour_eur": 0.005,
-                    "storage_price_hour_eur": 0.00049,
-                    "total_price_hour_eur": 0.01447,
-                }
-            )
-            manager.record_pricing_snapshot(
-                {
-                    "id": "srv-2",
-                    "name": "instance2",
-                    "commercial_type": "DEV1-M",
-                    "zone": "fr-par-1",
-                    "created_at": 2.0,
-                    "storage_kind": "Local Storage",
-                    "storage_size_gb": 10.0,
-                    "storage_size_label": "10 GB",
-                    "base_price_hour_eur": 0.0202,
-                    "ipv4_price_hour_eur": 0.005,
-                    "storage_price_hour_eur": 0.00049,
-                    "total_price_hour_eur": 0.02569,
-                }
-            )
+            with patch.object(scaleway_module.time, "time", return_value=10_000.0):
+                manager.record_pricing_snapshot(
+                    {
+                        "id": "srv-1",
+                        "name": "instance1",
+                        "commercial_type": "DEV1-S",
+                        "zone": "fr-par-1",
+                        "created_at": 10_000.0,
+                        "state": "running",
+                        "storage_kind": "Local Storage",
+                        "storage_size_gb": 10.0,
+                        "storage_size_label": "10 GB",
+                        "base_price_hour_eur": 0.00898,
+                        "ipv4_price_hour_eur": 0.005,
+                        "storage_price_hour_eur": 0.00049,
+                        "total_price_hour_eur": 0.01447,
+                    }
+                )
+            with patch.object(scaleway_module.time, "time", return_value=13_600.0):
+                manager.record_pricing_snapshot(
+                    {
+                        "id": "srv-2",
+                        "name": "instance2",
+                        "commercial_type": "DEV1-M",
+                        "zone": "fr-par-1",
+                        "created_at": 13_600.0,
+                        "state": "running",
+                        "storage_kind": "Local Storage",
+                        "storage_size_gb": 10.0,
+                        "storage_size_label": "10 GB",
+                        "base_price_hour_eur": 0.0202,
+                        "ipv4_price_hour_eur": 0.005,
+                        "storage_price_hour_eur": 0.00049,
+                        "total_price_hour_eur": 0.02569,
+                    }
+                )
+            with patch.object(scaleway_module.time, "time", return_value=17_200.0):
+                totals = manager.pricing_summary([])
+                payload = manager._load_pricing_totals(reference_time=17_200.0)
 
-            totals = manager.pricing_summary([])
-            payload = manager._load_pricing_totals()
-
-        self.assertEqual(totals["current_total_price_hour"], "€0/hour")
-        self.assertEqual(totals["overall_total_price_hour"], "€0.04016/hour")
+        self.assertEqual(totals["current_total_rate_hour"], "€0/hour")
+        self.assertEqual(totals["overall_billed_cost"], "€0.05463")
         self.assertEqual(totals["persisted_instance_count"], 2)
         self.assertIn("srv-1", payload["instances"])
         self.assertIn("srv-2", payload["instances"])
@@ -194,15 +198,48 @@ class SatelliteAssignmentTests(unittest.TestCase):
             totals_path = os.path.join(temp_dir, "scaleway-costs.json")
             manager = self.make_scaleway_manager(totals_path)
 
-            totals = manager.pricing_summary(
-                [
+            with patch.object(scaleway_module.time, "time", return_value=13_600.0):
+                totals = manager.pricing_summary(
+                    [
+                        {
+                            "id": "srv-existing",
+                            "name": "instance-existing",
+                            "zone": "fr-par-1",
+                            "created_at": 10_000.0,
+                            "managed": True,
+                            "state": "running",
+                            "commercial_type": "DEV1-S",
+                            "storage_kind": "Local Storage",
+                            "storage_size_gb": 10.0,
+                            "storage_size_label": "10 GB",
+                            "base_price_hour_eur": 0.00898,
+                            "ipv4_price_hour_eur": 0.005,
+                            "storage_price_hour_eur": 0.00049,
+                            "total_price_hour_eur": 0.01447,
+                        }
+                    ]
+                )
+                payload = manager._load_pricing_totals(reference_time=13_600.0)
+
+        self.assertEqual(totals["current_total_rate_hour"], "€0.01447/hour")
+        self.assertEqual(totals["overall_billed_cost"], "€0.01447")
+        self.assertEqual(totals["persisted_instance_count"], 1)
+        self.assertIn("srv-existing", payload["instances"])
+
+    def test_scaleway_billed_cost_keeps_one_hour_minimum_for_short_compute_runs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            totals_path = os.path.join(temp_dir, "scaleway-costs.json")
+            manager = self.make_scaleway_manager(totals_path)
+
+            with patch.object(scaleway_module.time, "time", return_value=10_000.0):
+                manager.record_pricing_snapshot(
                     {
-                        "id": "srv-existing",
-                        "name": "instance-existing",
-                        "zone": "fr-par-1",
-                        "managed": True,
-                        "state": "running",
+                        "id": "srv-1",
+                        "name": "instance1",
                         "commercial_type": "DEV1-S",
+                        "zone": "fr-par-1",
+                        "created_at": 10_000.0,
+                        "state": "running",
                         "storage_kind": "Local Storage",
                         "storage_size_gb": 10.0,
                         "storage_size_label": "10 GB",
@@ -211,13 +248,81 @@ class SatelliteAssignmentTests(unittest.TestCase):
                         "storage_price_hour_eur": 0.00049,
                         "total_price_hour_eur": 0.01447,
                     }
-                ]
-            )
-            payload = manager._load_pricing_totals()
+                )
+            with patch.object(scaleway_module.time, "time", return_value=11_200.0):
+                totals = manager.pricing_summary(
+                    [
+                        {
+                            "id": "srv-1",
+                            "name": "instance1",
+                            "zone": "fr-par-1",
+                            "created_at": 10_000.0,
+                            "managed": True,
+                            "state": "stopped",
+                            "commercial_type": "DEV1-S",
+                            "storage_kind": "Local Storage",
+                            "storage_size_gb": 10.0,
+                            "storage_size_label": "10 GB",
+                            "base_price_hour_eur": 0.00898,
+                            "ipv4_price_hour_eur": 0.005,
+                            "storage_price_hour_eur": 0.00049,
+                            "total_price_hour_eur": 0.01447,
+                        }
+                    ]
+                )
 
-        self.assertEqual(totals["overall_total_price_hour"], "€0.01447/hour")
-        self.assertEqual(totals["persisted_instance_count"], 1)
-        self.assertIn("srv-existing", payload["instances"])
+        self.assertEqual(totals["current_total_rate_hour"], "€0.00549/hour")
+        self.assertEqual(totals["overall_billed_cost"], "€0.01081")
+
+    def test_scaleway_billed_cost_stops_after_server_deletion(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            totals_path = os.path.join(temp_dir, "scaleway-costs.json")
+            manager = self.make_scaleway_manager(totals_path)
+
+            with patch.object(scaleway_module.time, "time", return_value=10_000.0):
+                manager.record_pricing_snapshot(
+                    {
+                        "id": "srv-1",
+                        "name": "instance1",
+                        "commercial_type": "DEV1-S",
+                        "zone": "fr-par-1",
+                        "created_at": 10_000.0,
+                        "state": "running",
+                        "storage_kind": "Local Storage",
+                        "storage_size_gb": 10.0,
+                        "storage_size_label": "10 GB",
+                        "base_price_hour_eur": 0.00898,
+                        "ipv4_price_hour_eur": 0.005,
+                        "storage_price_hour_eur": 0.00049,
+                        "total_price_hour_eur": 0.01447,
+                    }
+                )
+            with patch.object(scaleway_module.time, "time", return_value=11_200.0):
+                manager.pricing_summary(
+                    [
+                        {
+                            "id": "srv-1",
+                            "name": "instance1",
+                            "zone": "fr-par-1",
+                            "created_at": 10_000.0,
+                            "managed": True,
+                            "state": "stopped",
+                            "commercial_type": "DEV1-S",
+                            "storage_kind": "Local Storage",
+                            "storage_size_gb": 10.0,
+                            "storage_size_label": "10 GB",
+                            "base_price_hour_eur": 0.00898,
+                            "ipv4_price_hour_eur": 0.005,
+                            "storage_price_hour_eur": 0.00049,
+                            "total_price_hour_eur": 0.01447,
+                        }
+                    ]
+                )
+            manager.finalize_pricing_snapshot("srv-1", deleted_at=11_200.0)
+            with patch.object(scaleway_module.time, "time", return_value=11_800.0):
+                totals = manager.pricing_summary([])
+
+        self.assertEqual(totals["overall_billed_cost"], "€0.01081")
 
     def test_effective_local_viewer_count_prefers_local_satellite_row(self):
         with patch.object(streaming_app, "local_satellite_viewer_count", return_value=(4, True)), \

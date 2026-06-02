@@ -22,6 +22,9 @@ HOURLY_PRICE_QUANTUM = Decimal("0.00001")
 STORAGE_PRICE_UNIT_GB = Decimal("10")
 LOCAL_STORAGE_PRICE_PER_UNIT_HOUR_EUR = Decimal("0.00049")
 IPV4_PRICE_HOUR_EUR = Decimal("0.005")
+SECONDS_PER_HOUR = Decimal("3600")
+LEGACY_BILLING_SEED_SECONDS = 3600.0
+MINIMUM_BILLABLE_COMPUTE_SECONDS = 3600.0
 
 SERVER_TYPE_CATALOG = (
     {
@@ -83,6 +86,131 @@ def format_hourly_price(value: object) -> str:
     if not text:
         text = "0"
     return f"€{text}/hour"
+
+
+def format_currency(value: object) -> str:
+    amount = hourly_price_decimal(value)
+    text = f"{amount:.5f}".rstrip("0").rstrip(".")
+    if not text:
+        text = "0"
+    return f"€{text}"
+
+
+def timestamp_value(value: object, fallback: float = 0.0) -> float:
+    try:
+        timestamp = float(value or 0)
+    except (TypeError, ValueError):
+        timestamp = fallback
+    if timestamp < 0:
+        return fallback if fallback > 0 else 0.0
+    return timestamp
+
+
+def clamp_timestamp(value: object, reference_time: float) -> float:
+    timestamp = timestamp_value(value)
+    if timestamp <= 0:
+        return 0.0
+    return min(timestamp, max(reference_time, 0.0))
+
+
+def normalize_state(value: object) -> str:
+    return str(value or "").strip().lower()
+
+
+def is_compute_billed_state(state: object) -> bool:
+    normalized = normalize_state(state)
+    return normalized not in {"", "stopped", "stopped in place", "deleted", "deleting"}
+
+
+def is_resource_billed_state(state: object) -> bool:
+    return normalize_state(state) not in {"", "deleted", "deleting"}
+
+
+def normalize_billing_windows(
+    raw_windows: object,
+    reference_time: float,
+) -> list[dict[str, float | None]]:
+    if not isinstance(raw_windows, list):
+        return []
+    windows: list[dict[str, float | None]] = []
+    for item in raw_windows:
+        if not isinstance(item, dict):
+            continue
+        started_at = clamp_timestamp(item.get("started_at"), reference_time)
+        if started_at <= 0:
+            continue
+        ended_raw = item.get("ended_at")
+        ended_at = None if ended_raw in {None, ""} else clamp_timestamp(ended_raw, reference_time)
+        if ended_at is not None and ended_at < started_at:
+            ended_at = started_at
+        windows.append(
+            {
+                "started_at": started_at,
+                "ended_at": ended_at,
+            }
+        )
+    windows.sort(key=lambda item: (item["started_at"], float(item["ended_at"] or reference_time)))
+    normalized_windows: list[dict[str, float | None]] = []
+    open_seen = False
+    for window in windows:
+        if window["ended_at"] is None:
+            if open_seen:
+                continue
+            open_seen = True
+        normalized_windows.append(window)
+    return normalized_windows
+
+
+def has_open_billing_window(windows: list[dict[str, float | None]]) -> bool:
+    return bool(windows) and windows[-1].get("ended_at") is None
+
+
+def open_billing_window(windows: list[dict[str, float | None]], started_at: float) -> bool:
+    if started_at <= 0 or has_open_billing_window(windows):
+        return False
+    windows.append({"started_at": float(started_at), "ended_at": None})
+    return True
+
+
+def close_billing_window(
+    windows: list[dict[str, float | None]],
+    ended_at: float,
+    reference_time: float,
+) -> bool:
+    if not has_open_billing_window(windows):
+        return False
+    normalized_end = clamp_timestamp(ended_at, reference_time) or max(reference_time, 0.0)
+    started_at = float(windows[-1].get("started_at") or 0)
+    if normalized_end < started_at:
+        normalized_end = started_at
+    windows[-1]["ended_at"] = normalized_end
+    return True
+
+
+def billed_cost_for_windows(
+    rate_per_hour_eur: object,
+    windows: list[dict[str, float | None]],
+    reference_time: float,
+    minimum_seconds: float = 0.0,
+) -> Decimal:
+    rate = hourly_price_decimal(rate_per_hour_eur)
+    minimum = Decimal(str(minimum_seconds or 0))
+    total = Decimal("0")
+    for window in windows:
+        started_at = clamp_timestamp(window.get("started_at"), reference_time)
+        if started_at <= 0:
+            continue
+        ended_raw = window.get("ended_at")
+        ended_at = reference_time if ended_raw in {None, ""} else clamp_timestamp(ended_raw, reference_time)
+        if ended_at < started_at:
+            ended_at = started_at
+        duration_seconds = Decimal(str(ended_at - started_at))
+        if duration_seconds <= 0:
+            continue
+        if minimum > 0 and duration_seconds < minimum:
+            duration_seconds = minimum
+        total += rate * (duration_seconds / SECONDS_PER_HOUR)
+    return hourly_price_decimal(total)
 
 
 def iter_server_volumes(volumes: object) -> list[dict[str, object]]:
@@ -171,6 +299,26 @@ def server_price_details(
         **storage_meta,
         "total_price_hour_eur": float(total_price),
         "total_price_hour": format_hourly_price(total_price),
+    }
+
+
+def current_rate_details(
+    state: object,
+    base_price_hour_eur: object,
+    ipv4_price_hour_eur: object,
+    storage_price_hour_eur: object,
+) -> dict[str, object]:
+    base_price = hourly_price_decimal(base_price_hour_eur)
+    ipv4_price = hourly_price_decimal(ipv4_price_hour_eur)
+    storage_price = hourly_price_decimal(storage_price_hour_eur)
+    resource_rate = hourly_price_decimal(ipv4_price + storage_price)
+    if not is_resource_billed_state(state):
+        resource_rate = hourly_price_decimal(0)
+    compute_rate = hourly_price_decimal(base_price if is_compute_billed_state(state) else 0)
+    current_rate = hourly_price_decimal(resource_rate + compute_rate)
+    return {
+        "current_rate_hour_eur": float(current_rate),
+        "current_rate_hour": format_hourly_price(current_rate),
     }
 
 
@@ -320,36 +468,69 @@ class ScalewayManager:
     def _pricing_totals_path(self) -> Path:
         return Path(self.config.cost_totals_path)
 
-    def _default_pricing_totals(self) -> dict[str, object]:
-        return {
-            "currency": "EUR",
-            "instance_count": 0,
-            "instances": {},
-            "overall_total_price_hour_eur": 0.0,
-            "overall_total_price_hour": format_hourly_price(0),
-            "updated_at": 0.0,
-        }
+    def _default_pricing_totals(self, reference_time: float | None = None) -> dict[str, object]:
+        return self._build_pricing_totals({}, updated_at=0.0, reference_time=reference_time)
 
-    def _normalize_pricing_instance(self, server_id: str, item: dict[str, object]) -> dict[str, object]:
+    def _normalize_pricing_instance(
+        self,
+        server_id: str,
+        item: dict[str, object],
+        reference_time: float | None = None,
+    ) -> dict[str, object]:
+        billing_now = timestamp_value(reference_time, time.time())
         base_price = hourly_price_decimal(item.get("base_price_hour_eur") or 0)
         ipv4_price = hourly_price_decimal(item.get("ipv4_price_hour_eur") or 0)
         storage_price = hourly_price_decimal(item.get("storage_price_hour_eur") or 0)
         total_price = hourly_price_decimal(
             item.get("total_price_hour_eur") or (base_price + ipv4_price + storage_price)
         )
-        try:
-            created_at = float(item.get("created_at") or 0)
-        except (TypeError, ValueError):
-            created_at = 0.0
+        created_at = timestamp_value(item.get("created_at") or 0)
+        updated_at = timestamp_value(item.get("updated_at") or 0)
+        deleted_at = timestamp_value(item.get("deleted_at") or 0)
         try:
             storage_size_gb = float(item.get("storage_size_gb") or 0)
         except (TypeError, ValueError):
             storage_size_gb = 0.0
+        resource_windows = normalize_billing_windows(item.get("resource_windows"), billing_now)
+        compute_windows = normalize_billing_windows(item.get("compute_windows"), billing_now)
+        current_state = normalize_state(item.get("current_state") or item.get("state") or item.get("last_state") or "")
+        seed_billed_cost = hourly_price_decimal(item.get("seed_billed_cost_eur") or 0)
+        billed_compute_cost = billed_cost_for_windows(
+            base_price,
+            compute_windows,
+            billing_now,
+            minimum_seconds=MINIMUM_BILLABLE_COMPUTE_SECONDS,
+        )
+        billed_resource_cost = billed_cost_for_windows(
+            ipv4_price + storage_price,
+            resource_windows,
+            billing_now,
+        )
+        billed_total_cost = hourly_price_decimal(seed_billed_cost + billed_compute_cost + billed_resource_cost)
+        current_rate = hourly_price_decimal(0)
+        if has_open_billing_window(resource_windows):
+            current_rate += hourly_price_decimal(ipv4_price + storage_price)
+        if has_open_billing_window(compute_windows):
+            current_rate += base_price
+        current_rate = hourly_price_decimal(current_rate)
+        has_billing_windows = bool(resource_windows or compute_windows)
+        legacy_estimate = bool(
+            item.get("legacy_estimate")
+            or (
+                not has_billing_windows
+                and seed_billed_cost <= 0
+                and deleted_at <= 0
+                and "total_price_hour_eur" in item
+            )
+        )
         return {
             "name": str(item.get("name") or server_id),
             "zone": str(item.get("zone") or ""),
             "commercial_type": str(item.get("commercial_type") or ""),
             "created_at": created_at,
+            "updated_at": updated_at,
+            "deleted_at": deleted_at,
+            "current_state": current_state,
             "storage_kind": str(item.get("storage_kind") or "-"),
             "storage_size_gb": storage_size_gb,
             "storage_size_label": str(item.get("storage_size_label") or "-"),
@@ -361,18 +542,58 @@ class ScalewayManager:
             "storage_price_hour": format_hourly_price(storage_price),
             "total_price_hour_eur": float(total_price),
             "total_price_hour": format_hourly_price(total_price),
+            "resource_windows": resource_windows,
+            "compute_windows": compute_windows,
+            "legacy_estimate": legacy_estimate,
+            "seed_billed_cost_eur": float(seed_billed_cost),
+            "seed_billed_cost": format_currency(seed_billed_cost),
+            "billed_compute_cost_eur": float(billed_compute_cost),
+            "billed_compute_cost": format_currency(billed_compute_cost),
+            "billed_resource_cost_eur": float(billed_resource_cost),
+            "billed_resource_cost": format_currency(billed_resource_cost),
+            "billed_cost_eur": float(billed_total_cost),
+            "billed_cost": format_currency(billed_total_cost),
+            "current_rate_hour_eur": float(current_rate),
+            "current_rate_hour": format_hourly_price(current_rate),
         }
 
-    def _load_pricing_totals(self) -> dict[str, object]:
+    def _build_pricing_totals(
+        self,
+        instances: dict[str, dict[str, object]],
+        updated_at: float = 0.0,
+        reference_time: float | None = None,
+    ) -> dict[str, object]:
+        billing_now = timestamp_value(reference_time, time.time())
+        normalized_instances = {
+            server_id: self._normalize_pricing_instance(server_id, item, reference_time=billing_now)
+            for server_id, item in instances.items()
+            if str(server_id or "").strip()
+        }
+        overall_billed_cost = hourly_price_decimal(0)
+        for item in normalized_instances.values():
+            overall_billed_cost += hourly_price_decimal(item.get("billed_cost_eur") or 0)
+        overall_billed_cost = hourly_price_decimal(overall_billed_cost)
+        return {
+            "currency": "EUR",
+            "instance_count": len(normalized_instances),
+            "instances": dict(sorted(normalized_instances.items())),
+            "overall_billed_cost_eur": float(overall_billed_cost),
+            "overall_billed_cost": format_currency(overall_billed_cost),
+            "overall_total_price_hour_eur": float(overall_billed_cost),
+            "overall_total_price_hour": format_currency(overall_billed_cost),
+            "updated_at": timestamp_value(updated_at),
+        }
+
+    def _load_pricing_totals(self, reference_time: float | None = None) -> dict[str, object]:
         path = self._pricing_totals_path()
         if not path.exists():
-            return self._default_pricing_totals()
+            return self._default_pricing_totals(reference_time=reference_time)
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return self._default_pricing_totals()
+            return self._default_pricing_totals(reference_time=reference_time)
         if not isinstance(payload, dict):
-            return self._default_pricing_totals()
+            return self._default_pricing_totals(reference_time=reference_time)
         raw_instances = payload.get("instances")
         instances: dict[str, dict[str, object]] = {}
         if isinstance(raw_instances, dict):
@@ -382,42 +603,17 @@ class ScalewayManager:
                 normalized_id = str(server_id or "").strip()
                 if not normalized_id:
                     continue
-                instances[normalized_id] = self._normalize_pricing_instance(normalized_id, item)
-        overall_total = hourly_price_decimal(0)
-        for item in instances.values():
-            overall_total += hourly_price_decimal(item.get("total_price_hour_eur") or 0)
-        overall_total = hourly_price_decimal(overall_total)
-        try:
-            updated_at = float(payload.get("updated_at") or 0)
-        except (TypeError, ValueError):
-            updated_at = 0.0
-        return {
-            "currency": "EUR",
-            "instance_count": len(instances),
-            "instances": instances,
-            "overall_total_price_hour_eur": float(overall_total),
-            "overall_total_price_hour": format_hourly_price(overall_total),
-            "updated_at": updated_at,
-        }
+                instances[normalized_id] = item
+        updated_at = timestamp_value(payload.get("updated_at") or 0)
+        return self._build_pricing_totals(instances, updated_at=updated_at, reference_time=reference_time)
 
-    def _write_pricing_totals(self, instances: dict[str, dict[str, object]]) -> dict[str, object]:
-        normalized_instances = {
-            server_id: self._normalize_pricing_instance(server_id, item)
-            for server_id, item in instances.items()
-            if str(server_id or "").strip()
-        }
-        overall_total = hourly_price_decimal(0)
-        for item in normalized_instances.values():
-            overall_total += hourly_price_decimal(item.get("total_price_hour_eur") or 0)
-        overall_total = hourly_price_decimal(overall_total)
-        snapshot = {
-            "currency": "EUR",
-            "instance_count": len(normalized_instances),
-            "instances": dict(sorted(normalized_instances.items())),
-            "overall_total_price_hour_eur": float(overall_total),
-            "overall_total_price_hour": format_hourly_price(overall_total),
-            "updated_at": time.time(),
-        }
+    def _write_pricing_totals(
+        self,
+        instances: dict[str, dict[str, object]],
+        reference_time: float | None = None,
+    ) -> dict[str, object]:
+        billing_now = timestamp_value(reference_time, time.time())
+        snapshot = self._build_pricing_totals(instances, updated_at=billing_now, reference_time=billing_now)
         path = self._pricing_totals_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -426,72 +622,236 @@ class ScalewayManager:
         )
         return snapshot
 
+    def _seed_legacy_pricing_instance(
+        self,
+        instance: dict[str, object],
+        reference_time: float,
+    ) -> bool:
+        anchor = clamp_timestamp(instance.get("created_at") or 0, reference_time) or reference_time
+        if anchor <= 0:
+            return False
+        changed = False
+        seed_end = min(reference_time, anchor + LEGACY_BILLING_SEED_SECONDS)
+        if seed_end < anchor:
+            seed_end = anchor
+        resource_rate = hourly_price_decimal(
+            (instance.get("ipv4_price_hour_eur") or 0) + (instance.get("storage_price_hour_eur") or 0)
+        )
+        if resource_rate > 0 and not instance.get("resource_windows"):
+            instance["resource_windows"] = [{"started_at": anchor, "ended_at": seed_end}]
+            changed = True
+        if hourly_price_decimal(instance.get("base_price_hour_eur") or 0) > 0 and not instance.get("compute_windows"):
+            instance["compute_windows"] = [{"started_at": anchor, "ended_at": seed_end}]
+            changed = True
+        if changed:
+            instance["legacy_estimate"] = True
+        return changed
+
+    def _sync_pricing_instance(
+        self,
+        instances: dict[str, dict[str, object]],
+        server: dict[str, object],
+        reference_time: float,
+    ) -> bool:
+        server_id = str(server.get("id") or "").strip()
+        if not server_id:
+            return False
+        previous_raw = instances.get(server_id) if isinstance(instances.get(server_id), dict) else {}
+        current = self._normalize_pricing_instance(server_id, previous_raw or {}, reference_time=reference_time)
+        before = json.dumps(current, ensure_ascii=True, sort_keys=True)
+        current["name"] = str(server.get("name") or current.get("name") or server_id)
+        current["zone"] = str(server.get("zone") or current.get("zone") or "")
+        current["commercial_type"] = str(server.get("commercial_type") or current.get("commercial_type") or "")
+        current["storage_kind"] = str(server.get("storage_kind") or current.get("storage_kind") or "-")
+        current["storage_size_label"] = str(server.get("storage_size_label") or current.get("storage_size_label") or "-")
+        try:
+            current["storage_size_gb"] = float(server.get("storage_size_gb") or current.get("storage_size_gb") or 0)
+        except (TypeError, ValueError):
+            current["storage_size_gb"] = float(current.get("storage_size_gb") or 0)
+        created_at = timestamp_value(server.get("created_at"), float(current.get("created_at") or 0))
+        if created_at > 0:
+            current["created_at"] = created_at
+        state = normalize_state(server.get("state") or current.get("current_state") or "")
+        if state:
+            current["current_state"] = state
+        pricing_known = state not in {"deleted", "error"} or bool(str(server.get("commercial_type") or "").strip())
+        if pricing_known:
+            base_price = hourly_price_decimal(server.get("base_price_hour_eur") or 0)
+            ipv4_price = hourly_price_decimal(server.get("ipv4_price_hour_eur") or 0)
+            storage_price = hourly_price_decimal(server.get("storage_price_hour_eur") or 0)
+            total_price = hourly_price_decimal(base_price + ipv4_price + storage_price)
+            current["base_price_hour_eur"] = float(base_price)
+            current["ipv4_price_hour_eur"] = float(ipv4_price)
+            current["storage_price_hour_eur"] = float(storage_price)
+            current["total_price_hour_eur"] = float(total_price)
+        if state != "error":
+            anchor = clamp_timestamp(current.get("created_at") or 0, reference_time) or reference_time
+            resource_windows = normalize_billing_windows(current.get("resource_windows"), reference_time)
+            compute_windows = normalize_billing_windows(current.get("compute_windows"), reference_time)
+            resource_active = is_resource_billed_state(state)
+            compute_active = is_compute_billed_state(state)
+            if current.get("legacy_estimate"):
+                if resource_active:
+                    resource_windows = [{"started_at": anchor, "ended_at": None}]
+                if compute_active:
+                    compute_windows = [{"started_at": anchor, "ended_at": None}]
+                current["legacy_estimate"] = False
+            if resource_active:
+                if not resource_windows:
+                    resource_windows = [{"started_at": anchor, "ended_at": None}]
+                elif not has_open_billing_window(resource_windows):
+                    open_billing_window(resource_windows, reference_time)
+                current["deleted_at"] = 0.0
+            else:
+                close_billing_window(resource_windows, reference_time, reference_time)
+                current["deleted_at"] = reference_time
+            if compute_active:
+                if not compute_windows:
+                    compute_windows = [{"started_at": anchor, "ended_at": None}]
+                elif not has_open_billing_window(compute_windows):
+                    open_billing_window(compute_windows, reference_time)
+            else:
+                close_billing_window(compute_windows, reference_time, reference_time)
+            current["resource_windows"] = resource_windows
+            current["compute_windows"] = compute_windows
+        current["updated_at"] = reference_time
+        instances[server_id] = self._normalize_pricing_instance(server_id, current, reference_time=reference_time)
+        after = json.dumps(instances[server_id], ensure_ascii=True, sort_keys=True)
+        return after != before
+
     def record_pricing_snapshot(self, server: dict[str, object]) -> dict[str, object]:
         server_id = str(server.get("id") or "").strip()
         if not server_id:
             return self._load_pricing_totals()
-        totals = self._load_pricing_totals()
+        billing_now = timestamp_value(server.get("created_at"), time.time())
+        totals = self._load_pricing_totals(reference_time=billing_now)
         instances = dict(totals.get("instances") or {})
-        instances[server_id] = {
-            "name": str(server.get("name") or server_id),
-            "zone": str(server.get("zone") or ""),
-            "commercial_type": str(server.get("commercial_type") or ""),
-            "created_at": float(server.get("created_at") or time.time()),
-            "storage_kind": str(server.get("storage_kind") or "-"),
-            "storage_size_gb": float(server.get("storage_size_gb") or 0),
-            "storage_size_label": str(server.get("storage_size_label") or "-"),
-            "base_price_hour_eur": float(server.get("base_price_hour_eur") or 0),
-            "ipv4_price_hour_eur": float(server.get("ipv4_price_hour_eur") or 0),
-            "storage_price_hour_eur": float(server.get("storage_price_hour_eur") or 0),
-            "total_price_hour_eur": float(server.get("total_price_hour_eur") or 0),
-        }
-        return self._write_pricing_totals(instances)
+        self._sync_pricing_instance(instances, server, billing_now)
+        return self._write_pricing_totals(instances, reference_time=billing_now)
 
-    def backfill_pricing_snapshots(self, servers: list[dict[str, object]]) -> dict[str, object]:
-        totals = self._load_pricing_totals()
+    def update_pricing_state(
+        self,
+        server_id: str,
+        state: str,
+        changed_at: float | None = None,
+    ) -> dict[str, object]:
+        normalized_id = str(server_id or "").strip()
+        if not normalized_id:
+            return self._load_pricing_totals()
+        billing_now = timestamp_value(changed_at, time.time())
+        totals = self._load_pricing_totals(reference_time=billing_now)
+        instances = dict(totals.get("instances") or {})
+        if normalized_id not in instances:
+            return totals
+        current = self._normalize_pricing_instance(normalized_id, instances[normalized_id], reference_time=billing_now)
+        current["current_state"] = normalize_state(state)
+        resource_windows = normalize_billing_windows(current.get("resource_windows"), billing_now)
+        compute_windows = normalize_billing_windows(current.get("compute_windows"), billing_now)
+        if is_resource_billed_state(state):
+            if not resource_windows:
+                anchor = clamp_timestamp(current.get("created_at") or 0, billing_now) or billing_now
+                resource_windows = [{"started_at": anchor, "ended_at": None}]
+            else:
+                open_billing_window(resource_windows, billing_now)
+            current["deleted_at"] = 0.0
+        else:
+            close_billing_window(resource_windows, billing_now, billing_now)
+            current["deleted_at"] = billing_now
+        if is_compute_billed_state(state):
+            if not compute_windows:
+                anchor = clamp_timestamp(current.get("created_at") or 0, billing_now) or billing_now
+                compute_windows = [{"started_at": anchor, "ended_at": None}]
+            else:
+                open_billing_window(compute_windows, billing_now)
+        else:
+            close_billing_window(compute_windows, billing_now, billing_now)
+        current["resource_windows"] = resource_windows
+        current["compute_windows"] = compute_windows
+        current["legacy_estimate"] = False
+        current["updated_at"] = billing_now
+        instances[normalized_id] = self._normalize_pricing_instance(normalized_id, current, reference_time=billing_now)
+        return self._write_pricing_totals(instances, reference_time=billing_now)
+
+    def finalize_pricing_snapshot(
+        self,
+        server_id: str,
+        deleted_at: float | None = None,
+    ) -> dict[str, object]:
+        normalized_id = str(server_id or "").strip()
+        if not normalized_id:
+            return self._load_pricing_totals()
+        billing_now = timestamp_value(deleted_at, time.time())
+        totals = self._load_pricing_totals(reference_time=billing_now)
+        instances = dict(totals.get("instances") or {})
+        if normalized_id not in instances:
+            return totals
+        current = self._normalize_pricing_instance(normalized_id, instances[normalized_id], reference_time=billing_now)
+        current["seed_billed_cost_eur"] = float(hourly_price_decimal(current.get("billed_cost_eur") or 0))
+        current["current_state"] = "deleted"
+        current["deleted_at"] = billing_now
+        current["legacy_estimate"] = False
+        current["updated_at"] = billing_now
+        current["resource_windows"] = []
+        current["compute_windows"] = []
+        instances[normalized_id] = self._normalize_pricing_instance(normalized_id, current, reference_time=billing_now)
+        return self._write_pricing_totals(instances, reference_time=billing_now)
+
+    def backfill_pricing_snapshots(
+        self,
+        servers: list[dict[str, object]],
+        reference_time: float | None = None,
+    ) -> dict[str, object]:
+        billing_now = timestamp_value(reference_time, time.time())
+        totals = self._load_pricing_totals(reference_time=billing_now)
         instances = dict(totals.get("instances") or {})
         changed = False
+        for server_id, item in list(instances.items()):
+            normalized = self._normalize_pricing_instance(server_id, item, reference_time=billing_now)
+            if normalized.get("legacy_estimate") and self._seed_legacy_pricing_instance(normalized, billing_now):
+                changed = True
+            instances[server_id] = self._normalize_pricing_instance(server_id, normalized, reference_time=billing_now)
         for server in servers:
             if not isinstance(server, dict):
                 continue
             if not server.get("managed"):
                 continue
-            if str(server.get("state") or "").strip().lower() in {"deleted", "error"}:
-                continue
-            server_id = str(server.get("id") or "").strip()
-            if not server_id or server_id in instances:
-                continue
-            instances[server_id] = {
-                "name": str(server.get("name") or server_id),
-                "zone": str(server.get("zone") or ""),
-                "commercial_type": str(server.get("commercial_type") or ""),
-                "created_at": float(server.get("created_at") or time.time()),
-                "storage_kind": str(server.get("storage_kind") or "-"),
-                "storage_size_gb": float(server.get("storage_size_gb") or 0),
-                "storage_size_label": str(server.get("storage_size_label") or "-"),
-                "base_price_hour_eur": float(server.get("base_price_hour_eur") or 0),
-                "ipv4_price_hour_eur": float(server.get("ipv4_price_hour_eur") or 0),
-                "storage_price_hour_eur": float(server.get("storage_price_hour_eur") or 0),
-                "total_price_hour_eur": float(server.get("total_price_hour_eur") or 0),
-            }
-            changed = True
+            if self._sync_pricing_instance(instances, server, billing_now):
+                changed = True
         if changed:
-            return self._write_pricing_totals(instances)
-        return totals
+            return self._write_pricing_totals(instances, reference_time=billing_now)
+        return self._build_pricing_totals(
+            instances,
+            updated_at=float(totals.get("updated_at") or 0),
+            reference_time=billing_now,
+        )
 
     def pricing_summary(self, servers: list[dict[str, object]]) -> dict[str, object]:
+        billing_now = time.time()
         current_total = hourly_price_decimal(0)
         for server in servers:
             if not isinstance(server, dict):
                 continue
-            current_total += hourly_price_decimal(server.get("total_price_hour_eur") or 0)
+            if "current_rate_hour_eur" not in server:
+                server.update(
+                    current_rate_details(
+                        server.get("state"),
+                        server.get("base_price_hour_eur") or 0,
+                        server.get("ipv4_price_hour_eur") or 0,
+                        server.get("storage_price_hour_eur") or 0,
+                    )
+                )
+            current_total += hourly_price_decimal(server.get("current_rate_hour_eur") or 0)
         current_total = hourly_price_decimal(current_total)
-        persisted = self.backfill_pricing_snapshots(servers)
+        persisted = self.backfill_pricing_snapshots(servers, reference_time=billing_now)
         return {
+            "current_total_rate_hour_eur": float(current_total),
+            "current_total_rate_hour": format_hourly_price(current_total),
             "current_total_price_hour_eur": float(current_total),
             "current_total_price_hour": format_hourly_price(current_total),
-            "overall_total_price_hour_eur": float(persisted["overall_total_price_hour_eur"]),
-            "overall_total_price_hour": str(persisted["overall_total_price_hour"]),
+            "overall_billed_cost_eur": float(persisted["overall_billed_cost_eur"]),
+            "overall_billed_cost": str(persisted["overall_billed_cost"]),
+            "overall_total_price_hour_eur": float(persisted["overall_billed_cost_eur"]),
+            "overall_total_price_hour": str(persisted["overall_billed_cost"]),
             "persisted_instance_count": int(persisted["instance_count"]),
         }
 
@@ -698,6 +1058,7 @@ class ScalewayManager:
         else:
             self.wait_for_server_deletion(server_id, zone)
         deleted_volumes = self.delete_volumes(zone, volume_ids)
+        self.finalize_pricing_snapshot(server_id, deleted_at=time.time())
         self.remove_managed_server(server_id)
         rows = self.managed_rows()
         servers = self.visible_servers(rows)
@@ -1141,6 +1502,7 @@ class ScalewayManager:
             summary["state"] = "error"
             summary["error"] = "Unexpected Scaleway response"
             return summary
+        summary["created_at"] = float(server.get("creation_date_ts") or summary["created_at"])
         summary["name"] = self._shorten(server.get("name") or summary["name"], 120) or summary["name"]
         summary["state"] = self._shorten(server.get("state") or "unknown", 40) or "unknown"
         summary["public_ip"] = self.public_ip(server)
@@ -1158,6 +1520,14 @@ class ScalewayManager:
                 server.get("volumes"),
                 fallback_volume_type=self.config.default_root_volume_type if managed else "",
                 fallback_size_gb=self.config.default_root_volume_size_gb if managed else None,
+            )
+        )
+        summary.update(
+            current_rate_details(
+                summary["state"],
+                summary["base_price_hour_eur"],
+                summary["ipv4_price_hour_eur"],
+                summary["storage_price_hour_eur"],
             )
         )
         return summary
@@ -1194,6 +1564,14 @@ class ScalewayManager:
                 server.get("volumes"),
                 fallback_volume_type=self.config.default_root_volume_type if managed else "",
                 fallback_size_gb=self.config.default_root_volume_size_gb if managed else None,
+            )
+        )
+        summary.update(
+            current_rate_details(
+                summary["state"],
+                summary["base_price_hour_eur"],
+                summary["ipv4_price_hour_eur"],
+                summary["storage_price_hour_eur"],
             )
         )
         return summary
