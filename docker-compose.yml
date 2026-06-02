@@ -81,6 +81,24 @@ services:
       - hls_data:/var/www/hls
     command:
       - /usr/local/bin/start-audio
+    # Reports unhealthy only when the input is live but the audio output has gone
+    # stale (a genuine transcoder fault); healthy while idle. The in-script
+    # watchdog in start-audio.sh is the primary self-heal — this is a monitoring
+    # signal (visible in `docker ps`) and a hook for any external autoheal.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          now=$$(date +%s);
+          in_mod=$$(stat -c %Y "/var/www/hls/$${STREAM_NAME:-live}.m3u8" 2>/dev/null || echo 0);
+          stale=$${HLS_STALE_SECONDS:-15};
+          { [ "$$in_mod" -eq 0 ] || [ $$((now - in_mod)) -gt "$$stale" ]; } && exit 0;
+          out_mod=$$(stat -c %Y "/var/www/hls/$${AUDIO_STREAM_NAME}.m3u8" 2>/dev/null || echo 0);
+          [ "$$out_mod" -ne 0 ] && [ $$((now - out_mod)) -le "$$stale" ]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 60s
     restart: unless-stopped
 
   web:

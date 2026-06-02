@@ -1,6 +1,11 @@
 #!/usr/bin/env sh
 set -eu
 
+# Epoch mtime of a file, or 0 if it does not exist / cannot be read.
+file_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
+}
+
 while true; do
   if [ -z "${AUDIO_STREAM_NAME:-}" ]; then
     sleep 5
@@ -14,7 +19,7 @@ while true; do
   fi
 
   NOW=$(date +%s)
-  MOD=$(stat -c %Y "${LIVE}" 2>/dev/null || stat -f %m "${LIVE}" 2>/dev/null || echo 0)
+  MOD=$(file_mtime "${LIVE}")
   STALE=${HLS_STALE_SECONDS:-15}
   if [ "${MOD}" -eq 0 ] || [ $((NOW - MOD)) -gt "${STALE}" ]; then
     sleep 2
@@ -33,7 +38,7 @@ while true; do
     continue
   fi
 
-  SEG_MOD=$(stat -c %Y "${SEG_PATH}" 2>/dev/null || stat -f %m "${SEG_PATH}" 2>/dev/null || echo 0)
+  SEG_MOD=$(file_mtime "${SEG_PATH}")
   if [ "${SEG_MOD}" -eq 0 ] || [ $((NOW - SEG_MOD)) -gt "${STALE}" ]; then
     sleep 2
     continue
@@ -64,10 +69,42 @@ while true; do
     -hls_segment_type fmp4 -hls_fmp4_init_filename audio_init.mp4 \
     -hls_segment_filename "${SEG}" "${OUT}"
 
-  if ! ffmpeg "$@"; then
-    sleep 2
-    continue
+  # Run ffmpeg in the background so we can watch it while it transcodes. The
+  # pre-flight checks above only validate the input *before* launch; this
+  # watchdog catches the case where ffmpeg hangs mid-run (a local-file read
+  # never times out via -rw_timeout) and would otherwise serve stale audio
+  # forever while the process never exits.
+  ffmpeg "$@" &
+  FFPID=$!
+
+  START=$(date +%s)
+  while kill -0 "${FFPID}" 2>/dev/null; do
+    sleep 3
+    NOW=$(date +%s)
+
+    # Input playlist went stale: nothing fresh to transcode, restart the cycle.
+    IN_MOD=$(file_mtime "${LIVE}")
+    if [ "${IN_MOD}" -eq 0 ] || [ $((NOW - IN_MOD)) -gt "${STALE}" ]; then
+      break
+    fi
+
+    # Output stopped advancing (ffmpeg wedged), after a short startup grace.
+    if [ $((NOW - START)) -gt "${STALE}" ]; then
+      OUT_MOD=$(file_mtime "${OUT}")
+      if [ "${OUT_MOD}" -eq 0 ] || [ $((NOW - OUT_MOD)) -gt "${STALE}" ]; then
+        break
+      fi
+    fi
+  done
+
+  # If the watchdog broke out while ffmpeg is still alive, stop it (TERM, then
+  # KILL) so the loop can relaunch from a clean, re-validated state.
+  if kill -0 "${FFPID}" 2>/dev/null; then
+    kill "${FFPID}" 2>/dev/null || true
+    sleep 1
+    kill -9 "${FFPID}" 2>/dev/null || true
   fi
+  wait "${FFPID}" 2>/dev/null || true
 
   sleep 2
 done

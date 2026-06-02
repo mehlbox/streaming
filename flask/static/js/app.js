@@ -67,6 +67,8 @@ let mediaEl = video;
 let activeHlsUrl = hlsUrl;
 let mediaRecoveryAttempts = 0;
 let lastMediaRecoveryAt = 0;
+let mainSoftRecoveryAttempts = 0;
+let lastMainSoftRecoveryAt = 0;
 let satelliteUrl = null;
 let satelliteAssigned = false;
 const satelliteAssignPollIntervalMs = 15000;
@@ -76,6 +78,7 @@ const autostartAttemptsKey = "autostartAttempts";
 const autostartMaxAttempts = 10;
 const autostartRetryCooldownMs = 60000;
 const volumeStorageKey = "audioVolume";
+const soundIntentStorageKey = "soundEnabled";
 const tabIdStorageKey = "streamTabId";
 const tabBroadcastKey = "streamTabBroadcast";
 const tabChannelName = "stream-tabs";
@@ -84,6 +87,8 @@ const startupBufferTimeoutMs = 6000;
 const liveStartOffsetSeconds = 4.5;
 const stallReloadGraceMs = 60000;
 const stallRecoveryCooldownMs = 4000;
+const mainSoftRecoveryMaxAttempts = 4;
+const mainSoftRecoveryWindowMs = 30000;
 const satelliteStallFailoverMs = 10000;
 const satelliteStartupSwitchTimeoutMs = 10000;
 const playbackProgressEpsilonSeconds = 0.12;
@@ -105,6 +110,7 @@ let scheduleData = [];
 let audioAvailable = false;
 let audioLive = null;
 let playbackActive = false;
+let soundRestoreTried = false;
 let autostartAttempts = 0;
 let autostartRetryTimer = null;
 let tabSuppressed = false;
@@ -841,6 +847,27 @@ const loadVolume = () => {
   return Number.isFinite(value) ? clamp(value, 0, 1) : 1;
 };
 
+const loadSoundIntent = () => {
+  try {
+    return localStorage.getItem(soundIntentStorageKey) === "1";
+  } catch (error) {
+    return false;
+  }
+};
+
+const setSoundIntent = (value) => {
+  soundIntent = !!value;
+  try {
+    if (soundIntent) {
+      localStorage.setItem(soundIntentStorageKey, "1");
+    } else {
+      localStorage.removeItem(soundIntentStorageKey);
+    }
+  } catch (error) {
+    /* storage unavailable — keep in-memory value */
+  }
+};
+
 const applyVolume = () => {
   if (!mediaEl) return;
   const volume = clamp(currentVolume, 0, 1);
@@ -854,6 +881,7 @@ const applyVolume = () => {
 };
 
 let currentVolume = loadVolume();
+let soundIntent = loadSoundIntent();
 
 const setPendingPlaybackRequest = ({
   shouldPlay = true,
@@ -871,6 +899,7 @@ const syncPlaybackIntentFromElement = (element) => {
   if (!element) return;
   if (!element.muted && element.volume > 0) {
     allowAutoplay = false;
+    if (!soundIntent) setSoundIntent(true);
   }
 };
 
@@ -1608,6 +1637,19 @@ const isPlaybackRunning = (element, now = Date.now()) => {
   return (now - lastPlaybackProgressAt) <= playbackProgressGraceMs;
 };
 
+// True when the active media is genuinely playing and advancing. Used to keep a
+// healthy HLS stream alive even when the (separate) Flask /status endpoint is
+// flaky or briefly reports offline — the stall watchdog stays the authority on
+// real stalls.
+const isPlayingWell = () => (
+  started
+  && !!mediaEl
+  && isLive
+  && !mediaEl.paused
+  && !mediaEl.ended
+  && isPlaybackRunning(mediaEl)
+);
+
 const tryInlineStallRecovery = (reason) => {
   if (!isLive || !mediaEl || mediaEl.ended) return;
   const now = Date.now();
@@ -1674,6 +1716,10 @@ const forceReload = () => {
 };
 const url = new URL(window.location.href);
 const claimOnLoad = url.searchParams.get("claim") === "1";
+// Captured before the params are stripped below: a `?reload=` load comes from
+// forceReload(), i.e. the viewer was already watching — treat like a returning
+// viewer so we attempt to restore sound after recovery.
+const isAutoReload = url.searchParams.has("reload");
 const excludeSatelliteUrl = url.searchParams.get("sat_exclude") || null;
 currentExcludeSatelliteUrl = excludeSatelliteUrl;
 if (url.searchParams.has("reload") || claimOnLoad || url.searchParams.has("sat_exclude")) {
@@ -1837,8 +1883,51 @@ const attemptPlay = (element) => {
     if (audioOnlyEnabled && (error?.name === "NotSupportedError" || message.includes("no supported source"))) {
       stopPlayer();
       updateAudioControls();
+      return;
+    }
+    // Browser blocked unmuted autoplay (no user gesture). Degrade gracefully:
+    // play muted and surface the "Ton aktivieren" button. The muted retry never
+    // hits this branch again (element is muted), so there is no recursion.
+    if (
+      error?.name === "NotAllowedError"
+      && element === mediaEl
+      && !element.muted
+      && !audioOnlyEnabled
+    ) {
+      element.muted = true;
+      allowAutoplay = true;
+      updateUnmute();
+      element.play().catch(() => updateUnmute());
     }
   });
+};
+
+// Best-effort: once playback is confirmed running (muted), try to restore sound
+// for returning viewers / post-recovery reloads. Never starts unmuted from a
+// cold load (that would risk the autostart limiter and hidden-tab audio), and
+// always falls back to muted + button via attemptPlay's NotAllowedError path.
+const maybeRestoreSound = () => {
+  if (soundRestoreTried) return;
+  if (audioOnlyEnabled) return;
+  if (!mediaEl || !isLive || !started || mediaEl.ended) return;
+  if (tabSuppressed || tabLocked || document.hidden) return;
+  if (!(soundIntent || isAutoReload)) return;
+  if (!(currentVolume > 0)) return;
+  if (!mediaEl.muted) return;
+  soundRestoreTried = true;
+  const element = mediaEl;
+  element.muted = false;
+  attemptPlay(element);
+  // Some browsers pause (instead of rejecting) when unmuted without a gesture.
+  setTimeout(() => {
+    if (element !== mediaEl) return;
+    if (element.paused && !element.muted) {
+      element.muted = true;
+      allowAutoplay = true;
+      updateUnmute();
+      attemptPlay(element);
+    }
+  }, 400);
 };
 
 const updateAudioControls = () => {
@@ -1955,6 +2044,10 @@ if (volumeSlider) {
     if (!Number.isFinite(next)) return;
     currentVolume = clamp(next, 0, 1);
     localStorage.setItem(volumeStorageKey, currentVolume.toString());
+    if (currentVolume === 0) {
+      // User muted on purpose — remember it so we never force-unmute later.
+      setSoundIntent(false);
+    }
     if (mediaEl) {
       mediaEl.volume = currentVolume;
       mediaEl.muted = currentVolume === 0;
@@ -1987,6 +2080,8 @@ if (volumeSlider) {
       setAutostartAttempts(0, "reset");
     }
     updateUnmute();
+    // Limiter is now reset by the muted autostart above; safe to try sound.
+    maybeRestoreSound();
   });
   element.addEventListener("pause", (event) => {
     if (event.currentTarget === mediaEl) {
@@ -2077,6 +2172,8 @@ const stopPlayer = () => {
   playerStartedAt = 0;
   started = false;
   playbackActive = false;
+  soundRestoreTried = false;
+  mainSoftRecoveryAttempts = 0;
   startupPlayToken += 1;
   stopAudioVisualizer();
   resetMediaElement(video);
@@ -2292,6 +2389,14 @@ const startPlayerWithOptions = ({
   }
 
   if (window.Hls && Hls.isSupported()) {
+    // Satellites keep zero in-place retries: their failover (xhrSetup first-error
+    // + 10s stall watchdog) is the single, fast recovery authority. The main
+    // server has no failover target, so a few short retries let transient network
+    // blips self-heal instead of destroying the player and flashing Offline.
+    const manifestRetries = satelliteAssigned ? 0 : 2;
+    const segmentRetries = satelliteAssigned ? 0 : 3;
+    const retryDelayMs = satelliteAssigned ? 0 : 500;
+    const maxRetryDelayMs = satelliteAssigned ? 0 : 2000;
     hls = new Hls({
       liveSyncDurationCount: 6,
       liveMaxLatencyDurationCount: 12,
@@ -2301,24 +2406,24 @@ const startPlayerWithOptions = ({
       maxMaxBufferLength: 60,
       backBufferLength: 30,
       manifestLoadingTimeOut: satelliteAssigned ? 10000 : 15000,
-      manifestLoadingMaxRetry: 0,
+      manifestLoadingMaxRetry: manifestRetries,
       levelLoadingTimeOut: satelliteAssigned ? 10000 : 15000,
-      levelLoadingMaxRetry: 0,
+      levelLoadingMaxRetry: segmentRetries,
       fragLoadingTimeOut: satelliteAssigned ? 10000 : 15000,
-      fragLoadingMaxRetry: 0,
+      fragLoadingMaxRetry: segmentRetries,
       manifestLoadPolicy: {
         default: {
           maxTimeToFirstByteMs: satelliteAssigned ? 10000 : 15000,
           maxLoadTimeMs: satelliteAssigned ? 10000 : 15000,
           timeoutRetry: {
-            maxNumRetry: 0,
-            retryDelayMs: 0,
-            maxRetryDelayMs: 0
+            maxNumRetry: manifestRetries,
+            retryDelayMs,
+            maxRetryDelayMs
           },
           errorRetry: {
-            maxNumRetry: 0,
-            retryDelayMs: 0,
-            maxRetryDelayMs: 0
+            maxNumRetry: manifestRetries,
+            retryDelayMs,
+            maxRetryDelayMs
           }
         }
       },
@@ -2327,14 +2432,14 @@ const startPlayerWithOptions = ({
           maxTimeToFirstByteMs: satelliteAssigned ? 10000 : 15000,
           maxLoadTimeMs: satelliteAssigned ? 10000 : 15000,
           timeoutRetry: {
-            maxNumRetry: 0,
-            retryDelayMs: 0,
-            maxRetryDelayMs: 0
+            maxNumRetry: segmentRetries,
+            retryDelayMs,
+            maxRetryDelayMs
           },
           errorRetry: {
-            maxNumRetry: 0,
-            retryDelayMs: 0,
-            maxRetryDelayMs: 0
+            maxNumRetry: segmentRetries,
+            retryDelayMs,
+            maxRetryDelayMs
           }
         }
       },
@@ -2343,14 +2448,14 @@ const startPlayerWithOptions = ({
           maxTimeToFirstByteMs: satelliteAssigned ? 10000 : 15000,
           maxLoadTimeMs: satelliteAssigned ? 10000 : 15000,
           timeoutRetry: {
-            maxNumRetry: 0,
-            retryDelayMs: 0,
-            maxRetryDelayMs: 0
+            maxNumRetry: segmentRetries,
+            retryDelayMs,
+            maxRetryDelayMs
           },
           errorRetry: {
-            maxNumRetry: 0,
-            retryDelayMs: 0,
-            maxRetryDelayMs: 0
+            maxNumRetry: segmentRetries,
+            retryDelayMs,
+            maxRetryDelayMs
           }
         }
       },
@@ -2359,14 +2464,14 @@ const startPlayerWithOptions = ({
           maxTimeToFirstByteMs: satelliteAssigned ? 10000 : 15000,
           maxLoadTimeMs: satelliteAssigned ? 10000 : 15000,
           timeoutRetry: {
-            maxNumRetry: 0,
-            retryDelayMs: 0,
-            maxRetryDelayMs: 0
+            maxNumRetry: manifestRetries,
+            retryDelayMs,
+            maxRetryDelayMs
           },
           errorRetry: {
-            maxNumRetry: 0,
-            retryDelayMs: 0,
-            maxRetryDelayMs: 0
+            maxNumRetry: manifestRetries,
+            retryDelayMs,
+            maxRetryDelayMs
           }
         }
       },
@@ -2463,6 +2568,36 @@ const startPlayerWithOptions = ({
           void switchToAlternateSatellite(`${details || "segment load failed"} status=${responseCode || 0}`);
           return;
         }
+        // Main server (no failover target). Non-fatal errors are being retried
+        // internally by hls.js (see retry config above) — leave them alone.
+        if (!data?.fatal) {
+          console.log("HLS error:", data);
+          return;
+        }
+        // A 404/410 means the source is genuinely gone → go offline cleanly.
+        // Otherwise (timeout / status 0 / 5xx) give the live source a bounded
+        // number of soft reloads so a single blip doesn't flash Offline, while a
+        // truly-dead feed still resolves to offline after the budget is spent.
+        const sourceGone = responseCode === 404 || responseCode === 410;
+        const now = Date.now();
+        if (now - lastMainSoftRecoveryAt > mainSoftRecoveryWindowMs) {
+          mainSoftRecoveryAttempts = 0;
+        }
+        if (!sourceGone && hls && mainSoftRecoveryAttempts < mainSoftRecoveryMaxAttempts) {
+          lastMainSoftRecoveryAt = now;
+          mainSoftRecoveryAttempts += 1;
+          debugLog(`main soft recovery ${mainSoftRecoveryAttempts}/${mainSoftRecoveryMaxAttempts} (${details})`);
+          try {
+            if (typeof hls.startLoad === "function") {
+              hls.startLoad(-1);
+            }
+            jumpToLiveEdge(hls, mediaEl);
+            attemptPlay(mediaEl);
+          } catch (error) {
+            tryInlineStallRecovery("hls-network-error");
+          }
+          return;
+        }
         if (hls) {
           hls.destroy();
           hls = null;
@@ -2535,6 +2670,12 @@ const handleStatus = (live, audioLiveStatus) => {
     }
     return;
   }
+  if (isPlayingWell()) {
+    // /status says offline but the HLS stream is still progressing locally — a
+    // server-side lag/blip. Keep playing; the stall watchdog catches real stalls
+    // and the next poll re-evaluates once the buffer actually drains.
+    return;
+  }
   setStatus(false);
   if (autostartAttempts > 0 || autostartRetryTimer) {
     resetAutostartRetryState("offline");
@@ -2562,8 +2703,15 @@ const clearStatusFailure = () => {
 const handleStatusFailure = (reason) => {
   postClientLog("status_poll_failed", { reason });
   if (statusFailureTimer !== null) return;
-  statusFailureTimer = setTimeout(() => {
+  const onGrace = () => {
     statusFailureTimer = null;
+    if (isPlayingWell()) {
+      // Flask /status is unreachable, but the HLS stream (served separately by
+      // nginx) is still playing fine. Do not tear it down — keep playing and
+      // re-check after another grace window.
+      statusFailureTimer = setTimeout(onGrace, statusFailureGraceMs);
+      return;
+    }
     audioLive = false;
     audioAvailable = false;
     setStatus(false);
@@ -2571,7 +2719,8 @@ const handleStatusFailure = (reason) => {
     if (started) {
       stopPlayer();
     }
-  }, statusFailureGraceMs);
+  };
+  statusFailureTimer = setTimeout(onGrace, statusFailureGraceMs);
 };
 
 const pollStatus = async () => {
