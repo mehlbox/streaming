@@ -71,6 +71,8 @@ HLS_LOG_TAIL_BYTES = max(
 )
 NGINX_STATUS_URL = os.getenv("NGINX_STATUS_URL", "").strip()
 HLS_VIEWER_COOKIE = "stream_viewer"
+HLS_INTERNAL_VIEWER_PREFIX = "__internal__:"
+HLS_STATUS_PROBE_VIEWER_ID = f"{HLS_INTERNAL_VIEWER_PREFIX}status-probe"
 HLS_VIEWER_COOKIE_DOMAIN = os.getenv("HLS_VIEWER_COOKIE_DOMAIN", "").strip().lstrip(".")
 AUDIO_STREAM_NAME = os.getenv("AUDIO_STREAM_NAME", "").strip()
 AUDIO_HLS_URL = os.getenv("AUDIO_HLS_URL", "").strip()
@@ -493,6 +495,7 @@ scaleway = ScalewayManager(
         public_origin_url=PUBLIC_ORIGIN_URL,
         satellite_api_key=SATELLITE_API_KEY,
         satellite_bootstrap_token=SATELLITE_BOOTSTRAP_TOKEN,
+        state_db_path=STATE_DB,
     ),
     connect_db=connect_db,
     init_db=init_db,
@@ -961,6 +964,11 @@ def http_probe(
     return http_probe_once(url, headers, method=method)
 
 
+def is_internal_viewer_id(viewer_id: str) -> bool:
+    normalized = str(viewer_id or "").strip()
+    return bool(normalized) and normalized.startswith(HLS_INTERNAL_VIEWER_PREFIX)
+
+
 def public_probe_status_for_url(value: str, observed_ip: str = "", now: float | None = None) -> dict[str, object]:
     current = time.time() if now is None else now
     normalized_value = str(value or "").strip()
@@ -990,7 +998,7 @@ def public_probe_status_for_url(value: str, observed_ip: str = "", now: float | 
     hls_url = satellite_manifest_url(normalized_value)
     origin_headers = {"Origin": PUBLIC_ORIGIN_URL} if PUBLIC_ORIGIN_URL else {}
     viewer_headers = dict(origin_headers)
-    viewer_headers["Cookie"] = f"{HLS_VIEWER_COOKIE}=status-probe"
+    viewer_headers["Cookie"] = f"{HLS_VIEWER_COOKIE}={HLS_STATUS_PROBE_VIEWER_ID}"
     preflight_headers = dict(origin_headers)
     preflight_headers["Access-Control-Request-Method"] = "GET"
     preflight_headers["Access-Control-Request-Headers"] = "Range"
@@ -1184,7 +1192,7 @@ def parse_hls_log_line(line: str) -> tuple[float, str, bool] | None:
     except ValueError:
         return None
     viewer_id = str(viewer_cookie or "").strip()
-    if not viewer_id or viewer_id == "-":
+    if not viewer_id or viewer_id == "-" or is_internal_viewer_id(viewer_id):
         return None
     return timestamp, viewer_id, via_satellite == "1"
 

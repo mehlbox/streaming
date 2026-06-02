@@ -134,7 +134,7 @@
                 <thead>
                   <tr>
                     <th>Typ</th>
-                    <th>Preis</th>
+                    <th>Kosten pro Stunde</th>
                     <th>vCPU</th>
                     <th>RAM</th>
                     <th>Bandbreite</th>
@@ -144,7 +144,7 @@
                   {% for server_type in scaleway_server_types %}
                   <tr>
                     <td>{{ server_type.name }}</td>
-                    <td>{{ server_type.price_hour }}</td>
+                    <td>{{ server_type.total_price_hour|replace('/hour', '') }}</td>
                     <td>{{ server_type.vcpus }}</td>
                     <td>{{ server_type.memory }}</td>
                     <td>{{ server_type.bandwidth }}</td>
@@ -155,25 +155,36 @@
             </div>
           </details>
           <form id="scaleway-form" class="scw-form">
-            <label class="scw-field">
-              <span>Zone</span>
-              <select id="scaleway-zone">
-                {% for zone in scaleway_zone_options %}
-                <option value="{{ zone.id }}"{% if zone.id == scaleway_default_zone %} selected{% endif %}>{{ zone.label }}</option>
-                {% endfor %}
-              </select>
-            </label>
-            <label class="scw-field">
-              <span>Typ</span>
-              <select id="scaleway-type">
-                {% for server_type in scaleway_server_types %}
-                <option value="{{ server_type.name }}"{% if server_type.name == scaleway_default_type %} selected{% endif %}>{{ server_type.name }}</option>
-                {% endfor %}
-              </select>
-            </label>
-            <div class="scw-actions">
-              <button id="scaleway-create" type="submit" class="scw-button">Server erstellen</button>
-            </div>
+            <fieldset class="scw-submit-group">
+              <legend class="scw-submit-legend">Neue Instanz erstellen</legend>
+              <div class="scw-choice-columns">
+                <div class="scw-choice-group">
+                  <span class="scw-choice-title">Zone</span>
+                  <div class="scw-radio-grid">
+                    {% for zone in scaleway_zone_options %}
+                    <label class="scw-radio-option">
+                      <input type="radio" name="scaleway-zone" value="{{ zone.id }}"{% if zone.id == scaleway_default_zone %} checked{% endif %} required>
+                      <span>{{ zone.label }}</span>
+                    </label>
+                    {% endfor %}
+                  </div>
+                </div>
+                <div class="scw-choice-group">
+                  <span class="scw-choice-title">Typ</span>
+                  <div class="scw-radio-grid">
+                    {% for server_type in scaleway_server_types %}
+                    <label class="scw-radio-option">
+                      <input type="radio" name="scaleway-type" value="{{ server_type.name }}"{% if server_type.name == scaleway_default_type %} checked{% endif %} required>
+                      <span>{{ server_type.name }}</span>
+                    </label>
+                    {% endfor %}
+                  </div>
+                </div>
+              </div>
+              <div class="scw-actions">
+                <button id="scaleway-create" type="submit" class="scw-button">Server erstellen</button>
+              </div>
+            </fieldset>
           </form>
           <p id="scaleway-meta" class="scw-meta">Maximal {{ scaleway_server_limit }} verwaltete Server.</p>
           <p id="scaleway-status" class="scw-status">{% if not scaleway_enabled %}Scaleway-Verwaltung ist noch nicht konfiguriert.{% else %}Bereit zum Erstellen von Instanzen.{% endif %}</p>
@@ -187,12 +198,25 @@
                   <th>State</th>
                   <th>IP</th>
                   <th>Typ</th>
+                  <th>Summe/h</th>
                   <th>Remove</th>
                 </tr>
               </thead>
               <tbody id="scaleway-body">
-                <tr><td colspan="7" class="empty-state">Noch keine verwalteten Scaleway-Server geladen.</td></tr>
+                <tr><td colspan="8" class="empty-state">Noch keine verwalteten Scaleway-Server geladen.</td></tr>
               </tbody>
+              <tfoot id="scaleway-footer">
+                <tr>
+                  <td colspan="6">Aktuell sichtbare Summe</td>
+                  <td>€0/hour</td>
+                  <td>-</td>
+                </tr>
+                <tr>
+                  <td colspan="6">Persistierte Gesamtsumme</td>
+                  <td>€0/hour</td>
+                  <td>-</td>
+                </tr>
+              </tfoot>
             </table>
           </div>
         </div>

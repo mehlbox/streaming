@@ -937,6 +937,11 @@ body[data-admin="1"] .main-content {
   background: var(--bg-light);
 }
 
+.data-table tfoot td {
+  background: var(--bg-light);
+  font-weight: 600;
+}
+
 .empty-state {
   text-align: center;
   color: var(--text-secondary);
@@ -1015,11 +1020,75 @@ body[data-admin="1"] .main-content {
   color: #dc2626;
 }
 
+.scw-total-value {
+  white-space: nowrap;
+}
+
 .scw-form {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: var(--spacing-md);
-  align-items: end;
+}
+
+.scw-submit-group {
+  margin: 0;
+  padding: var(--spacing-lg);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  background: var(--bg-light);
+}
+
+.scw-submit-legend {
+  padding: 0 0.5rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.scw-choice-columns {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--spacing-md);
+  margin-bottom: var(--spacing-md);
+}
+
+.scw-choice-group {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.scw-choice-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.scw-radio-grid {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.scw-radio-option {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-height: 48px;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-lighter);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: border-color var(--transition-normal), background var(--transition-normal), box-shadow var(--transition-normal);
+}
+
+.scw-radio-option:has(input:checked) {
+  border-color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 10%, var(--bg-lighter));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--primary) 30%, transparent);
+}
+
+.scw-radio-option input {
+  margin: 0;
+  accent-color: var(--primary);
 }
 
 .scw-field {
@@ -1208,6 +1277,10 @@ body[data-admin="1"] .stats-title {
 
   .scw-actions {
     flex-direction: column;
+  }
+
+  .scw-choice-columns {
+    grid-template-columns: 1fr;
   }
 
   .scw-button,

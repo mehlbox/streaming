@@ -46,6 +46,7 @@ HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "10"))
 NGINX_STATUS_URL = os.environ.get("NGINX_STATUS_URL", "http://127.0.0.1:80/nginx-status")
 HLS_ACCESS_LOG = os.environ.get("HLS_ACCESS_LOG", "").strip()
 HLS_VIEWER_WINDOW = int(os.environ.get("HLS_VIEWER_WINDOW", "15"))
+HLS_INTERNAL_VIEWER_PREFIX = "__internal__:"
 CADDY_CERTIFICATES_DIR = os.environ.get(
     "CADDY_CERTIFICATES_DIR",
     "/var/lib/caddy/.local/share/caddy/certificates",
@@ -74,6 +75,11 @@ def get_active_connections():
     return 0
 
 
+def is_internal_viewer_id(viewer_id):
+    normalized = str(viewer_id or "").strip()
+    return bool(normalized) and normalized.startswith(HLS_INTERNAL_VIEWER_PREFIX)
+
+
 def parse_hls_log_line(line):
     text = str(line or "").strip()
     if not text:
@@ -87,7 +93,7 @@ def parse_hls_log_line(line):
     except ValueError:
         return None
     viewer_id = str(viewer_cookie or "").strip()
-    if not viewer_id or viewer_id == "-":
+    if not viewer_id or viewer_id == "-" or is_internal_viewer_id(viewer_id):
         return None
     return timestamp, viewer_id, via_satellite == "1"
 

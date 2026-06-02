@@ -33,10 +33,9 @@ const satelliteSection = document.getElementById("satellite-section");
 const satelliteBody = document.getElementById("satellite-body");
 const scalewaySection = document.getElementById("scaleway-section");
 const scalewayForm = document.getElementById("scaleway-form");
-const scalewayZoneEl = document.getElementById("scaleway-zone");
-const scalewayTypeEl = document.getElementById("scaleway-type");
 const scalewayCreateBtn = document.getElementById("scaleway-create");
 const scalewayBody = document.getElementById("scaleway-body");
+const scalewayFooter = document.getElementById("scaleway-footer");
 const scalewayStatusEl = document.getElementById("scaleway-status");
 const scalewayMetaEl = document.getElementById("scaleway-meta");
 const statusUrl = document.body?.dataset?.statusUrl || "/status";
@@ -1413,6 +1412,23 @@ const scalewayRequest = async (url, options = {}) => {
   throw new Error(errorText || `HTTP ${resp.status}`);
 };
 
+const renderScalewayFooter = (payload) => {
+  if (!scalewayFooter) return;
+  const currentTotal = escapeHtml(payload?.pricing?.current_total_price_hour || "€0/hour");
+  const overallTotal = escapeHtml(payload?.pricing?.overall_total_price_hour || "€0/hour");
+  const overallInstances = Number(payload?.pricing?.persisted_instance_count || 0);
+  scalewayFooter.innerHTML = `<tr class="scw-total-row">
+      <td colspan="6">Aktuell sichtbare Summe</td>
+      <td class="scw-total-value">${currentTotal}</td>
+      <td>-</td>
+    </tr>
+    <tr class="scw-total-row">
+      <td colspan="6">Persistierte Gesamtsumme (nicht zurückgesetzt, ${overallInstances} Instanzen)</td>
+      <td class="scw-total-value">${overallTotal}</td>
+      <td>-</td>
+    </tr>`;
+};
+
 const renderScalewayTable = (payload) => {
   if (!scalewayBody) return;
   scalewayLastPayload = payload;
@@ -1420,12 +1436,16 @@ const renderScalewayTable = (payload) => {
   if (scalewayMetaEl) {
     const count = Number(payload?.count || servers.length || 0);
     const managedCount = Number(payload?.managed_count || 0);
-    scalewayMetaEl.textContent = `${count} sichtbar | ${managedCount} / ${payload?.max_servers || scalewayServerLimit} verwaltet`;
+    const currentTotal = payload?.pricing?.current_total_price_hour || "€0/hour";
+    const overallTotal = payload?.pricing?.overall_total_price_hour || "€0/hour";
+    scalewayMetaEl.textContent = `${count} sichtbar | ${managedCount} / ${payload?.max_servers || scalewayServerLimit} verwaltet | aktuell ${currentTotal} | historisch ${overallTotal}`;
   }
   if (!servers.length) {
-    scalewayBody.innerHTML = '<tr><td colspan="7" class="satellite-empty">Keine Scaleway-Server im Projekt sichtbar.</td></tr>';
+    scalewayBody.innerHTML = '<tr><td colspan="8" class="satellite-empty">Keine Scaleway-Server im Projekt sichtbar.</td></tr>';
+    renderScalewayFooter(payload);
     return;
   }
+  renderScalewayFooter(payload);
   scalewayBody.innerHTML = servers.map((server) => {
     const state = String(server.state || "unknown");
     const stateClass = state === "running"
@@ -1440,6 +1460,7 @@ const renderScalewayTable = (payload) => {
       <td title="${errorTitle}"><span class="sat-health ${stateClass}">${escapeHtml(state)}</span></td>
       <td>${escapeHtml(server.public_ip || "-")}</td>
       <td>${escapeHtml(server.commercial_type || "-")}</td>
+      <td>${escapeHtml(server.total_price_hour || "€0/hour")}</td>
       <td>${server.managed
         ? `<button type="button" class="scw-inline-button${deletePending ? " scw-inline-button-pending" : ""}" data-server-id="${escapeHtml(server.id)}"${deletePending ? " disabled" : ""}>${deletePending ? "Pending" : "Remove"}</button>`
         : '<span class="scw-external-label">Extern</span>'}</td>
@@ -1473,10 +1494,16 @@ const fetchScalewayServers = async ({ quiet = false } = {}) => {
 
 const createScalewayServer = async () => {
   if (!scalewayForm) return;
+  const selectedZone = scalewayForm.querySelector('input[name="scaleway-zone"]:checked')?.value?.trim() || "";
+  const selectedType = scalewayForm.querySelector('input[name="scaleway-type"]:checked')?.value?.trim() || "";
   const payload = {
-    zone: scalewayZoneEl?.value?.trim() || "",
-    commercial_type: scalewayTypeEl?.value?.trim() || ""
+    zone: selectedZone,
+    commercial_type: selectedType
   };
+  if (!payload.zone || !payload.commercial_type) {
+    setScalewayStatus("Bitte Zone und Typ auswaehlen und dann absenden.", true);
+    return;
+  }
   setScalewayStatus("Erstelle Scaleway-Server ...");
   if (scalewayCreateBtn) scalewayCreateBtn.disabled = true;
   try {

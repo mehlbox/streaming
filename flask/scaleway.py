@@ -5,6 +5,7 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Callable
 from urllib.error import HTTPError, URLError
@@ -17,43 +18,160 @@ SCW_API_LOG_PATH = Path(
     os.getenv("SCW_API_LOG_PATH", "").strip()
     or str(Path(__file__).resolve().with_name("scaleway-api.log"))
 )
+HOURLY_PRICE_QUANTUM = Decimal("0.00001")
+STORAGE_PRICE_UNIT_GB = Decimal("10")
+LOCAL_STORAGE_PRICE_PER_UNIT_HOUR_EUR = Decimal("0.00049")
+IPV4_PRICE_HOUR_EUR = Decimal("0.005")
+
 SERVER_TYPE_CATALOG = (
     {
         "name": "STARDUST1-S",
-        "price_hour": "€0.00015/hour",
+        "price_hour_eur": "0.0006",
         "vcpus": 1,
         "memory": "1 GB",
         "bandwidth": "100 Mbps",
     },
     {
         "name": "DEV1-S",
-        "price_hour": "€0.0088/hour",
+        "price_hour_eur": "0.00898",
         "vcpus": 2,
         "memory": "2 GB",
         "bandwidth": "200 Mbps",
     },
     {
         "name": "DEV1-M",
-        "price_hour": "€0.0198/hour",
+        "price_hour_eur": "0.0202",
         "vcpus": 3,
         "memory": "4 GB",
         "bandwidth": "300 Mbps",
     },
     {
         "name": "DEV1-L",
-        "price_hour": "€0.042/hour",
+        "price_hour_eur": "0.04284",
         "vcpus": 4,
         "memory": "8 GB",
         "bandwidth": "400 Mbps",
     },
     {
         "name": "DEV1-XL",
-        "price_hour": "€0.0638/hour",
+        "price_hour_eur": "0.06508",
         "vcpus": 4,
         "memory": "12 GB",
         "bandwidth": "500 Mbps",
     },
 )
+
+
+def local_storage_server_type_catalog() -> tuple[dict[str, object], ...]:
+    return SERVER_TYPE_CATALOG
+
+
+def hourly_price_decimal(value: object) -> Decimal:
+    if isinstance(value, Decimal):
+        amount = value
+    else:
+        try:
+            amount = Decimal(str(value or 0))
+        except (InvalidOperation, ValueError, TypeError):
+            amount = Decimal("0")
+    return amount.quantize(HOURLY_PRICE_QUANTUM, rounding=ROUND_HALF_UP)
+
+
+def format_hourly_price(value: object) -> str:
+    amount = hourly_price_decimal(value)
+    text = f"{amount:.5f}".rstrip("0").rstrip(".")
+    if not text:
+        text = "0"
+    return f"€{text}/hour"
+
+
+def iter_server_volumes(volumes: object) -> list[dict[str, object]]:
+    if isinstance(volumes, dict):
+        return [value for value in volumes.values() if isinstance(value, dict)]
+    if isinstance(volumes, list):
+        return [value for value in volumes if isinstance(value, dict)]
+    return []
+
+
+def format_storage_size(size_gb: Decimal) -> str:
+    normalized = size_gb.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    text = f"{normalized:.2f}".rstrip("0").rstrip(".")
+    if not text:
+        text = "0"
+    return f"{text} GB"
+
+
+def storage_price_details(
+    volumes: object,
+    fallback_volume_type: str = "",
+    fallback_size_gb: int | None = None,
+) -> tuple[Decimal, dict[str, object]]:
+    total_size_gb = Decimal("0")
+    detected_volume_type = ""
+    for volume in iter_server_volumes(volumes):
+        if not detected_volume_type:
+            detected_volume_type = str(volume.get("volume_type") or volume.get("type") or "").strip().lower()
+        raw_size = volume.get("size") or volume.get("size_bytes") or volume.get("size_in_bytes") or 0
+        try:
+            size_bytes = Decimal(str(raw_size or 0))
+        except (InvalidOperation, ValueError, TypeError):
+            size_bytes = Decimal("0")
+        if size_bytes > 0:
+            total_size_gb += size_bytes / Decimal("1000000000")
+    if total_size_gb <= 0 and fallback_size_gb:
+        try:
+            total_size_gb = Decimal(str(fallback_size_gb))
+        except (InvalidOperation, ValueError, TypeError):
+            total_size_gb = Decimal("0")
+    volume_type = detected_volume_type or str(fallback_volume_type or "").strip().lower()
+    if total_size_gb <= 0:
+        return Decimal("0"), {
+            "storage_kind": "-",
+            "storage_size_gb": 0.0,
+            "storage_size_label": "-",
+            "volume_type": volume_type,
+            "storage_price_hour_eur": 0.0,
+            "storage_price_hour": format_hourly_price(0),
+        }
+    storage_price = hourly_price_decimal(
+        (total_size_gb / STORAGE_PRICE_UNIT_GB) * LOCAL_STORAGE_PRICE_PER_UNIT_HOUR_EUR
+    )
+    storage_kind = "Local Storage"
+    return storage_price, {
+        "storage_kind": storage_kind,
+        "storage_size_gb": float(total_size_gb.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+        "storage_size_label": format_storage_size(total_size_gb),
+        "volume_type": volume_type,
+        "storage_price_hour_eur": float(storage_price),
+        "storage_price_hour": format_hourly_price(storage_price),
+    }
+
+
+def server_price_details(
+    commercial_type: str,
+    public_ip: str = "",
+    volumes: object = None,
+    fallback_volume_type: str = "",
+    fallback_size_gb: int | None = None,
+) -> dict[str, object]:
+    entry = server_type_entry(commercial_type)
+    base_price = hourly_price_decimal(entry.get("price_hour_eur") if entry else 0)
+    ipv4_price = hourly_price_decimal(IPV4_PRICE_HOUR_EUR if str(public_ip or "").strip() else 0)
+    storage_price, storage_meta = storage_price_details(
+        volumes,
+        fallback_volume_type=fallback_volume_type,
+        fallback_size_gb=fallback_size_gb,
+    )
+    total_price = hourly_price_decimal(base_price + ipv4_price + storage_price)
+    return {
+        "base_price_hour_eur": float(base_price),
+        "base_price_hour": format_hourly_price(base_price),
+        "ipv4_price_hour_eur": float(ipv4_price),
+        "ipv4_price_hour": format_hourly_price(ipv4_price),
+        **storage_meta,
+        "total_price_hour_eur": float(total_price),
+        "total_price_hour": format_hourly_price(total_price),
+    }
 
 
 def server_type_entry(commercial_type: str) -> dict[str, object] | None:
@@ -105,6 +223,7 @@ class ScalewayConfig:
     public_origin_url: str
     satellite_api_key: str
     satellite_bootstrap_token: str
+    cost_totals_path: str
 
     @classmethod
     def from_env(
@@ -113,6 +232,7 @@ class ScalewayConfig:
         public_origin_url: str,
         satellite_api_key: str,
         satellite_bootstrap_token: str,
+        state_db_path: str,
     ) -> "ScalewayConfig":
         def env_default(key: str, default: str) -> str:
             value = os.getenv(key, "").strip()
@@ -131,6 +251,13 @@ class ScalewayConfig:
             server_limit = max(1, min(10, int(os.getenv("SCW_SERVER_LIMIT", "10"))))
         except ValueError:
             server_limit = 10
+        local_storage_types = local_storage_server_type_catalog()
+        default_commercial_type = env_default(
+            "SCW_DEFAULT_COMMERCIAL_TYPE",
+            str(local_storage_types[0]["name"]),
+        )
+        if default_commercial_type not in {str(entry["name"]) for entry in local_storage_types}:
+            default_commercial_type = str(local_storage_types[0]["name"])
         return cls(
             api_base_url=os.getenv("SCW_API_BASE_URL", "https://api.scaleway.com").strip().rstrip("/"),
             access_key=os.getenv("SCW_ACCESS_KEY", "").strip(),
@@ -141,7 +268,7 @@ class ScalewayConfig:
                 or os.getenv("SCW_PROJECT_ID", "").strip()
             ),
             default_zone=env_default("SCW_DEFAULT_ZONE", "fr-par-1"),
-            default_commercial_type=env_default("SCW_DEFAULT_COMMERCIAL_TYPE", "GP1-S"),
+            default_commercial_type=default_commercial_type,
             default_image=env_default("SCW_DEFAULT_IMAGE", "ubuntu_noble"),
             default_root_volume_type=env_default("SCW_ROOT_VOLUME_TYPE", "l_ssd"),
             default_root_volume_size_gb=env_int("SCW_ROOT_VOLUME_SIZE_GB", 10, 10),
@@ -158,6 +285,10 @@ class ScalewayConfig:
             public_origin_url=public_origin_url.strip(),
             satellite_api_key=satellite_api_key.strip(),
             satellite_bootstrap_token=satellite_bootstrap_token.strip(),
+            cost_totals_path=(
+                os.getenv("SCW_COST_TOTALS_PATH", "").strip()
+                or str(Path(state_db_path).with_name("scaleway-costs.json"))
+            ),
         )
 
 
@@ -185,6 +316,184 @@ class ScalewayManager:
         self._normalize_ip_address = normalize_ip_address
         self._request_external_base_url = request_external_base_url
         self._logger = build_scaleway_logger()
+
+    def _pricing_totals_path(self) -> Path:
+        return Path(self.config.cost_totals_path)
+
+    def _default_pricing_totals(self) -> dict[str, object]:
+        return {
+            "currency": "EUR",
+            "instance_count": 0,
+            "instances": {},
+            "overall_total_price_hour_eur": 0.0,
+            "overall_total_price_hour": format_hourly_price(0),
+            "updated_at": 0.0,
+        }
+
+    def _normalize_pricing_instance(self, server_id: str, item: dict[str, object]) -> dict[str, object]:
+        base_price = hourly_price_decimal(item.get("base_price_hour_eur") or 0)
+        ipv4_price = hourly_price_decimal(item.get("ipv4_price_hour_eur") or 0)
+        storage_price = hourly_price_decimal(item.get("storage_price_hour_eur") or 0)
+        total_price = hourly_price_decimal(
+            item.get("total_price_hour_eur") or (base_price + ipv4_price + storage_price)
+        )
+        try:
+            created_at = float(item.get("created_at") or 0)
+        except (TypeError, ValueError):
+            created_at = 0.0
+        try:
+            storage_size_gb = float(item.get("storage_size_gb") or 0)
+        except (TypeError, ValueError):
+            storage_size_gb = 0.0
+        return {
+            "name": str(item.get("name") or server_id),
+            "zone": str(item.get("zone") or ""),
+            "commercial_type": str(item.get("commercial_type") or ""),
+            "created_at": created_at,
+            "storage_kind": str(item.get("storage_kind") or "-"),
+            "storage_size_gb": storage_size_gb,
+            "storage_size_label": str(item.get("storage_size_label") or "-"),
+            "base_price_hour_eur": float(base_price),
+            "base_price_hour": format_hourly_price(base_price),
+            "ipv4_price_hour_eur": float(ipv4_price),
+            "ipv4_price_hour": format_hourly_price(ipv4_price),
+            "storage_price_hour_eur": float(storage_price),
+            "storage_price_hour": format_hourly_price(storage_price),
+            "total_price_hour_eur": float(total_price),
+            "total_price_hour": format_hourly_price(total_price),
+        }
+
+    def _load_pricing_totals(self) -> dict[str, object]:
+        path = self._pricing_totals_path()
+        if not path.exists():
+            return self._default_pricing_totals()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return self._default_pricing_totals()
+        if not isinstance(payload, dict):
+            return self._default_pricing_totals()
+        raw_instances = payload.get("instances")
+        instances: dict[str, dict[str, object]] = {}
+        if isinstance(raw_instances, dict):
+            for server_id, item in raw_instances.items():
+                if not isinstance(item, dict):
+                    continue
+                normalized_id = str(server_id or "").strip()
+                if not normalized_id:
+                    continue
+                instances[normalized_id] = self._normalize_pricing_instance(normalized_id, item)
+        overall_total = hourly_price_decimal(0)
+        for item in instances.values():
+            overall_total += hourly_price_decimal(item.get("total_price_hour_eur") or 0)
+        overall_total = hourly_price_decimal(overall_total)
+        try:
+            updated_at = float(payload.get("updated_at") or 0)
+        except (TypeError, ValueError):
+            updated_at = 0.0
+        return {
+            "currency": "EUR",
+            "instance_count": len(instances),
+            "instances": instances,
+            "overall_total_price_hour_eur": float(overall_total),
+            "overall_total_price_hour": format_hourly_price(overall_total),
+            "updated_at": updated_at,
+        }
+
+    def _write_pricing_totals(self, instances: dict[str, dict[str, object]]) -> dict[str, object]:
+        normalized_instances = {
+            server_id: self._normalize_pricing_instance(server_id, item)
+            for server_id, item in instances.items()
+            if str(server_id or "").strip()
+        }
+        overall_total = hourly_price_decimal(0)
+        for item in normalized_instances.values():
+            overall_total += hourly_price_decimal(item.get("total_price_hour_eur") or 0)
+        overall_total = hourly_price_decimal(overall_total)
+        snapshot = {
+            "currency": "EUR",
+            "instance_count": len(normalized_instances),
+            "instances": dict(sorted(normalized_instances.items())),
+            "overall_total_price_hour_eur": float(overall_total),
+            "overall_total_price_hour": format_hourly_price(overall_total),
+            "updated_at": time.time(),
+        }
+        path = self._pricing_totals_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(snapshot, ensure_ascii=True, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return snapshot
+
+    def record_pricing_snapshot(self, server: dict[str, object]) -> dict[str, object]:
+        server_id = str(server.get("id") or "").strip()
+        if not server_id:
+            return self._load_pricing_totals()
+        totals = self._load_pricing_totals()
+        instances = dict(totals.get("instances") or {})
+        instances[server_id] = {
+            "name": str(server.get("name") or server_id),
+            "zone": str(server.get("zone") or ""),
+            "commercial_type": str(server.get("commercial_type") or ""),
+            "created_at": float(server.get("created_at") or time.time()),
+            "storage_kind": str(server.get("storage_kind") or "-"),
+            "storage_size_gb": float(server.get("storage_size_gb") or 0),
+            "storage_size_label": str(server.get("storage_size_label") or "-"),
+            "base_price_hour_eur": float(server.get("base_price_hour_eur") or 0),
+            "ipv4_price_hour_eur": float(server.get("ipv4_price_hour_eur") or 0),
+            "storage_price_hour_eur": float(server.get("storage_price_hour_eur") or 0),
+            "total_price_hour_eur": float(server.get("total_price_hour_eur") or 0),
+        }
+        return self._write_pricing_totals(instances)
+
+    def backfill_pricing_snapshots(self, servers: list[dict[str, object]]) -> dict[str, object]:
+        totals = self._load_pricing_totals()
+        instances = dict(totals.get("instances") or {})
+        changed = False
+        for server in servers:
+            if not isinstance(server, dict):
+                continue
+            if not server.get("managed"):
+                continue
+            if str(server.get("state") or "").strip().lower() in {"deleted", "error"}:
+                continue
+            server_id = str(server.get("id") or "").strip()
+            if not server_id or server_id in instances:
+                continue
+            instances[server_id] = {
+                "name": str(server.get("name") or server_id),
+                "zone": str(server.get("zone") or ""),
+                "commercial_type": str(server.get("commercial_type") or ""),
+                "created_at": float(server.get("created_at") or time.time()),
+                "storage_kind": str(server.get("storage_kind") or "-"),
+                "storage_size_gb": float(server.get("storage_size_gb") or 0),
+                "storage_size_label": str(server.get("storage_size_label") or "-"),
+                "base_price_hour_eur": float(server.get("base_price_hour_eur") or 0),
+                "ipv4_price_hour_eur": float(server.get("ipv4_price_hour_eur") or 0),
+                "storage_price_hour_eur": float(server.get("storage_price_hour_eur") or 0),
+                "total_price_hour_eur": float(server.get("total_price_hour_eur") or 0),
+            }
+            changed = True
+        if changed:
+            return self._write_pricing_totals(instances)
+        return totals
+
+    def pricing_summary(self, servers: list[dict[str, object]]) -> dict[str, object]:
+        current_total = hourly_price_decimal(0)
+        for server in servers:
+            if not isinstance(server, dict):
+                continue
+            current_total += hourly_price_decimal(server.get("total_price_hour_eur") or 0)
+        current_total = hourly_price_decimal(current_total)
+        persisted = self.backfill_pricing_snapshots(servers)
+        return {
+            "current_total_price_hour_eur": float(current_total),
+            "current_total_price_hour": format_hourly_price(current_total),
+            "overall_total_price_hour_eur": float(persisted["overall_total_price_hour_eur"]),
+            "overall_total_price_hour": str(persisted["overall_total_price_hour"]),
+            "persisted_instance_count": int(persisted["instance_count"]),
+        }
 
     def ensure_db(self, conn: sqlite3.Connection) -> None:
         conn.execute(
@@ -352,16 +661,19 @@ class ScalewayManager:
             "managed_count": len(rows),
             "max_servers": self.config.server_limit,
             "servers": servers,
+            "pricing": self.pricing_summary(servers),
         }
 
     def create_payload(self) -> dict[str, object]:
         server = self.create_server()
         rows = self.managed_rows()
+        servers = self.visible_servers(rows)
         return {
             "server": server,
-            "count": len(self.visible_servers(rows)),
+            "count": len(servers),
             "managed_count": len(rows),
             "max_servers": self.config.server_limit,
+            "pricing": self.pricing_summary(servers),
         }
 
     def delete_payload(self, server_id: str) -> dict[str, object]:
@@ -388,12 +700,14 @@ class ScalewayManager:
         deleted_volumes = self.delete_volumes(zone, volume_ids)
         self.remove_managed_server(server_id)
         rows = self.managed_rows()
+        servers = self.visible_servers(rows)
         return {
             "deleted": server_id,
             "deleted_volumes": deleted_volumes,
-            "count": len(self.visible_servers(rows)),
+            "count": len(servers),
             "managed_count": len(rows),
             "max_servers": self.config.server_limit,
+            "pricing": self.pricing_summary(servers),
         }
 
     def create_server(self) -> dict[str, object]:
@@ -461,15 +775,18 @@ class ScalewayManager:
             payload["name"],
             self.config.default_project_id,
         )
-        return self.server_summary(
+        summary = self.server_summary(
             {
                 "server_id": server_id,
                 "zone": payload["zone"],
                 "name": payload["name"],
                 "project_id": self.config.default_project_id,
                 "created_at": time.time(),
-            }
+            },
+            managed=True,
         )
+        self.record_pricing_snapshot(summary)
+        return summary
 
     def render_cloud_init(self) -> str:
         bootstrap_token = self.config.satellite_bootstrap_token or self.config.satellite_api_key
@@ -513,9 +830,11 @@ class ScalewayManager:
             data.get("commercial_type") or self.config.default_commercial_type,
             40,
         ) or ""
+        catalog_entry = server_type_entry(commercial_type)
         image = self.config.default_image
         root_volume_type = self._shorten(
-            data.get("root_volume_type") or self.config.default_root_volume_type,
+            data.get("root_volume_type")
+            or self.config.default_root_volume_type,
             20,
         ) or ""
         try:
@@ -531,7 +850,7 @@ class ScalewayManager:
             abort(400, "Missing Scaleway commercial type")
         if not image:
             abort(400, "Missing Scaleway image")
-        if commercial_type not in self.server_type_names():
+        if catalog_entry is None or commercial_type not in self.server_type_names():
             abort(400, "Unsupported Scaleway server type")
         if root_volume_type != "l_ssd":
             abort(400, "Only local l_ssd storage is supported here")
@@ -754,11 +1073,15 @@ class ScalewayManager:
                 server_id = str(server.get("id") or "").strip()
                 if not server_id:
                     continue
-                visible_by_id[server_id] = self.server_summary_from_remote(
-                    server,
-                    zone,
-                    managed=server_id in managed_by_id,
-                )
+                managed_row = managed_by_id.get(server_id)
+                if managed_row is not None:
+                    visible_by_id[server_id] = self.server_summary(managed_row, managed=True)
+                else:
+                    visible_by_id[server_id] = self.server_summary_from_remote(
+                        server,
+                        zone,
+                        managed=False,
+                    )
         for server_id, row in managed_by_id.items():
             if server_id not in visible_by_id:
                 visible_by_id[server_id] = self.server_summary(row, managed=True)
@@ -802,6 +1125,7 @@ class ScalewayManager:
             "error": "",
             "managed": managed,
         }
+        summary.update(server_price_details("", ""))
         try:
             payload = self.api_request("GET", self.instance_path(summary["zone"], summary["id"]))
         except ScalewayAPIError as exc:
@@ -827,6 +1151,15 @@ class ScalewayManager:
             if isinstance(server.get("allowed_actions"), list)
             else []
         )
+        summary.update(
+            server_price_details(
+                summary["commercial_type"],
+                summary["public_ip"],
+                server.get("volumes"),
+                fallback_volume_type=self.config.default_root_volume_type if managed else "",
+                fallback_size_gb=self.config.default_root_volume_size_gb if managed else None,
+            )
+        )
         return summary
 
     def server_summary_from_remote(
@@ -836,7 +1169,7 @@ class ScalewayManager:
         managed: bool = False,
     ) -> dict[str, object]:
         commercial_type = self._shorten(server.get("commercial_type") or "", 40) or ""
-        return {
+        summary = {
             "id": str(server.get("id") or ""),
             "zone": zone,
             "name": self._shorten(server.get("name") or "", 120) or str(server.get("id") or ""),
@@ -854,21 +1187,47 @@ class ScalewayManager:
                 else []
             ),
         }
+        summary.update(
+            server_price_details(
+                commercial_type,
+                summary["public_ip"],
+                server.get("volumes"),
+                fallback_volume_type=self.config.default_root_volume_type if managed else "",
+                fallback_size_gb=self.config.default_root_volume_size_gb if managed else None,
+            )
+        )
+        return summary
 
     def server_type_names(self) -> set[str]:
-        return {entry["name"] for entry in SERVER_TYPE_CATALOG}
+        return {entry["name"] for entry in local_storage_server_type_catalog()}
 
     def available_server_types(self) -> list[dict[str, object]]:
-        return [
-            {
-                "name": entry["name"],
-                "price_hour": entry["price_hour"],
-                "vcpus": entry["vcpus"],
-                "memory": entry["memory"],
-                "bandwidth": entry["bandwidth"],
-            }
-            for entry in SERVER_TYPE_CATALOG
-        ]
+        server_types: list[dict[str, object]] = []
+        for entry in local_storage_server_type_catalog():
+            pricing = server_price_details(
+                str(entry["name"]),
+                public_ip="0.0.0.0",
+                fallback_volume_type="l_ssd",
+                fallback_size_gb=self.config.default_root_volume_size_gb,
+            )
+            server_types.append(
+                {
+                    "name": entry["name"],
+                    "price_hour": format_hourly_price(entry["price_hour_eur"]),
+                    "price_hour_eur": float(hourly_price_decimal(entry["price_hour_eur"])),
+                    "ipv4_price_hour": pricing["ipv4_price_hour"],
+                    "ipv4_price_hour_eur": pricing["ipv4_price_hour_eur"],
+                    "storage_price_hour": pricing["storage_price_hour"],
+                    "storage_price_hour_eur": pricing["storage_price_hour_eur"],
+                    "total_price_hour": pricing["total_price_hour"],
+                    "total_price_hour_eur": pricing["total_price_hour_eur"],
+                    "storage_size_label": pricing["storage_size_label"],
+                    "vcpus": entry["vcpus"],
+                    "memory": entry["memory"],
+                    "bandwidth": entry["bandwidth"],
+                }
+            )
+        return server_types
 
     def available_zones(self) -> list[dict[str, str]]:
         return [
