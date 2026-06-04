@@ -140,8 +140,8 @@ a:hover {
    ============================================================================ */
 
 .navbar {
-  background: var(--bg-lighter);
-  border-bottom: 1px solid var(--border-color);
+  background: var(--primary);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
   box-shadow: var(--shadow);
   position: sticky;
   top: 0;
@@ -166,8 +166,8 @@ a:hover {
 }
 
 .navbar-logo {
-  width: 56px;
-  height: 56px;
+  height: 80px;
+  width: auto;
 }
 
 .navbar-text {
@@ -178,13 +178,13 @@ a:hover {
 
 .site-title {
   font-size: 2.8rem;
-  color: var(--primary);
+  color: #fff;
   margin: 0;
 }
 
 .site-subtitle {
   font-size: 0.875rem;
-  color: var(--text-secondary);
+  color: rgba(255, 255, 255, 0.85);
   margin: 0;
 }
 
@@ -1298,8 +1298,8 @@ body[data-admin="1"] .stats-title {
   }
 
   .navbar-logo {
-    width: 48px;
-    height: 48px;
+    height: 64px;
+    width: auto;
   }
 
   h1 { font-size: 2rem; }
@@ -1363,8 +1363,8 @@ body[data-admin="1"] .stats-title {
   }
 
   .navbar-logo {
-    width: 40px;
-    height: 40px;
+    height: 52px;
+    width: auto;
   }
 
   .control-toggle {
