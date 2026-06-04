@@ -58,6 +58,22 @@ const longDateFormatter = new Intl.DateTimeFormat(scheduleLocale, {
   month: "long"
 });
 const defaultStatsMinutes = 60;
+
+// Firefox for Android gained native HLS (canPlayType -> "maybe") in v150, but it
+// is new, flaky, and — crucially — bypasses every recovery/failover hook this
+// player builds on hls.js events (satellite failover, stall watchdog, soft
+// reloads, live-edge sync). When hls.js (MSE) is available we route Firefox
+// through it instead, exactly like desktop Firefox, which is well tested.
+// Safari/iOS (incl. Firefox-iOS, which is WebKit) keep native HLS because
+// hls.js/MSE is unavailable there, so the guard below leaves them untouched.
+const isGeckoFirefox = /firefox\//i.test(navigator.userAgent || "");
+const hlsJsSupported = () => !!(window.Hls && window.Hls.isSupported());
+const canUseNativeHls = (el) => (
+  !!el
+  && !!el.canPlayType("application/vnd.apple.mpegurl")
+  && !(isGeckoFirefox && hlsJsSupported())
+);
+
 let hls = null;
 let started = false;
 let isLive = false;
@@ -360,7 +376,7 @@ const performSourceSwitch = (reason, updateSource) => {
     return;
   }
 
-  if (mediaEl && mediaEl.canPlayType("application/vnd.apple.mpegurl")) {
+  if (canUseNativeHls(mediaEl)) {
     mediaEl.addEventListener("loadedmetadata", () => {
       seekToNearLiveStart(mediaEl);
       continuePendingPlayback();
@@ -2376,7 +2392,7 @@ const startPlayerWithOptions = ({
     applyPendingAudioState();
   }
 
-  if (mediaEl && mediaEl.canPlayType("application/vnd.apple.mpegurl")) {
+  if (canUseNativeHls(mediaEl)) {
     mediaEl.src = activeHlsUrl;
     if (shouldPlay && forcePlay) {
       attemptPlay(mediaEl);
