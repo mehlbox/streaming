@@ -66,7 +66,7 @@ For example, keep the existing site in `/docker/streaming` and clone or copy the
 repository into `/docker/stream2`. In `/docker/stream2/.env`, change at least:
 
 ```dotenv
-STREAMING_HOST=stream2.bethaus-speyer.de
+STREAMING_HOST=stream2.example.com
 RTMP_PORT=1936
 SECRET_KEY=use-a-distinct-random-secret
 STREAM_KEY=use-a-distinct-obs-stream-key
@@ -75,9 +75,9 @@ STREAM_KEY=use-a-distinct-obs-stream-key
 If the second site uses satellites, also set:
 
 ```dotenv
-SATELLITE_BOOTSTRAP_ORIGIN_URL=https://stream2.bethaus-speyer.de
+SATELLITE_BOOTSTRAP_ORIGIN_URL=https://stream2.example.com
 SATELLITE_BOOTSTRAP_NAME_PREFIX=stream2-node
-SATELLITE_BOOTSTRAP_PUBLIC_URL_TEMPLATE=https://{name}.bethaus-speyer.de/hls
+SATELLITE_BOOTSTRAP_PUBLIC_URL_TEMPLATE=https://{name}.example.com/hls
 SATELLITE_API_KEY=use-a-distinct-satellite-secret
 SCW_SERVER_NAME_PREFIX=stream2-instance
 ```
@@ -93,7 +93,7 @@ docker compose up -d
 ```
 
 Publish OBS for the first site to port `1935` and the second site to port
-`1936`, for example `rtmp://stream2.bethaus-speyer.de:1936/live?key=...`.
+`1936`, for example `rtmp://stream2.example.com:1936/live?key=...`.
 
 The external `traefik` network remains shared intentionally. Satellite-profile
 instances must also use distinct `SATELLITE_PORT` values when they bind ports

@@ -12,7 +12,7 @@ write_files:
       #!/bin/sh
       set -eu
 
-      STREAMING_HOST="streaming.bethaus-speyer.de"
+      STREAMING_HOST="streaming.example.com"
       BOOTSTRAP_TOKEN="xgzsToeLFCLMhl5OzRJZcjrDjdQXV340s62Xkwuk_Kk"
       # Designed uplink (Mbps) for this instance type. The main app fills this in
       # per server so capacity sizing has a sane basis if the speedtest fails.
