@@ -1,133 +1,66 @@
 /* ============================================================================
-   THEME
+   THEME — single source of truth for the site's colors.
 
-   The single source of truth for the site's look. There is no theme selection —
-   the variables below on :root are the active theme. To change the look, edit
-   these values (or replace the whole block with one of the alternative palettes
-   provided, commented out, at the bottom of this file).
+   Loaded after style.css, so the :root below overrides style.css's built-in
+   defaults. These are the variables the stylesheet actually consumes
+   (--primary, --accent, --text-*, --bg-*, --border-color, --shadow*, glows).
+   To change the look, edit the values here. The previous default palette is
+   kept commented out at the bottom — swap the two blocks to revert.
+
+   Active: CDH-Stephanus (crimson), matching https://media.cdhserver.de/
+   Anchored on the brand crimson #b50e3c with burgundy darks and light-pink
+   surfaces. Note: this is a fixed light theme (overrides OS dark mode), like
+   the CDH site itself.
    ============================================================================ */
 
 :root {
-  --ink: #1f2937;
-  --wine: #3b82f6;
-  --wine-dark: #14213d;
-  --sand: #f5f3ef;
-  --mist: #f5f7fb;
-  --stone: #e2ecff;
-  --cloud: #ffffff;
-  --muted: #6b7280;
-  --stroke: #d9e2ec;
-  --glass: rgba(255, 255, 255, 0.88);
-  --shadow: 0 20px 40px rgba(12, 74, 110, 0.16);
-  --shadow-soft: 0 12px 30px rgba(12, 74, 110, 0.12);
-  --shadow-lg: 0 32px 80px rgba(12, 74, 110, 0.25);
-  --page-bg-top: #f5f7fb;
-  --page-bg-bottom: #f5f3ef;
-  --page-glow-1: rgba(59, 130, 246, 0.2);
-  --page-glow-2: rgba(34, 211, 238, 0.18);
-  --panel: rgba(255, 255, 255, 0.92);
-  --panel-strong: rgba(255, 255, 255, 0.97);
-  --panel-solid: #ffffff;
-  --switch-track: #d9e2ec;
-  --ghost-bg: rgba(255, 255, 255, 0.78);
-  --radius-lg: 24px;
-  --radius-md: 18px;
-  --radius-sm: 12px;
+  /* Brand / accents */
+  --primary:        #780a29;   /* deep burgundy — headers, dark UI        */
+  --primary-light:  #8d0b30;   /* mid burgundy                            */
+  --accent:         #b50e3c;   /* brand crimson — buttons, highlights     */
+  --accent-soft:    #f6e1e8;   /* light pink surface                      */
+
+  /* Text */
+  --text-primary:   #3c1a23;   /* dark burgundy body text                 */
+  --text-secondary: #82515f;   /* muted                                   */
+  --text-light:     #b58a98;   /* light muted                             */
+
+  /* Surfaces */
+  --bg-light:       #fdf3f6;   /* page background                         */
+  --bg-lighter:     #fffafb;   /* cards / raised surfaces                 */
+  --border-color:   #eecfd9;   /* hairlines                               */
+
+  /* Shadows (burgundy-tinted) */
+  --shadow:         0 2px 8px rgba(84, 7, 27, 0.10);
+  --shadow-md:      0 4px 16px rgba(84, 7, 27, 0.14);
+  --shadow-lg:      0 8px 24px rgba(181, 14, 60, 0.18);
+
+  /* Decorative background glows */
+  --page-glow-1:    rgba(181, 14, 60, 0.18);
+  --page-glow-2:    rgba(141, 11, 48, 0.15);
 }
 
 /* ============================================================================
-   ALTERNATIVE PALETTES
-
-   To switch the look, copy one of these blocks' contents over the :root block
-   above (or just swap the values you want to change).
+   DEFAULT PALETTE (previous look) — kept for easy revert, not deleted.
+   To restore it: comment out the :root above and uncomment the block below.
    ============================================================================ */
 
-/* --- stephanus (warm, light) ---
+/*
 :root {
-  --ink: #17130f;
-  --wine: #8b2b2e;
-  --wine-dark: #5f1a1c;
-  --sand: #f7f1e7;
-  --mist: #f2efe9;
-  --stone: #e6ddd0;
-  --cloud: #fcfbf8;
-  --muted: #6f6760;
-  --stroke: rgba(27, 19, 15, 0.12);
-  --glass: rgba(255, 255, 255, 0.82);
-  --shadow: 0 28px 60px rgba(25, 18, 14, 0.16);
-  --shadow-soft: 0 18px 36px rgba(25, 18, 14, 0.12);
-  --shadow-lg: 0 32px 80px rgba(25, 18, 14, 0.22);
-  --page-bg-top: #fbf7f0;
-  --page-bg-bottom: #efe5d6;
-  --page-glow-1: rgba(139, 43, 46, 0.18);
-  --page-glow-2: rgba(245, 210, 157, 0.25);
-  --panel: rgba(255, 255, 255, 0.86);
-  --panel-strong: rgba(255, 255, 255, 0.92);
-  --panel-solid: #ffffff;
-  --switch-track: #d9d1c7;
-  --ghost-bg: rgba(255, 255, 255, 0.7);
-  --radius-lg: 24px;
-  --radius-md: 18px;
-  --radius-sm: 12px;
-}
-*/
-
-/* --- ocean (teal, light) ---
-:root {
-  --ink: #0d1b24;
-  --wine: #1b8e7e;
-  --wine-dark: #0e5c52;
-  --sand: #ecf6f4;
-  --mist: #e6f0ee;
-  --stone: #d7e7e3;
-  --cloud: #f7fbfb;
-  --muted: #4d6a6a;
-  --stroke: rgba(13, 27, 36, 0.12);
-  --glass: rgba(255, 255, 255, 0.84);
-  --shadow: 0 28px 60px rgba(10, 30, 36, 0.16);
-  --shadow-soft: 0 18px 36px rgba(10, 30, 36, 0.12);
-  --shadow-lg: 0 32px 80px rgba(10, 30, 36, 0.22);
-  --page-bg-top: #f2fbfb;
-  --page-bg-bottom: #d8f1ed;
-  --page-glow-1: rgba(27, 142, 126, 0.18);
-  --page-glow-2: rgba(94, 211, 196, 0.2);
-  --panel: rgba(255, 255, 255, 0.88);
-  --panel-strong: rgba(255, 255, 255, 0.94);
-  --panel-solid: #ffffff;
-  --switch-track: #c9ddd8;
-  --ghost-bg: rgba(255, 255, 255, 0.7);
-  --radius-lg: 24px;
-  --radius-md: 18px;
-  --radius-sm: 12px;
-}
-*/
-
-/* --- midnight (dark) ---
-:root {
-  --ink: #e7edf2;
-  --wine: #57b8ff;
-  --wine-dark: #2d79a5;
-  --sand: #101821;
-  --mist: #121c27;
-  --stone: #1a2532;
-  --cloud: #16212e;
-  --muted: #a4b2c1;
-  --stroke: rgba(231, 237, 242, 0.12);
-  --glass: rgba(13, 19, 27, 0.74);
-  --shadow: 0 28px 60px rgba(3, 8, 12, 0.55);
-  --shadow-soft: 0 18px 36px rgba(3, 8, 12, 0.45);
-  --shadow-lg: 0 32px 80px rgba(3, 8, 12, 0.65);
-  --page-bg-top: #0a1118;
-  --page-bg-bottom: #121b26;
-  --page-glow-1: rgba(87, 184, 255, 0.2);
-  --page-glow-2: rgba(80, 255, 200, 0.12);
-  --panel: rgba(16, 24, 33, 0.9);
-  --panel-strong: rgba(20, 29, 39, 0.96);
-  --panel-solid: #101b26;
-  --switch-track: #2a3a4a;
-  --ghost-bg: rgba(17, 27, 38, 0.7);
-  --radius-lg: 24px;
-  --radius-md: 18px;
-  --radius-sm: 12px;
+  --primary:        #2c3e50;
+  --primary-light:  #34495e;
+  --accent:         #e74c3c;
+  --accent-soft:    #ecf0f1;
+  --text-primary:   #2c3e50;
+  --text-secondary: #7f8c8d;
+  --text-light:     #bdc3c7;
+  --bg-light:       #f8f9fa;
+  --bg-lighter:     #ffffff;
+  --border-color:   #e0e0e0;
+  --shadow:         0 2px 8px rgba(0, 0, 0, 0.1);
+  --shadow-md:      0 4px 16px rgba(0, 0, 0, 0.15);
+  --shadow-lg:      0 8px 24px rgba(0, 0, 0, 0.2);
+  --page-glow-1:    rgba(44, 62, 80, 0.12);
+  --page-glow-2:    rgba(231, 76, 60, 0.10);
 }
 */

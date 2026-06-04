@@ -88,6 +88,7 @@ FAVICON_URL = os.getenv("FAVICON_URL", "").strip()
 FAVICON_TYPE = get_env_default("FAVICON_TYPE", "image/svg+xml")
 FOOTER_URL = get_env_default("FOOTER_URL", "")
 FOOTER_TEXT = get_env_default("FOOTER_TEXT", "Your Footers Here")
+FOOTER_TAGLINE = get_env_default("FOOTER_TAGLINE", "Live-Stream")
 SCHEDULE_BASE_URL = get_env_default("SCHEDULE_BASE_URL", "")
 STREAMING_HOST = os.getenv("STREAMING_HOST", "").strip()
 SATELLITE_API_KEY = os.getenv("SATELLITE_API_KEY", "").strip()
@@ -286,6 +287,7 @@ def render_page_context(debug_enabled: bool) -> dict[str, object]:
         "debug_enabled": debug_enabled,
         "footer_url": FOOTER_URL,
         "footer_text": FOOTER_TEXT,
+        "footer_tagline": FOOTER_TAGLINE,
         "schedule_base_url": SCHEDULE_BASE_URL,
         "show_schedule": bool(SCHEDULE_BASE_URL),
         "scaleway_enabled": scaleway.feature_enabled(),
