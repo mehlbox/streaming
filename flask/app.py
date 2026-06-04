@@ -77,10 +77,8 @@ HLS_VIEWER_COOKIE_DOMAIN = os.getenv("HLS_VIEWER_COOKIE_DOMAIN", "").strip().lst
 AUDIO_STREAM_NAME = os.getenv("AUDIO_STREAM_NAME", "").strip()
 AUDIO_HLS_URL = os.getenv("AUDIO_HLS_URL", "").strip()
 AUDIO_ONLY = parse_bool(os.getenv("AUDIO_ONLY", ""))
-THEME = os.getenv("THEME", "ocean").strip().lower()
-SUPPORTED_THEMES = {"stephanus", "ocean", "midnight", "bethaus"}
-if THEME not in SUPPORTED_THEMES:
-    THEME = "ocean"
+# The site uses a single theme defined entirely in static/css/theme.css. There
+# is no theme selection — to change the look, edit the variables in that file.
 SITE_TITLE = get_env_default("SITE_TITLE", "docker streaming")
 SITE_SUBTITLE = get_env_default("SITE_SUBTITLE", "")
 PAGE_TITLE = get_env_default("PAGE_TITLE", f"Live Stream - {SITE_TITLE}")
@@ -277,7 +275,6 @@ def render_page_context(debug_enabled: bool) -> dict[str, object]:
         "hls_url": f"/hls/{STREAM_NAME}.m3u8",
         "audio_hls_url": audio_hls_url,
         "local_satellite_name": LOCAL_SATELLITE_NAME,
-        "theme": THEME,
         "site_title": SITE_TITLE,
         "site_subtitle": SITE_SUBTITLE,
         "page_title": PAGE_TITLE,
@@ -337,7 +334,7 @@ def require_admin() -> None:
 
 def render_admin_login(login_error: str, status_code: int = 200):
     context = render_page_context(False)
-    context["page_title"] = f"{PAGE_TITLE} Admin Login"
+    context["page_title"] = f"{context['page_title']} Admin Login"
     context["login_error"] = login_error
     return render_template("admin_login.html", **context), status_code
 
@@ -370,7 +367,7 @@ def admin_logout():
 
 def render_admin():
     context = render_page_context(True)
-    context["page_title"] = f"{PAGE_TITLE} Admin"
+    context["page_title"] = f"{context['page_title']} Admin"
     response = make_response(
         render_template(
             "admin.html",

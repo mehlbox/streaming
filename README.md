@@ -48,6 +48,13 @@ Click **Start Streaming** in OBS. The page will show **Online** once HLS segment
 - `AUDIO_HLS_URL` (optional: full URL to an audio-only HLS playlist; overrides `AUDIO_STREAM_NAME`)
 - `AUDIO_INPUT_URL` (optional: input URL for audio-only ffmpeg; defaults to the shared live HLS playlist file)
 
+## Theme
+
+The site uses a single theme defined in `flask/static/css/theme.css`. To change
+the look, edit the CSS variables in the `:root` block there (a few alternative
+palettes are included, commented out, to copy from). There is no theme setting in
+`.env` and no per-host selection.
+
 ## Multiple Compose instances
 
 Use a separate folder for each site. Compose derives the project name from the
