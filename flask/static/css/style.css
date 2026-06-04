@@ -1294,7 +1294,7 @@ body[data-admin="1"] .stats-title {
   }
 
   .site-title {
-    font-size: 1.25rem;
+    font-size: 2rem;
   }
 
   .navbar-logo {
@@ -1347,19 +1347,19 @@ body[data-admin="1"] .stats-title {
   }
 
   .site-title {
-    font-size: 1rem;
+    font-size: 1.6rem;
   }
 
   .site-subtitle {
     display: none;
   }
 
-  h1 { font-size: 1.5rem; }
-  h2 { font-size: 1.25rem; }
-  h3 { font-size: 1rem; }
+  h1 { font-size: 1.75rem; }
+  h2 { font-size: 1.4rem; }
+  h3 { font-size: 1.2rem; }
 
   .card-title {
-    font-size: 1rem;
+    font-size: 1.15rem;
   }
 
   .navbar-logo {
@@ -1372,7 +1372,7 @@ body[data-admin="1"] .stats-title {
   }
 
   .viewer-count {
-    font-size: 0.8rem;
+    font-size: 0.9rem;
     padding: 6px 12px;
   }
 }
