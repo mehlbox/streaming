@@ -127,7 +127,18 @@ services:
       - -c
       - |
         pip install --no-cache-dir -r requirements.txt &&
-        gunicorn --bind 0.0.0.0:5000 --workers 2 --threads 2 --timeout 60 --access-logfile - --error-logfile - app:app
+        gunicorn --bind 0.0.0.0:5000 \
+          --worker-class gevent \
+          --workers ${GUNICORN_WORKERS:-4} \
+          --worker-connections ${GUNICORN_WORKER_CONNECTIONS:-1000} \
+          --backlog 2048 \
+          --timeout 60 \
+          --graceful-timeout 30 \
+          --keep-alive 5 \
+          --max-requests 10000 \
+          --max-requests-jitter 1000 \
+          --access-logfile - --error-logfile - \
+          app:app
     healthcheck:
       test:
         - CMD
