@@ -86,11 +86,26 @@ LOGO_URL = get_env_default("LOGO_URL", "")
 LOGO_ALT = get_env_default("LOGO_ALT", "Your Logo Here")
 FAVICON_URL = os.getenv("FAVICON_URL", "").strip()
 FAVICON_TYPE = get_env_default("FAVICON_TYPE", "image/svg+xml")
+# Open Graph preview image for link unfurls (Telegram, WhatsApp, etc.). Must be a
+# raster format (PNG/JPEG) — SVG is not rendered by these services.
+OG_IMAGE_URL = os.getenv("OG_IMAGE_URL", "").strip()
 FOOTER_URL = get_env_default("FOOTER_URL", "")
 FOOTER_TEXT = get_env_default("FOOTER_TEXT", "Your Footers Here")
 FOOTER_TAGLINE = get_env_default("FOOTER_TAGLINE", "Live-Stream")
 SCHEDULE_BASE_URL = get_env_default("SCHEDULE_BASE_URL", "")
+# Selects which schedule-<name>.json file in SCHEDULE_BASE_URL is loaded. The
+# frontend reads this from the <html data-theme> attribute (app.js).
+SCHEDULE_NAME = get_env_default("SCHEDULE_NAME", "stephanus")
+# Local filesystem path of that same schedule file, used by the admin editor to
+# read and write entries. Defaults to the nginx-served data directory.
+SCHEDULE_FILE = get_env_default(
+    "SCHEDULE_FILE", f"/var/www/data/schedule-{SCHEDULE_NAME}.json"
+)
 STREAMING_HOST = os.getenv("STREAMING_HOST", "").strip()
+# External RTMP ingest port and application name (see nginx.conf `application`),
+# used to show the upload/ingest link in the admin area.
+RTMP_PORT = get_env_default("RTMP_PORT", "1935")
+RTMP_APP = get_env_default("RTMP_APP", "stream")
 SATELLITE_API_KEY = os.getenv("SATELLITE_API_KEY", "").strip()
 SATELLITE_BOOTSTRAP_TOKEN = os.getenv("SATELLITE_BOOTSTRAP_TOKEN", "").strip()
 ADMIN_TOKEN = (
@@ -283,12 +298,15 @@ def render_page_context(debug_enabled: bool) -> dict[str, object]:
         "logo_alt": LOGO_ALT,
         "favicon_url": favicon_url,
         "favicon_type": FAVICON_TYPE,
+        "og_image_url": OG_IMAGE_URL,
+        "og_url": request_external_base_url(),
         "audio_only": AUDIO_ONLY,
         "debug_enabled": debug_enabled,
         "footer_url": FOOTER_URL,
         "footer_text": FOOTER_TEXT,
         "footer_tagline": FOOTER_TAGLINE,
         "schedule_base_url": SCHEDULE_BASE_URL,
+        "schedule_name": SCHEDULE_NAME,
         "show_schedule": bool(SCHEDULE_BASE_URL),
         "scaleway_enabled": scaleway.feature_enabled(),
         "scaleway_default_zone": scaleway.config.default_zone,
@@ -370,6 +388,13 @@ def admin_logout():
 def render_admin():
     context = render_page_context(True)
     context["page_title"] = f"{context['page_title']} Admin"
+    # Encoder config: Server = the app URL with the auth key as a query string,
+    # Stream Key = the stream name ("live").
+    rtmp_server = f"rtmp://{STREAMING_HOST}:{RTMP_PORT}/{RTMP_APP}" if STREAMING_HOST else ""
+    context["rtmp_url"] = (
+        f"{rtmp_server}?key={STREAM_KEY}" if rtmp_server and STREAM_KEY else rtmp_server
+    )
+    context["rtmp_stream_key"] = STREAM_NAME
     response = make_response(
         render_template(
             "admin.html",
@@ -2133,6 +2158,72 @@ def scaleway_server_delete_route(server_id: str):
     except ScalewayAPIError as exc:
         abort(exc.status_code, exc.message)
     return jsonify(payload)
+
+
+_SCHEDULE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_SCHEDULE_TIME_RE = re.compile(r"^\d{2}:\d{2}$")
+
+
+def load_schedule_entries() -> list[dict]:
+    try:
+        with open(SCHEDULE_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return []
+    except (OSError, json.JSONDecodeError):
+        abort(500, "Schedule file could not be read")
+    return data if isinstance(data, list) else []
+
+
+def validate_schedule_payload(entries) -> list[dict]:
+    if not isinstance(entries, list):
+        abort(400, "Expected a list of schedule entries")
+    cleaned: list[dict] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            abort(400, f"Entry {index + 1} is not an object")
+        date = str(entry.get("date", "")).strip()
+        start = str(entry.get("startTime", "")).strip()
+        end = str(entry.get("endTime", "")).strip()
+        title = str(entry.get("title", "")).strip()
+        if not _SCHEDULE_DATE_RE.match(date):
+            abort(400, f"Entry {index + 1}: date must be YYYY-MM-DD")
+        if not _SCHEDULE_TIME_RE.match(start) or not _SCHEDULE_TIME_RE.match(end):
+            abort(400, f"Entry {index + 1}: times must be HH:MM")
+        if not title:
+            abort(400, f"Entry {index + 1}: title is required")
+        cleaned.append(
+            {"date": date, "startTime": start, "endTime": end, "title": title}
+        )
+    cleaned.sort(key=lambda item: (item["date"], item["startTime"]))
+    return cleaned
+
+
+@app.get("/api/schedule")
+def schedule_get():
+    require_admin()
+    return jsonify({"entries": load_schedule_entries(), "name": SCHEDULE_NAME})
+
+
+@app.post("/api/schedule")
+def schedule_save():
+    require_admin()
+    payload = request.get_json(silent=True)
+    if payload is None:
+        abort(400, "Invalid JSON body")
+    entries = payload.get("entries") if isinstance(payload, dict) else payload
+    cleaned = validate_schedule_payload(entries)
+    target = Path(SCHEDULE_FILE)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(cleaned, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(tmp, target)
+    except OSError as exc:
+        abort(500, f"Schedule file could not be written: {exc}")
+    return jsonify({"entries": cleaned})
 
 
 @app.get("/api/satellite/bootstrap.sh")

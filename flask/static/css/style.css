@@ -317,6 +317,10 @@ body[data-admin="1"] .main-content {
 .offline-box {
   text-align: center;
   color: white;
+  max-width: 100%;
+  padding: var(--spacing-lg);
+  box-sizing: border-box;
+  overflow-wrap: break-word;
 }
 
 .offline-icon {
@@ -1184,6 +1188,131 @@ body[data-admin="1"] .stats-title {
   transform: translateY(-1px);
 }
 
+.schedule-admin-list {
+  list-style: none;
+  margin: 0 0 var(--spacing-md);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+}
+
+.schedule-admin-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-md);
+  flex-wrap: wrap;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-light);
+}
+
+.schedule-admin-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.schedule-admin-title {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.schedule-admin-meta {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.schedule-admin-actions {
+  display: flex;
+  gap: var(--spacing-sm);
+  flex-shrink: 0;
+}
+
+.schedule-form {
+  margin-top: var(--spacing-md);
+  padding: var(--spacing-md);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-light);
+}
+
+.schedule-form.hidden {
+  display: none;
+}
+
+.schedule-form-title {
+  margin: 0 0 var(--spacing-sm);
+  font-size: 1.05rem;
+}
+
+.schedule-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: var(--spacing-sm);
+  margin-bottom: var(--spacing-md);
+}
+
+.schedule-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.schedule-field-wide {
+  grid-column: 1 / -1;
+}
+
+.schedule-field input {
+  min-height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-card, #fff);
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.ingest-field {
+  margin-bottom: var(--spacing-md);
+}
+
+.ingest-field label {
+  display: block;
+  margin-bottom: 0.35rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.ingest-row {
+  display: flex;
+  gap: var(--spacing-sm);
+  flex-wrap: wrap;
+}
+
+.ingest-row input {
+  flex: 1 1 240px;
+  min-width: 0;
+  min-height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-card, #fff);
+  color: var(--text-primary);
+  font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.ingest-row .scw-button {
+  flex: 0 0 auto;
+}
+
 /* ============================================================================
    FOOTER
    ============================================================================ */
@@ -1357,6 +1486,20 @@ body[data-admin="1"] .stats-title {
   h1 { font-size: 1.75rem; }
   h2 { font-size: 1.4rem; }
   h3 { font-size: 1.2rem; }
+
+  .offline-icon {
+    width: 48px;
+    height: 48px;
+    margin-bottom: var(--spacing-md);
+  }
+
+  .offline-box h2 {
+    font-size: 1.35rem;
+  }
+
+  .offline-box p {
+    font-size: 0.9rem;
+  }
 
   .card-title {
     font-size: 1.15rem;

@@ -1045,10 +1045,10 @@ window.addEventListener("pagehide", (event) => {
   postClientLog("pagehide", { persisted: !!event?.persisted });
 });
 
-const toDate = (entry) => {
-  if (!entry?.date || !entry?.time) return null;
-  const [year, month, day] = String(entry.date).split("-").map(Number);
-  const [hour, minute] = String(entry.time).split(":").map(Number);
+const toDate = (dateStr, timeStr) => {
+  if (!dateStr || !timeStr) return null;
+  const [year, month, day] = String(dateStr).split("-").map(Number);
+  const [hour, minute] = String(timeStr).split(":").map(Number);
   if (!year || !month || !day || Number.isNaN(hour) || Number.isNaN(minute)) {
     return null;
   }
@@ -1066,11 +1066,11 @@ const isSameDay = (a, b) => (
 const normalizeSchedule = (entries) => (
   (Array.isArray(entries) ? entries : [])
     .map((entry) => {
-      const start = toDate(entry);
+      const start = toDate(entry.date, entry.startTime);
       if (!start) return null;
-      const duration = Number.isFinite(entry.durationMinutes) ? entry.durationMinutes : 90;
-      const end = new Date(start.getTime() + duration * 60000);
-      return { ...entry, start, end, durationMinutes: duration };
+      let end = toDate(entry.date, entry.endTime);
+      if (!end || end <= start) end = new Date(start.getTime() + 90 * 60000);
+      return { ...entry, start, end };
     })
     .filter(Boolean)
     .sort((a, b) => a.start - b.start)
@@ -1115,7 +1115,7 @@ const renderSchedule = (visibleEntries, now = new Date()) => {
     const timeEl = document.createElement("div");
     timeEl.className = "schedule-time";
     const weekday = weekdayFormatter.format(entry.start);
-    timeEl.textContent = `${weekday} · ${timeFormatter.format(entry.start)} Uhr`;
+    timeEl.textContent = `${weekday} · ${timeFormatter.format(entry.start)} – ${timeFormatter.format(entry.end)} Uhr`;
 
     const tagEl = document.createElement("div");
     tagEl.className = "schedule-tag";
@@ -1123,14 +1123,215 @@ const renderSchedule = (visibleEntries, now = new Date()) => {
       tagEl.textContent = "Jetzt geplant";
     } else if (isSameDay(now, entry.start)) {
       tagEl.textContent = "Heute";
-    } else {
-      tagEl.textContent = "Termin";
     }
 
-    metaEl.append(titleEl, timeEl, tagEl);
+    metaEl.append(titleEl, timeEl);
+    if (tagEl.textContent) metaEl.append(tagEl);
     item.append(dateEl, metaEl);
     scheduleEl.appendChild(item);
   });
+};
+
+const scheduleListEl = document.getElementById("schedule-list");
+const scheduleAddBtn = document.getElementById("schedule-add");
+const scheduleEditorStatus = document.getElementById("schedule-status");
+const scheduleFormEl = document.getElementById("schedule-form");
+const scheduleFormTitleEl = document.getElementById("schedule-form-title");
+const scheduleCancelBtn = document.getElementById("schedule-cancel");
+
+let scheduleEntries = [];
+let scheduleEditIndex = null; // null = no form open; -1 = adding; >=0 = editing that index
+
+const setScheduleEditorStatus = (message) => {
+  if (scheduleEditorStatus) scheduleEditorStatus.textContent = message;
+};
+
+const formatScheduleEntryDate = (entry) => {
+  const date = toDate(entry.date, entry.startTime || "00:00");
+  return date ? longDateFormatter.format(date) : entry.date;
+};
+
+const renderScheduleList = () => {
+  if (!scheduleListEl) return;
+  scheduleListEl.innerHTML = "";
+  if (!scheduleEntries.length) {
+    const empty = document.createElement("li");
+    empty.className = "empty-state";
+    empty.textContent = "Noch keine Termine. Mit „Termin hinzufügen“ starten.";
+    scheduleListEl.appendChild(empty);
+    return;
+  }
+  scheduleEntries.forEach((entry, index) => {
+    const item = document.createElement("li");
+    item.className = "schedule-admin-item";
+
+    const info = document.createElement("div");
+    info.className = "schedule-admin-info";
+    const titleEl = document.createElement("span");
+    titleEl.className = "schedule-admin-title";
+    titleEl.textContent = entry.title;
+    const metaEl = document.createElement("span");
+    metaEl.className = "schedule-admin-meta";
+    metaEl.textContent = `${formatScheduleEntryDate(entry)} · ${entry.startTime}–${entry.endTime} Uhr`;
+    info.append(titleEl, metaEl);
+
+    const actions = document.createElement("div");
+    actions.className = "schedule-admin-actions";
+    const editBtn = document.createElement("button");
+    editBtn.type = "button";
+    editBtn.className = "scw-button scw-button-secondary";
+    editBtn.textContent = "Bearbeiten";
+    editBtn.addEventListener("click", () => openScheduleForm(index));
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "scw-inline-button";
+    removeBtn.textContent = "Entfernen";
+    removeBtn.addEventListener("click", () => removeScheduleEntry(index));
+    actions.append(editBtn, removeBtn);
+
+    item.append(info, actions);
+    scheduleListEl.appendChild(item);
+  });
+};
+
+const openScheduleForm = (index) => {
+  if (!scheduleFormEl) return;
+  scheduleEditIndex = index;
+  const entry = index >= 0 ? scheduleEntries[index] : { date: "", startTime: "", endTime: "", title: "" };
+  scheduleFormEl.elements.date.value = entry.date || "";
+  scheduleFormEl.elements.startTime.value = entry.startTime || "";
+  scheduleFormEl.elements.endTime.value = entry.endTime || "";
+  scheduleFormEl.elements.title.value = entry.title || "";
+  if (scheduleFormTitleEl) scheduleFormTitleEl.textContent = index >= 0 ? "Termin bearbeiten" : "Termin hinzufügen";
+  scheduleFormEl.classList.remove("hidden");
+  scheduleFormEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  scheduleFormEl.elements.title.focus();
+};
+
+const closeScheduleForm = () => {
+  scheduleEditIndex = null;
+  if (scheduleFormEl) scheduleFormEl.classList.add("hidden");
+};
+
+const persistScheduleEntries = async () => {
+  const response = await fetch("/api/schedule", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    cache: "no-store",
+    body: JSON.stringify({ entries: scheduleEntries }),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || `HTTP ${response.status}`);
+  }
+  const data = await response.json();
+  scheduleEntries = data.entries || [];
+  renderScheduleList();
+};
+
+const removeScheduleEntry = async (index) => {
+  const removed = scheduleEntries[index];
+  const previous = scheduleEntries.slice();
+  scheduleEntries.splice(index, 1);
+  renderScheduleList();
+  setScheduleEditorStatus("Speichern …");
+  try {
+    await persistScheduleEntries();
+    setScheduleEditorStatus(`„${removed?.title || "Termin"}“ entfernt.`);
+  } catch (error) {
+    scheduleEntries = previous;
+    renderScheduleList();
+    setScheduleEditorStatus(`Fehler beim Entfernen: ${error.message}`);
+  }
+};
+
+const submitScheduleForm = async (event) => {
+  event.preventDefault();
+  if (!scheduleFormEl) return;
+  const entry = {
+    date: scheduleFormEl.elements.date.value.trim(),
+    startTime: scheduleFormEl.elements.startTime.value.trim(),
+    endTime: scheduleFormEl.elements.endTime.value.trim(),
+    title: scheduleFormEl.elements.title.value.trim(),
+  };
+  if (!entry.date || !entry.startTime || !entry.endTime || !entry.title) {
+    setScheduleEditorStatus("Bitte Datum, Beginn, Ende und Titel ausfüllen.");
+    return;
+  }
+  if (entry.endTime <= entry.startTime) {
+    setScheduleEditorStatus("Ende muss nach dem Beginn liegen.");
+    return;
+  }
+  const previous = scheduleEntries.slice();
+  if (scheduleEditIndex >= 0) {
+    scheduleEntries[scheduleEditIndex] = entry;
+  } else {
+    scheduleEntries.push(entry);
+  }
+  setScheduleEditorStatus("Speichern …");
+  try {
+    await persistScheduleEntries();
+    closeScheduleForm();
+    setScheduleEditorStatus(`Gespeichert: ${scheduleEntries.length} Termine.`);
+  } catch (error) {
+    scheduleEntries = previous;
+    renderScheduleList();
+    setScheduleEditorStatus(`Fehler beim Speichern: ${error.message}`);
+  }
+};
+
+const initIngestPanel = () => {
+  const statusEl = document.getElementById("ingest-status");
+  const setStatus = (message) => { if (statusEl) statusEl.textContent = message; };
+  document.querySelectorAll(".ingest-reveal").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const input = document.getElementById(btn.dataset.revealTarget);
+      if (!input) return;
+      const hidden = input.type === "password";
+      input.type = hidden ? "text" : "password";
+      btn.textContent = hidden ? "Verbergen" : "Anzeigen";
+    });
+  });
+  document.querySelectorAll(".ingest-copy").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const input = document.getElementById(btn.dataset.copyTarget);
+      if (!input) return;
+      const value = input.value;
+      try {
+        if (navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(value);
+        } else {
+          const wasPassword = input.type === "password";
+          if (wasPassword) input.type = "text";
+          input.focus();
+          input.select();
+          document.execCommand("copy");
+          input.setSelectionRange(0, 0);
+          if (wasPassword) input.type = "password";
+        }
+        setStatus("In die Zwischenablage kopiert.");
+      } catch (error) {
+        setStatus(`Kopieren fehlgeschlagen: ${error.message}`);
+      }
+    });
+  });
+};
+
+const initScheduleEditor = async () => {
+  if (!scheduleListEl) return;
+  if (scheduleAddBtn) scheduleAddBtn.addEventListener("click", () => openScheduleForm(-1));
+  if (scheduleCancelBtn) scheduleCancelBtn.addEventListener("click", closeScheduleForm);
+  if (scheduleFormEl) scheduleFormEl.addEventListener("submit", submitScheduleForm);
+  try {
+    const response = await fetch("/api/schedule", { cache: "no-store" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    scheduleEntries = data.entries || [];
+    renderScheduleList();
+    setScheduleEditorStatus(`${scheduleEntries.length} Termine geladen.`);
+  } catch (error) {
+    setScheduleEditorStatus(`Termine konnten nicht geladen werden: ${error.message}`);
+  }
 };
 
 const updateOfflineMessage = () => {
@@ -1794,6 +1995,9 @@ setInterval(() => {
 if (!adminMode) {
   loadSchedule();
   setInterval(refreshScheduleUI, 60000);
+} else {
+  initScheduleEditor();
+  initIngestPanel();
 }
 if (debugEnabled) {
   if (statsSection) statsSection.classList.remove("hidden");

@@ -62,6 +62,33 @@
       </div>
     </section>
 
+    {% if rtmp_url %}
+    <section class="satellites-section" id="ingest-section">
+      <div class="container">
+        <h2 class="section-title">Streaming-Upload</h2>
+        <div class="scw-card">
+          <p class="scw-meta">Diese Werte im Encoder (OBS o. Ä.) eintragen, um den Stream zu senden.</p>
+          <div class="ingest-field">
+            <label for="ingest-url">Server / URL</label>
+            <div class="ingest-row">
+              <input id="ingest-url" type="password" readonly value="{{ rtmp_url }}">
+              <button type="button" class="scw-button scw-button-secondary ingest-reveal" data-reveal-target="ingest-url">Anzeigen</button>
+              <button type="button" class="scw-button scw-button-secondary ingest-copy" data-copy-target="ingest-url">Kopieren</button>
+            </div>
+          </div>
+          <div class="ingest-field">
+            <label for="ingest-key">Streamschlüssel</label>
+            <div class="ingest-row">
+              <input id="ingest-key" type="text" readonly value="{{ rtmp_stream_key }}">
+              <button type="button" class="scw-button scw-button-secondary ingest-copy" data-copy-target="ingest-key">Kopieren</button>
+            </div>
+          </div>
+          <p id="ingest-status" class="scw-status" role="status"></p>
+        </div>
+      </div>
+    </section>
+    {% endif %}
+
     <section class="stats-section" id="stats-section">
       <div class="container">
         <div class="stats-card">
@@ -94,6 +121,47 @@
             <canvas id="stats-canvas" width="600" height="220" aria-label="User-Visit Balkendiagramm"></canvas>
             <p id="stats-empty" class="stats-empty" hidden>Noch keine Daten verfügbar.</p>
           </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="satellites-section" id="schedule-section">
+      <div class="container">
+        <h2 class="section-title">Programm</h2>
+        <div class="scw-card">
+          <ul id="schedule-list" class="schedule-admin-list">
+            <li class="empty-state">Termine werden geladen …</li>
+          </ul>
+          <div class="scw-actions">
+            <button id="schedule-add" type="button" class="scw-button">Termin hinzufügen</button>
+          </div>
+          <p id="schedule-status" class="scw-status">Termine werden geladen …</p>
+
+          <form id="schedule-form" class="schedule-form hidden">
+            <h3 id="schedule-form-title" class="schedule-form-title">Termin bearbeiten</h3>
+            <div class="schedule-form-grid">
+              <label class="schedule-field">
+                <span>Datum</span>
+                <input type="date" name="date" required>
+              </label>
+              <label class="schedule-field">
+                <span>Beginn</span>
+                <input type="time" name="startTime" required>
+              </label>
+              <label class="schedule-field">
+                <span>Ende</span>
+                <input type="time" name="endTime" required>
+              </label>
+              <label class="schedule-field schedule-field-wide">
+                <span>Titel</span>
+                <input type="text" name="title" placeholder="z. B. Eröffnungsgottesdienst" required>
+              </label>
+            </div>
+            <div class="scw-actions">
+              <button type="submit" class="scw-button">Übernehmen</button>
+              <button type="button" id="schedule-cancel" class="scw-button scw-button-secondary">Abbrechen</button>
+            </div>
+          </form>
         </div>
       </div>
     </section>
@@ -223,6 +291,7 @@
         </div>
       </div>
     </section>
+
   </main>
 
   <footer class="footer">
