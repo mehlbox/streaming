@@ -396,9 +396,9 @@ class ScalewayConfig:
                 return default
 
         try:
-            server_limit = max(1, min(10, int(os.getenv("SCW_SERVER_LIMIT", "10"))))
+            server_limit = max(1, min(100, int(os.getenv("SCW_SERVER_LIMIT", "100"))))
         except ValueError:
-            server_limit = 10
+            server_limit = 100
         local_storage_types = local_storage_server_type_catalog()
         default_commercial_type = env_default(
             "SCW_DEFAULT_COMMERCIAL_TYPE",

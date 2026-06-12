@@ -107,6 +107,11 @@ const mainSoftRecoveryMaxAttempts = 4;
 const mainSoftRecoveryWindowMs = 30000;
 const satelliteStallFailoverMs = 10000;
 const satelliteStartupSwitchTimeoutMs = 10000;
+// Conservative debounce so a single transient request failure (one timeout, one
+// cache-timing 404) does not tear the player down and switch nodes. A genuinely
+// failing node produces several failures fast and still trips this quickly.
+const satelliteFailoverFailureThreshold = 2;
+const satelliteFailoverFailureWindowMs = 6000;
 const playbackProgressEpsilonSeconds = 0.12;
 const playbackProgressGraceMs = 15000;
 const statusPollIntervalMs = 10000;
@@ -150,6 +155,8 @@ let satelliteSwitchPromise = null;
 let satelliteStartupSwitchTimer = null;
 let satelliteStartupSwitchTargetUrl = null;
 let satelliteAssignmentRequestToken = 0;
+let satelliteRequestFailureCount = 0;
+let satelliteRequestFailureWindowStart = 0;
 let pendingPlaybackRequest = {
   shouldPlay: true,
   immediate: false,
@@ -2609,14 +2616,16 @@ const startPlayerWithOptions = ({
   }
 
   if (window.Hls && Hls.isSupported()) {
-    // Satellites keep zero in-place retries: their failover (xhrSetup first-error
-    // + 10s stall watchdog) is the single, fast recovery authority. The main
-    // server has no failover target, so a few short retries let transient network
-    // blips self-heal instead of destroying the player and flashing Offline.
+    // Satellites get a single fast in-place retry so one transient blip self-heals
+    // instead of immediately switching nodes (which tears the player down and
+    // resumes at the new node's live edge). The xhrSetup failover is debounced to
+    // match (see satelliteFailoverFailureThreshold); the 10s stall watchdog and the
+    // hls.js ERROR handler remain the authorities for a genuinely failed node. The
+    // main server has no failover target, so it keeps a few more soft retries.
     const manifestRetries = satelliteAssigned ? 0 : 2;
-    const segmentRetries = satelliteAssigned ? 0 : 3;
-    const retryDelayMs = satelliteAssigned ? 0 : 500;
-    const maxRetryDelayMs = satelliteAssigned ? 0 : 2000;
+    const segmentRetries = satelliteAssigned ? 1 : 3;
+    const retryDelayMs = 500;
+    const maxRetryDelayMs = satelliteAssigned ? 1000 : 2000;
     hls = new Hls({
       liveSyncDurationCount: 6,
       liveMaxLatencyDurationCount: 12,
@@ -2704,6 +2713,19 @@ const startPlayerWithOptions = ({
         const failover = (reason) => {
           if (failoverTriggered) return;
           failoverTriggered = true;
+          const now = Date.now();
+          if (now - satelliteRequestFailureWindowStart > satelliteFailoverFailureWindowMs) {
+            satelliteRequestFailureWindowStart = now;
+            satelliteRequestFailureCount = 0;
+          }
+          satelliteRequestFailureCount += 1;
+          // Tolerate the first failure in the window: the single hls.js retry above
+          // recovers a transient blip without a node switch. A real outage produces
+          // a second failure fast and falls through to the switch below.
+          if (satelliteRequestFailureCount < satelliteFailoverFailureThreshold) {
+            return;
+          }
+          satelliteRequestFailureCount = 0;
           triggerSatelliteRequestFailover(reason, requestUrl, failedSatelliteUrl, {
             status: xhr.status || 0,
             readyState: xhr.readyState

@@ -233,6 +233,16 @@ print(max(0.0, value))
 PY
 )"
 
+  # The speedtest proved too unreliable as a capacity basis, so prefer the
+  # instance's booked (designed) uplink whenever it is known. fallback_capacity()
+  # applies the same margin math to the designed bandwidth. The speedtest only
+  # sizes capacity on manual installs where the designed uplink is unknown (0).
+  if [ "$(python3 -c 'import sys; print(1 if float(sys.argv[1]) > 0 else 0)' "$SATELLITE_DESIGNED_BANDWIDTH_MBPS")" = "1" ]; then
+    SATELLITE_MAX_VIEWERS="$(fallback_capacity)"
+    echo "Capacity from booked uplink ${SATELLITE_DESIGNED_BANDWIDTH_MBPS} Mbps: $SATELLITE_MAX_VIEWERS viewers" >&2
+    return
+  fi
+
   speedtest_script="$(download_speedtest_cli || true)"
   if [ -z "${speedtest_script:-}" ]; then
     SATELLITE_MAX_VIEWERS="$(fallback_capacity)"

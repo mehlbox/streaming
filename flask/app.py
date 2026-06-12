@@ -1631,8 +1631,18 @@ def satellite_score(row: sqlite3.Row) -> float:
     capacity = int(row["capacity_max_viewers"])
     viewers = int(row["viewer_count"])
     cpu = float(row["cpu_percent"])
-    headroom = max(0, capacity - viewers)
-    return headroom * (1 - min(cpu, 100.0) / 100.0)
+    cpu_factor = 1 - min(cpu, 100.0) / 100.0
+    headroom = capacity - viewers
+    if headroom > 0:
+        # Normal case: weight by spare capacity (unchanged behaviour).
+        return headroom * cpu_factor
+    # At/over capacity: never hard-cap. Keep every healthy node eligible with a
+    # small, strictly-positive overflow weight so viewers keep spreading across
+    # the existing nodes instead of falling back to the main server. The weight
+    # stays < 1 (so any node with real headroom is always preferred), favours the
+    # relatively least-loaded node (more capacity per current viewer), and shrinks
+    # as a node goes further over capacity, so overflow distributes evenly.
+    return (capacity / (viewers + 1)) * cpu_factor
 
 
 def select_weighted_satellite(
