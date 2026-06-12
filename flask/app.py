@@ -92,6 +92,21 @@ OG_IMAGE_URL = os.getenv("OG_IMAGE_URL", "").strip()
 FOOTER_URL = get_env_default("FOOTER_URL", "")
 FOOTER_TEXT = get_env_default("FOOTER_TEXT", "Your Footers Here")
 FOOTER_TAGLINE = get_env_default("FOOTER_TAGLINE", "Live-Stream")
+# Optional link to a recorded audio version of the current event. Shown as a card
+# on the start page when set. The token-bearing URL can be swapped per event.
+AUDIO_RECORDING_URL = get_env_default("AUDIO_RECORDING_URL", "")
+AUDIO_RECORDING_TEXT = get_env_default(
+    "AUDIO_RECORDING_TEXT", "Audioaufzeichnung dieser Veranstaltung"
+)
+# Optional link to the organisation's website. Shown as a card on the start page
+# when set.
+ORGANISATION_URL = get_env_default("ORGANISATION_URL", "")
+ORGANISATION_TEXT = get_env_default(
+    "ORGANISATION_TEXT", "Zur Website der Organisation"
+)
+# Optional donation link, shown alongside the other links on the start page.
+DONATION_URL = get_env_default("DONATION_URL", "")
+DONATION_TEXT = get_env_default("DONATION_TEXT", "Jetzt spenden")
 SCHEDULE_BASE_URL = get_env_default("SCHEDULE_BASE_URL", "")
 # Selects which schedule-<name>.json file in SCHEDULE_BASE_URL is loaded. The
 # frontend reads this from the <html data-theme> attribute (app.js).
@@ -300,6 +315,12 @@ def render_page_context(debug_enabled: bool) -> dict[str, object]:
         "footer_url": FOOTER_URL,
         "footer_text": FOOTER_TEXT,
         "footer_tagline": FOOTER_TAGLINE,
+        "audio_recording_url": AUDIO_RECORDING_URL,
+        "audio_recording_text": AUDIO_RECORDING_TEXT,
+        "organisation_url": ORGANISATION_URL,
+        "organisation_text": ORGANISATION_TEXT,
+        "donation_url": DONATION_URL,
+        "donation_text": DONATION_TEXT,
         "schedule_base_url": SCHEDULE_BASE_URL,
         "schedule_name": SCHEDULE_NAME,
         "show_schedule": bool(SCHEDULE_BASE_URL),

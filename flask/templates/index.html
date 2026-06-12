@@ -137,6 +137,54 @@
             </ul>
           </div>
 
+          <!-- Links Card -->
+          {% if audio_recording_url or organisation_url or donation_url %}
+          <div class="info-card card-secondary">
+            <div class="card-header">
+              <h2 class="card-title">
+                <svg class="card-icon-inline" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 0 0-5.656 0l-4 4a4 4 0 1 0 5.656 5.656l1.102-1.101M10.172 13.828a4 4 0 0 0 5.656 0l4-4a4 4 0 1 0-5.656-5.656l-1.1 1.1" />
+                </svg>
+                Links
+              </h2>
+            </div>
+            <div class="link-list">
+              {% if audio_recording_url %}
+              <a href="{{ audio_recording_url }}" target="_blank" rel="noopener noreferrer" class="recording-link" aria-label="{{ audio_recording_text }}">
+                <span class="recording-speaker" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M4 9v6h4l5 4V5L8 9H4zm11.5 3a4.5 4.5 0 0 0-2.25-3.9v7.8A4.5 4.5 0 0 0 15.5 12zm0-7a9.5 9.5 0 0 1 0 14v-2a7.5 7.5 0 0 0 0-10V5z"/>
+                  </svg>
+                </span>
+                <span class="recording-text">{{ audio_recording_text }}</span>
+              </a>
+              {% endif %}
+              {% if organisation_url %}
+              <a href="{{ organisation_url }}" target="_blank" rel="noopener noreferrer" class="recording-link" aria-label="{{ organisation_text }}">
+                <span class="recording-speaker" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <line x1="2" y1="12" x2="22" y2="12"></line>
+                    <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+                  </svg>
+                </span>
+                <span class="recording-text">{{ organisation_text }}</span>
+              </a>
+              {% endif %}
+              {% if donation_url %}
+              <a href="{{ donation_url }}" target="_blank" rel="noopener noreferrer" class="recording-link" aria-label="{{ donation_text }}">
+                <span class="recording-speaker" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
+                  </svg>
+                </span>
+                <span class="recording-text">{{ donation_text }}</span>
+              </a>
+              {% endif %}
+            </div>
+          </div>
+          {% endif %}
+
           <!-- Schedule Card -->
           {% if show_schedule %}
           <div id="schedule-card" class="info-card card-secondary hidden">

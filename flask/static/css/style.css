@@ -765,6 +765,48 @@ body[data-admin="1"] .main-content {
   text-align: center;
 }
 
+.link-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-md);
+}
+
+.recording-link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  color: var(--accent);
+  font-weight: 600;
+  transition: color var(--transition-normal);
+}
+
+.recording-speaker {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.75rem;
+  height: 2.75rem;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--accent);
+  color: white;
+  transition: background var(--transition-normal), transform var(--transition-normal);
+}
+
+.recording-speaker svg {
+  width: 1.4rem;
+  height: 1.4rem;
+}
+
+.recording-link:hover .recording-speaker {
+  background: var(--accent-soft);
+  transform: scale(1.06);
+}
+
+.recording-link:hover .recording-text {
+  text-decoration: underline;
+}
+
 /* ============================================================================
    DEBUG PANEL
    ============================================================================ */
