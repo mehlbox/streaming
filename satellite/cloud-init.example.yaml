@@ -15,7 +15,7 @@ write_files:
       STREAMING_HOST="streaming.example.com"
       BOOTSTRAP_TOKEN="xgzsToeLFCLMhl5OzRJZcjrDjdQXV340s62Xkwuk_Kk"
       # Designed uplink (Mbps) for this instance type. The main app fills this in
-      # per server so capacity sizing has a sane basis if the speedtest fails.
+      # per server so capacity sizing has a sane basis.
       SATELLITE_DESIGNED_BANDWIDTH_MBPS="0"
       export SATELLITE_DESIGNED_BANDWIDTH_MBPS
 

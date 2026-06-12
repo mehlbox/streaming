@@ -8,7 +8,6 @@ Env vars:
   SATELLITE_NAME           Human-readable name for this satellite
   SATELLITE_PUBLIC_URL     Public HLS base URL viewers will connect to
   SATELLITE_MAX_VIEWERS    Max viewer capacity (default 200)
-  SATELLITE_SPEEDTEST_UPLOAD_MBPS  Average bootstrap upload speed test result
   HEARTBEAT_INTERVAL       Seconds between heartbeats (overridden by server)
   NGINX_STATUS_URL         Local nginx stub_status URL (default http://127.0.0.1:80/nginx-status)
   HLS_ACCESS_LOG           Path to nginx HLS access log (IP + msec format); if set, used instead of stub_status
@@ -41,7 +40,6 @@ API_KEY = os.environ.get("SATELLITE_API_KEY", "")
 SATELLITE_NAME = os.environ.get("SATELLITE_NAME", "satellite-1")
 SATELLITE_PUBLIC_URL = os.environ.get("SATELLITE_PUBLIC_URL", "")
 MAX_VIEWERS = int(os.environ.get("SATELLITE_MAX_VIEWERS", "200"))
-SPEEDTEST_UPLOAD_MBPS = max(0.0, float(os.environ.get("SATELLITE_SPEEDTEST_UPLOAD_MBPS", "0") or "0"))
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "10"))
 NGINX_STATUS_URL = os.environ.get("NGINX_STATUS_URL", "http://127.0.0.1:80/nginx-status")
 HLS_ACCESS_LOG = os.environ.get("HLS_ACCESS_LOG", "").strip()
@@ -241,7 +239,6 @@ def register():
         "name": SATELLITE_NAME,
         "url": SATELLITE_PUBLIC_URL,
         "capacity_max_viewers": MAX_VIEWERS,
-        "speedtest_upload_mbps": SPEEDTEST_UPLOAD_MBPS,
     }
     while running:
         try:
@@ -269,7 +266,6 @@ def heartbeat(sat_id, interval):
             "api_key": API_KEY,
             "cpu_percent": cpu,
             "bandwidth_mbps": bandwidth,
-            "speedtest_upload_mbps": SPEEDTEST_UPLOAD_MBPS,
             "viewer_count": viewers,
             "capacity_max_viewers": MAX_VIEWERS,
         }

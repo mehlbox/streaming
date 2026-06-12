@@ -253,7 +253,6 @@ def init_db() -> None:
                     observed_ip TEXT NOT NULL DEFAULT '',
                     cpu_percent REAL NOT NULL DEFAULT 0,
                     bandwidth_mbps REAL NOT NULL DEFAULT 0,
-                    speedtest_upload_mbps REAL NOT NULL DEFAULT 0,
                     viewer_count INTEGER NOT NULL DEFAULT 0,
                     capacity_max_viewers INTEGER NOT NULL DEFAULT 100,
                     last_heartbeat REAL NOT NULL,
@@ -273,10 +272,6 @@ def init_db() -> None:
             if "observed_ip" not in satellite_columns:
                 conn.execute(
                     "ALTER TABLE satellites ADD COLUMN observed_ip TEXT NOT NULL DEFAULT ''"
-                )
-            if "speedtest_upload_mbps" not in satellite_columns:
-                conn.execute(
-                    "ALTER TABLE satellites ADD COLUMN speedtest_upload_mbps REAL NOT NULL DEFAULT 0"
                 )
         db_ready = True
 
@@ -1865,7 +1860,6 @@ def satellite_info(row: sqlite3.Row, now: float | None = None) -> dict[str, str 
         "viewer_count": int(row["viewer_count"]),
         "cpu_percent": float(row["cpu_percent"]),
         "bandwidth_mbps": float(row["bandwidth_mbps"]),
-        "speedtest_upload_mbps": float(row["speedtest_upload_mbps"]),
         "capacity_max_viewers": int(row["capacity_max_viewers"]),
         "last_heartbeat_age": age,
         "heartbeat_healthy": heartbeat_healthy,
@@ -1918,15 +1912,14 @@ def satellite_register():
                 """
                 INSERT INTO satellites(
                     id, name, url, observed_ip, cpu_percent, bandwidth_mbps,
-                    speedtest_upload_mbps, viewer_count, capacity_max_viewers, last_heartbeat, registered_at
-                ) VALUES(?, ?, ?, ?, 0, 0, ?, 0, ?, ?, ?)
+                    viewer_count, capacity_max_viewers, last_heartbeat, registered_at
+                ) VALUES(?, ?, ?, ?, 0, 0, 0, ?, ?, ?)
                 """,
                 (
                     sat_id,
                     name,
                     url,
                     observed_ip,
-                    max(0.0, float(data.get("speedtest_upload_mbps", 0))),
                     int(data.get("capacity_max_viewers", 100)),
                     now,
                     now,
@@ -1968,7 +1961,7 @@ def satellite_heartbeat(sat_id):
                 """
                 UPDATE satellites
                 SET observed_ip = ?, cpu_percent = ?, bandwidth_mbps = ?, viewer_count = ?,
-                    speedtest_upload_mbps = ?, capacity_max_viewers = ?, last_heartbeat = ?
+                    capacity_max_viewers = ?, last_heartbeat = ?
                 WHERE id = ?
                 """,
                 (
@@ -1976,7 +1969,6 @@ def satellite_heartbeat(sat_id):
                     min(100.0, max(0.0, float(data.get("cpu_percent", 0)))),
                     max(0.0, float(data.get("bandwidth_mbps", 0))),
                     max(0, int(data.get("viewer_count", 0))),
-                    max(0.0, float(data.get("speedtest_upload_mbps", 0))),
                     max(1, int(data.get("capacity_max_viewers", 100))),
                     updated_at,
                     sat_id,

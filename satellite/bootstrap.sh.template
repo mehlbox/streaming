@@ -12,18 +12,10 @@ MAIN_SERVER_UPSTREAM_HOST=${MAIN_SERVER_UPSTREAM_HOST:-__MAIN_SERVER_UPSTREAM_HO
 SATELLITE_PORT=${SATELLITE_PORT:-__SATELLITE_PORT_QUOTED__}
 SATELLITE_API_KEY=__SATELLITE_API_KEY_QUOTED__
 SATELLITE_VIEWER_MBPS=${SATELLITE_VIEWER_MBPS:-3.5}
-SATELLITE_SPEEDTEST_RUNS=${SATELLITE_SPEEDTEST_RUNS:-3}
-SATELLITE_SPEEDTEST_RETRIES=${SATELLITE_SPEEDTEST_RETRIES:-3}
-SATELLITE_SPEEDTEST_MARGIN_PERCENT=${SATELLITE_SPEEDTEST_MARGIN_PERCENT:-20}
-SATELLITE_SPEEDTEST_PAUSE_SECONDS=${SATELLITE_SPEEDTEST_PAUSE_SECONDS:-5}
-SATELLITE_SPEEDTEST_TIMEOUT_SECONDS=${SATELLITE_SPEEDTEST_TIMEOUT_SECONDS:-90}
-# Pinned to a tagged release: the master branch occasionally breaks the CLI.
-SATELLITE_SPEEDTEST_PY_URL=${SATELLITE_SPEEDTEST_PY_URL:-https://raw.githubusercontent.com/sivel/speedtest-cli/v2.1.3/speedtest.py}
-SATELLITE_SPEEDTEST_UPLOAD_MBPS=${SATELLITE_SPEEDTEST_UPLOAD_MBPS:-0}
-SATELLITE_SPEEDTEST_SAFE_UPLOAD_MBPS=${SATELLITE_SPEEDTEST_SAFE_UPLOAD_MBPS:-0}
+SATELLITE_CAPACITY_MARGIN_PERCENT=${SATELLITE_CAPACITY_MARGIN_PERCENT:-20}
 # Designed uplink (Mbps) for this VM's instance type. The main app injects this
-# per server via cloud-init; used to size capacity when the speedtest fails
-# instead of a blind static viewer count. 0 = unknown (manual installs).
+# per server via cloud-init; used to size capacity (margin-adjusted) instead of
+# a blind static viewer count. 0 = unknown (manual installs).
 SATELLITE_DESIGNED_BANDWIDTH_MBPS=${SATELLITE_DESIGNED_BANDWIDTH_MBPS:-0}
 
 NGINX_CONF_PATH=${NGINX_CONF_PATH:-/etc/nginx/conf.d/streaming-satellite.conf}
@@ -93,49 +85,10 @@ install_packages() {
   exit 1
 }
 
-download_speedtest_cli() {
-  target="$(mktemp /tmp/streaming-speedtest.XXXXXX.py)"
-  attempt=1
-  while [ "$attempt" -le 3 ]; do
-    if curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 90 \
-        "$SATELLITE_SPEEDTEST_PY_URL" -o "$target" && [ -s "$target" ]; then
-      echo "$target"
-      return 0
-    fi
-    echo "Speedtest CLI download attempt $attempt/3 failed" >&2
-    attempt=$((attempt + 1))
-    sleep 3
-  done
-  rm -f "$target"
-  return 1
-}
-
-run_speedtest_result() {
-  script_path="$1"
-  # Cap each run so a hung speedtest can never stall the whole bootstrap.
-  timeout_prefix=""
-  if command -v timeout >/dev/null 2>&1; then
-    timeout_prefix="timeout $SATELLITE_SPEEDTEST_TIMEOUT_SECONDS"
-  fi
-  $timeout_prefix python3 "$script_path" --secure --json 2>/dev/null | python3 -c '
-import json, sys
-try:
-    payload = json.load(sys.stdin)
-    download = float(payload.get("download", 0.0))
-    upload = float(payload.get("upload", 0.0))
-except Exception:
-    raise SystemExit(1)
-if upload <= 0:
-    raise SystemExit(1)
-print(f"{round(download / 1_000_000, 2)} {round(upload / 1_000_000, 2)}")
-'
-}
-
-# Capacity to use when the speedtest cannot run. Prefer the instance type's
-# designed uplink (margin-adjusted, same math as the speedtest path) over a
-# blind static viewer count.
-fallback_capacity() {
-  python3 - "$SATELLITE_DESIGNED_BANDWIDTH_MBPS" "$SATELLITE_SPEEDTEST_MARGIN_PERCENT" "$SATELLITE_VIEWER_MBPS" "$DEFAULT_SATELLITE_MAX_VIEWERS" <<'PY'
+# Size capacity from the instance type's designed uplink (margin-adjusted) when
+# it is known, otherwise fall back to a static viewer count.
+capacity_from_designed_uplink() {
+  python3 - "$SATELLITE_DESIGNED_BANDWIDTH_MBPS" "$SATELLITE_CAPACITY_MARGIN_PERCENT" "$SATELLITE_VIEWER_MBPS" "$DEFAULT_SATELLITE_MAX_VIEWERS" <<'PY'
 import math
 import sys
 
@@ -162,17 +115,7 @@ resolve_satellite_capacity() {
   if [ -n "$SATELLITE_MAX_VIEWERS" ]; then
     return
   fi
-  SATELLITE_SPEEDTEST_RUNS="$(python3 - "$SATELLITE_SPEEDTEST_RUNS" <<'PY'
-import sys
-
-try:
-    value = int(sys.argv[1])
-except (TypeError, ValueError):
-    value = 3
-print(max(1, value))
-PY
-)"
-  SATELLITE_SPEEDTEST_MARGIN_PERCENT="$(python3 - "$SATELLITE_SPEEDTEST_MARGIN_PERCENT" <<'PY'
+  SATELLITE_CAPACITY_MARGIN_PERCENT="$(python3 - "$SATELLITE_CAPACITY_MARGIN_PERCENT" <<'PY'
 import sys
 
 try:
@@ -192,36 +135,6 @@ except (TypeError, ValueError):
 print(max(0.1, value))
 PY
 )"
-  SATELLITE_SPEEDTEST_PAUSE_SECONDS="$(python3 - "$SATELLITE_SPEEDTEST_PAUSE_SECONDS" <<'PY'
-import sys
-
-try:
-    value = float(sys.argv[1])
-except (TypeError, ValueError):
-    value = 5.0
-print(max(0.0, value))
-PY
-)"
-  SATELLITE_SPEEDTEST_RETRIES="$(python3 - "$SATELLITE_SPEEDTEST_RETRIES" <<'PY'
-import sys
-
-try:
-    value = int(sys.argv[1])
-except (TypeError, ValueError):
-    value = 3
-print(max(0, value))
-PY
-)"
-  SATELLITE_SPEEDTEST_TIMEOUT_SECONDS="$(python3 - "$SATELLITE_SPEEDTEST_TIMEOUT_SECONDS" <<'PY'
-import sys
-
-try:
-    value = float(sys.argv[1])
-except (TypeError, ValueError):
-    value = 90.0
-print(int(max(10.0, value)))
-PY
-)"
   SATELLITE_DESIGNED_BANDWIDTH_MBPS="$(python3 - "$SATELLITE_DESIGNED_BANDWIDTH_MBPS" <<'PY'
 import sys
 
@@ -233,94 +146,15 @@ print(max(0.0, value))
 PY
 )"
 
-  # The speedtest proved too unreliable as a capacity basis, so prefer the
-  # instance's booked (designed) uplink whenever it is known. fallback_capacity()
-  # applies the same margin math to the designed bandwidth. The speedtest only
-  # sizes capacity on manual installs where the designed uplink is unknown (0).
+  # Size capacity from the instance's booked (designed) uplink whenever it is
+  # known, applying the margin math. Manual installs without a designed uplink
+  # (0) fall back to the static SATELLITE_MAX_VIEWERS value.
+  SATELLITE_MAX_VIEWERS="$(capacity_from_designed_uplink)"
   if [ "$(python3 -c 'import sys; print(1 if float(sys.argv[1]) > 0 else 0)' "$SATELLITE_DESIGNED_BANDWIDTH_MBPS")" = "1" ]; then
-    SATELLITE_MAX_VIEWERS="$(fallback_capacity)"
     echo "Capacity from booked uplink ${SATELLITE_DESIGNED_BANDWIDTH_MBPS} Mbps: $SATELLITE_MAX_VIEWERS viewers" >&2
-    return
+  else
+    echo "Designed uplink unknown; static fallback capacity: $SATELLITE_MAX_VIEWERS viewers" >&2
   fi
-
-  speedtest_script="$(download_speedtest_cli || true)"
-  if [ -z "${speedtest_script:-}" ]; then
-    SATELLITE_MAX_VIEWERS="$(fallback_capacity)"
-    echo "Speedtest CLI unavailable; fallback capacity: $SATELLITE_MAX_VIEWERS viewers (designed uplink ${SATELLITE_DESIGNED_BANDWIDTH_MBPS} Mbps)" >&2
-    return
-  fi
-
-  # Keep retrying until we have SATELLITE_SPEEDTEST_RUNS good samples, allowing
-  # up to SATELLITE_SPEEDTEST_RETRIES extra attempts to ride out transient
-  # speedtest.net failures (403s, server-selection hiccups, timeouts).
-  samples_file="$(mktemp /tmp/streaming-speedtest-samples.XXXXXX)"
-  runs_completed=0
-  attempt=1
-  max_attempts=$((SATELLITE_SPEEDTEST_RUNS + SATELLITE_SPEEDTEST_RETRIES))
-  while [ "$runs_completed" -lt "$SATELLITE_SPEEDTEST_RUNS" ] && [ "$attempt" -le "$max_attempts" ]; do
-    result="$(run_speedtest_result "$speedtest_script" || true)"
-    if [ -n "${result:-}" ]; then
-      download_sample="$(printf '%s\n' "$result" | awk '{print $1}')"
-      upload_sample="$(printf '%s\n' "$result" | awk '{print $2}')"
-      printf '%s\n' "$upload_sample" >> "$samples_file"
-      runs_completed=$((runs_completed + 1))
-      echo "Speedtest attempt $attempt: download ${download_sample} Mbps | upload ${upload_sample} Mbps | sample ${runs_completed}/${SATELLITE_SPEEDTEST_RUNS}"
-    else
-      echo "Speedtest attempt $attempt/$max_attempts failed" >&2
-    fi
-    attempt=$((attempt + 1))
-    if [ "$runs_completed" -lt "$SATELLITE_SPEEDTEST_RUNS" ] && [ "$attempt" -le "$max_attempts" ] && [ "$SATELLITE_SPEEDTEST_PAUSE_SECONDS" != "0.0" ]; then
-      sleep "$SATELLITE_SPEEDTEST_PAUSE_SECONDS"
-    fi
-  done
-  rm -f "$speedtest_script"
-
-  if [ "$runs_completed" -eq 0 ]; then
-    rm -f "$samples_file"
-    SATELLITE_MAX_VIEWERS="$(fallback_capacity)"
-    echo "All speedtests failed; fallback capacity: $SATELLITE_MAX_VIEWERS viewers (designed uplink ${SATELLITE_DESIGNED_BANDWIDTH_MBPS} Mbps)" >&2
-    return
-  fi
-
-  SATELLITE_SPEEDTEST_UPLOAD_MBPS="$(python3 - "$samples_file" <<'PY'
-import pathlib
-import statistics
-import sys
-
-path = pathlib.Path(sys.argv[1])
-values = [
-    float(line.strip())
-    for line in path.read_text(encoding="utf-8").splitlines()
-    if line.strip()
-]
-if not values:
-    raise SystemExit(1)
-print(round(statistics.fmean(values), 2))
-PY
-)"
-  rm -f "$samples_file"
-
-  SATELLITE_SPEEDTEST_SAFE_UPLOAD_MBPS="$(python3 - "$SATELLITE_SPEEDTEST_UPLOAD_MBPS" "$SATELLITE_SPEEDTEST_MARGIN_PERCENT" <<'PY'
-import sys
-
-average = float(sys.argv[1])
-margin_percent = max(0.0, min(95.0, float(sys.argv[2])))
-safe = average * (1.0 - margin_percent / 100.0)
-print(round(max(0.0, safe), 2))
-PY
-)"
-  SATELLITE_MAX_VIEWERS="$(python3 - "$SATELLITE_SPEEDTEST_SAFE_UPLOAD_MBPS" "$SATELLITE_VIEWER_MBPS" <<'PY'
-import math
-import sys
-
-safe_upload = float(sys.argv[1])
-per_viewer = max(0.1, float(sys.argv[2]))
-print(max(1, int(math.floor(safe_upload / per_viewer))))
-PY
-)"
-  echo "Average upload speedtest: ${SATELLITE_SPEEDTEST_UPLOAD_MBPS} Mbps"
-  echo "Safe upload after ${SATELLITE_SPEEDTEST_MARGIN_PERCENT}% margin: ${SATELLITE_SPEEDTEST_SAFE_UPLOAD_MBPS} Mbps"
-  echo "Calculated capacity: ${SATELLITE_MAX_VIEWERS} viewers at ${SATELLITE_VIEWER_MBPS} Mbps/viewer"
 }
 
 render_nginx_conf() {
@@ -502,11 +336,7 @@ SATELLITE_NAME=$DEFAULT_SATELLITE_NAME
 SATELLITE_PUBLIC_URL=$SATELLITE_PUBLIC_URL
 SATELLITE_MAX_VIEWERS=$SATELLITE_MAX_VIEWERS
 SATELLITE_VIEWER_MBPS=$SATELLITE_VIEWER_MBPS
-SATELLITE_SPEEDTEST_RUNS=$SATELLITE_SPEEDTEST_RUNS
-SATELLITE_SPEEDTEST_MARGIN_PERCENT=$SATELLITE_SPEEDTEST_MARGIN_PERCENT
-SATELLITE_SPEEDTEST_PAUSE_SECONDS=$SATELLITE_SPEEDTEST_PAUSE_SECONDS
-SATELLITE_SPEEDTEST_UPLOAD_MBPS=$SATELLITE_SPEEDTEST_UPLOAD_MBPS
-SATELLITE_SPEEDTEST_SAFE_UPLOAD_MBPS=$SATELLITE_SPEEDTEST_SAFE_UPLOAD_MBPS
+SATELLITE_CAPACITY_MARGIN_PERCENT=$SATELLITE_CAPACITY_MARGIN_PERCENT
 MAIN_SERVER_URL=$MAIN_SERVER_URL
 MAIN_SERVER_INTERNAL_URL=$MAIN_SERVER_INTERNAL_URL
 MAIN_SERVER_UPSTREAM_HOST=$MAIN_SERVER_UPSTREAM_HOST
