@@ -7,10 +7,9 @@
    To change the look, edit the values here. The previous default palette is
    kept commented out at the bottom — swap the two blocks to revert.
 
-   Active: CDH-Stephanus (crimson), matching https://media.cdhserver.de/
-   Anchored on the brand crimson #b50e3c with burgundy darks and light-pink
-   surfaces. Note: this is a fixed light theme (overrides OS dark mode), like
-   the CDH site itself.
+   Active: crimson palette.
+   Anchored on crimson #b50e3c with burgundy darks and light-pink
+   surfaces. Note: this is a fixed light theme (overrides OS dark mode).
    ============================================================================ */
 
 :root {

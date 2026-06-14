@@ -110,7 +110,7 @@ DONATION_TEXT = get_env_default("DONATION_TEXT", "Jetzt spenden")
 SCHEDULE_BASE_URL = get_env_default("SCHEDULE_BASE_URL", "")
 # Selects which schedule-<name>.json file in SCHEDULE_BASE_URL is loaded. The
 # frontend reads this from the <html data-theme> attribute (app.js).
-SCHEDULE_NAME = get_env_default("SCHEDULE_NAME", "stephanus")
+SCHEDULE_NAME = get_env_default("SCHEDULE_NAME", "default")
 # Local filesystem path of that same schedule file, used by the admin editor to
 # read and write entries. Defaults to the nginx-served data directory.
 SCHEDULE_FILE = get_env_default(
