@@ -175,7 +175,7 @@ SATELLITE_PROBE_CACHE_SECONDS = max(
 )
 SATELLITE_ASSIGN_TIMEOUT_SECONDS = max(
     0.5,
-    float(os.getenv("SATELLITE_ASSIGN_TIMEOUT_SECONDS", "2")),
+    float(os.getenv("SATELLITE_ASSIGN_TIMEOUT_SECONDS", "3")),
 )
 APP_DEBUG = parse_bool(os.getenv("APP_DEBUG", "0"))
 PUBLIC_ORIGIN_URL = (
@@ -2070,6 +2070,11 @@ def satellite_assign():
     with connect_db() as conn:
         rows = [dict(row) for row in conn.execute("SELECT * FROM satellites").fetchall()]
 
+    # Any real (non-local) satellite registered, regardless of health. The client uses
+    # this to decide whether to wait for a node decision (nodes exist but may still be
+    # booting) or go straight to main (no nodes configured).
+    has_nodes = any(not is_local_satellite(row) for row in rows)
+
     candidate_rows = [row for row in rows if satellite_score(row) > 0]
     if exclude_url:
         alternates = [row for row in candidate_rows if str(row["url"] or "").rstrip("/") != exclude_url]
@@ -2130,11 +2135,11 @@ def satellite_assign():
             executor.shutdown(wait=False, cancel_futures=True)
         selected_remote_row = select_weighted_satellite(healthy_remote_rows)
         if selected_remote_row is not None:
-            return jsonify({"satellite_url": selected_remote_row["url"]})
+            return jsonify({"satellite_url": selected_remote_row["url"], "has_nodes": has_nodes})
 
     if best_local_row is not None and best_local_score > 0:
-        return jsonify({"satellite_url": best_local_row["url"]})
-    return jsonify({"satellite_url": None})
+        return jsonify({"satellite_url": best_local_row["url"], "has_nodes": has_nodes})
+    return jsonify({"satellite_url": None, "has_nodes": has_nodes})
 
 
 @app.get("/api/satellites")

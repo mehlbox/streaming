@@ -89,6 +89,15 @@ let satelliteUrl = null;
 let satelliteAssigned = false;
 const satelliteAssignPollIntervalMs = 15000;
 const satelliteExcludeCooldownMs = 30000;
+// Startup node-assignment gate: on first live, hold the player in a loading state for
+// up to startupNodeWaitMs while we try to land a node, instead of starting on main
+// immediately. The 3s budget is anchored at the live transition (see
+// beginStartupNodeAssignment, which is only invoked from handleStatus's live branch).
+const startupNodeWaitMs = 3000;
+let startupNodeDecisionDone = false;
+let startupAssignmentStarted = false;
+let lastAssignHasNodes = null; // from /api/satellite/assign has_nodes
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const audioOnlyStorageKey = "audioOnly";
 const autostartAttemptsKey = "autostartAttempts";
 const autostartMaxAttempts = 10;
@@ -437,6 +446,9 @@ const requestSatelliteAssignment = async ({ forceFresh = false, excludeUrl = nul
         return;
       }
       const data = await resp.json();
+      if (typeof data?.has_nodes === "boolean") {
+        lastAssignHasNodes = data.has_nodes;
+      }
       if (requestToken !== satelliteAssignmentRequestToken) {
         logNodeSwitchConsole("assignment-stale-ignored", {
           requestToken,
@@ -2852,6 +2864,52 @@ const startPlayerWithOptions = ({
   console.log("HLS not supported in this browser.");
 };
 
+const triggerAutostart = () => {
+  if (started) return;
+  if (autostartEnabled) {
+    recordAutostartAttempt();
+    if (!autostartEnabled) return;
+  }
+  setActiveMedia();
+  if (allowAutoplay && mediaEl) {
+    mediaEl.muted = true;
+  }
+  updateUnmute();
+  startPlayer();
+};
+
+const finishStartupNodeDecision = (reason) => {
+  if (startupNodeDecisionDone) return;
+  startupNodeDecisionDone = true;
+  logNodeSwitchConsole("startup-node-decision", { reason, assigned: satelliteAssigned });
+  // Stream may already be live and waiting on the gate — start now on whatever source
+  // we ended up with (assigned node, or main on timeout).
+  if (isLive && !started && !adminMode) triggerAutostart();
+};
+
+const beginStartupNodeAssignment = () => {
+  if (startupAssignmentStarted || adminMode) return;
+  startupAssignmentStarted = true;
+  void (async () => {
+    const deadline = Date.now() + startupNodeWaitMs; // anchored at first live tick
+    while (!startupNodeDecisionDone && Date.now() < deadline) {
+      const assignedUrl = await requestSatelliteAssignment({ forceFresh: true });
+      if (startupNodeDecisionDone) return;
+      if (assignedUrl) {                         // got a node -> keep it (sticky)
+        applySatelliteAssignment(assignedUrl, "startup");
+        finishStartupNodeDecision("node-assigned");
+        return;
+      }
+      if (lastAssignHasNodes === false) {        // no nodes at all -> main now
+        finishStartupNodeDecision("no-nodes");
+        return;
+      }
+      await sleep(Math.min(400, Math.max(0, deadline - Date.now())));
+    }
+    finishStartupNodeDecision("timeout");        // 3s elapsed -> main
+  })();
+};
+
 const handleStatus = (live, audioLiveStatus) => {
   const previousLiveStatus = lastLiveStatus;
   const previousAudioStatus = lastAudioLiveStatus;
@@ -2896,16 +2954,11 @@ const handleStatus = (live, audioLiveStatus) => {
   if (live) {
     setStatus(true);
     if (!started) {
-      if (autostartEnabled) {
-        recordAutostartAttempt();
-        if (!autostartEnabled) return;
+      if (!startupNodeDecisionDone && !satelliteAssigned && lastAssignHasNodes !== false) {
+        beginStartupNodeAssignment(); // idempotent; holds main until decision (max 3s)
+        return;
       }
-      setActiveMedia();
-      if (allowAutoplay && mediaEl) {
-        mediaEl.muted = true;
-      }
-      updateUnmute();
-      startPlayer();
+      triggerAutostart();
     }
     return;
   }
