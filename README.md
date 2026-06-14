@@ -5,8 +5,8 @@ Simple Flask frontend for a live HLS stream with polling-based viewer count, sch
 ## Quick start
 
 ```bash
-# cd /docker/streaming
-# docker compose up -d
+cp .env.example .env   # then edit SECRET_KEY, STREAMING_HOST, STREAM_KEY, …
+docker compose up -d   # COMPOSE_PROFILES in .env selects main/satellite
 ```
 
 ## OBS Studio setup
@@ -24,10 +24,16 @@ In OBS Studio:
 
 Settings in OBS:
 
-- **Server**: `rtmp://streaming.example.com/live?key=YOUR_SECRET`
+- **Server**: `rtmp://streaming.example.com/stream?key=YOUR_SECRET`
 - **Stream Key**: `live`
 
-### 3) Start streaming
+The `stream` path is the fixed RTMP application name (defined in `nginx.conf`);
+the stream key field is the `STREAM_NAME` (default `live`), and the `?key=` value
+must match `STREAM_KEY` when one is set. If you publish to a non-default
+`RTMP_PORT`, include it in the server URL, e.g.
+`rtmp://streaming.example.com:1936/stream?key=YOUR_SECRET`.
+
+### 2) Start streaming
 
 Click **Start Streaming** in OBS. The page will show **Online** once HLS segments are produced.
 
@@ -41,7 +47,7 @@ Click **Start Streaming** in OBS. The page will show **Online** once HLS segment
 - `STREAM_KEY` (default: empty; if set, must match the `key` in OBS)
 - `HLS_DIR` (default: `/var/www/hls`)
 - `HLS_STALE_SECONDS` (default: `15`)
-- `SOCKETIO_POLL_SECONDS` (default: `2`)
+- `ADMIN_TOKEN` (default: empty; required to access the `/admin` page; when unset the page is unavailable)
 - `STATE_DB` (default: `/app/state.db`)
 - `STATS_SAMPLE_SECONDS` (default: `60`)
 - `AUDIO_STREAM_NAME` (optional: name of an audio-only stream; enables the "Nur Audio" toggle)
@@ -93,7 +99,7 @@ docker compose up -d
 ```
 
 Publish OBS for the first site to port `1935` and the second site to port
-`1936`, for example `rtmp://stream2.example.com:1936/live?key=...`.
+`1936`, for example `rtmp://stream2.example.com:1936/stream?key=...`.
 
 The external `traefik` network remains shared intentionally. Satellite-profile
 instances must also use distinct `SATELLITE_PORT` values when they bind ports
@@ -129,7 +135,7 @@ Notes:
 
 - Docker is not required on the satellite VM. The installer sets up `nginx`, `caddy`, `python3`, a virtualenv, and a system service directly on the host.
 - The bootstrap endpoint assigns the node name and `public_url` itself and reuses the same node number for known IPs via the persisted JSON node map.
-- During bootstrap, the installer runs 3 upload speed tests, averages them, subtracts 20%, and derives `SATELLITE_MAX_VIEWERS` from `SATELLITE_VIEWER_MBPS` (default `3.5`). If the speed test fails, it falls back to the configured `SATELLITE_MAX_VIEWERS`.
+- During bootstrap, the installer sizes `SATELLITE_MAX_VIEWERS` from the node's designed/booked uplink (`SATELLITE_DESIGNED_BANDWIDTH_MBPS`): it subtracts the safety margin (`SATELLITE_CAPACITY_MARGIN_PERCENT`, default `20`%) and divides by the assumed per-viewer bandwidth (`SATELLITE_VIEWER_MBPS`, default `3.5`). For Scaleway nodes the main app injects the designed uplink per server via cloud-init. If the designed uplink is unknown (`0`) or you set `SATELLITE_MAX_VIEWERS` explicitly before running the installer, that static value is used instead.
 - `public_url` must use `https://`. The satellite obtains and renews its own certificate locally through Caddy. After Caddy creates the cert, the satellite agent uploads the Caddy certificate storage files back to the main server cache (`SATELLITE_CERT_CACHE_DIR`, default next to `STATE_DB`). In Docker Compose, `./satellite-certs` is mounted into the web container as `/satellite-certs`, and the satellite profile mounts the host Caddy cert directory into the agent container read-only. Future bootstraps restore that cache before starting Caddy, so a recreated node can reuse the certificate.
 - If the main app is behind a reverse proxy, set `SATELLITE_BOOTSTRAP_ORIGIN_URL` so satellites pull HLS from the public HTTPS origin instead of an internal HTTP URL that may redirect.
 - The installer writes its files to `/opt/streaming-satellite`, configures local nginx on loopback, configures Caddy for public HTTPS, and starts the agent automatically.
@@ -137,26 +143,27 @@ Notes:
 
 ## Scaleway provisioning
 
-The `/debug` page now includes a Scaleway section that can create and delete managed Instances for satellite nodes.
+The `/admin` page (gated by `ADMIN_TOKEN`) includes a Scaleway section that can create and delete managed Instances for satellite nodes.
 
 Set these on the main server to enable it:
 
 - `SCW_MANAGE_TOKEN` to enable the feature on the server side
 - `SCW_SECRET_KEY` with your Scaleway API secret
 - `SCW_DEFAULT_PROJECT_ID` for the target Scaleway project
-- optionally `SCW_DEFAULT_ZONE`, `SCW_DEFAULT_COMMERCIAL_TYPE`, `SCW_DEFAULT_IMAGE`, `SCW_ROOT_VOLUME_TYPE`, `SCW_ROOT_VOLUME_SIZE_GB`, and `SCW_SERVER_NAME_PREFIX`
+- optionally `SCW_DEFAULT_ZONE`, `SCW_DEFAULT_COMMERCIAL_TYPE`, `SCW_DEFAULT_IMAGE`, `SCW_ROOT_VOLUME_TYPE`, `SCW_ROOT_VOLUME_SIZE_GB`, `SCW_SERVER_NAME_PREFIX`, and `SCW_SERVER_LIMIT`
 
 Behavior:
 
-- The backend enforces a hard limit of `5` managed Scaleway servers.
+- The backend caps the number of managed Scaleway servers at `SCW_SERVER_LIMIT` (default `100`, clamped to `1`–`100`).
 - Created instances are named automatically as `instance1`, `instance2`, ...
 - New Instances receive the current [satellite/cloud-init.example.yaml](satellite/cloud-init.example.yaml) as Scaleway `cloud-init` user-data, and the backend reads the `cloud-init` key back from the Scaleway API before reporting success.
 - The created VM still uses the existing bootstrap flow, so the main server auto-assigns `node1`, `node2`, ... by IP and persists the mapping in the JSON node map.
 - Root storage defaults to cheap local SSD (`l_ssd`) with `10 GB`, which matches the low-cost local-storage setup better than block storage.
-- The UI does not expose image selection; it always creates Debian 12 (`debian_bookworm`) nodes.
+- The UI does not expose image selection; it always creates nodes from `SCW_DEFAULT_IMAGE` (default `ubuntu_noble`, i.e. Ubuntu 24.04).
 - This integration currently uses the Scaleway secret key for API requests; the access key is not required by the HTTP calls themselves.
 
 ## Notes
 
-- The schedule and offline messages are configured in `flask/static/js/app.js`.
+- The schedule is edited on the `/admin` page ("Programm" editor) and persisted as JSON at `/var/www/data/schedule-<SCHEDULE_NAME>.json` (default `schedule-default.json`), served from `/data/`. The viewer page fetches it and renders upcoming entries; the `/api/schedule` endpoints back the editor.
+- The offline-overlay messages are still defined in `flask/static/js/app.js` (`updateOfflineMessage`).
 - The stats graph reads `/stats?minutes=60` and draws a small canvas chart.
