@@ -1,5 +1,4 @@
 import json
-import logging
 import os
 import re
 import sqlite3
@@ -14,10 +13,6 @@ from urllib.parse import urlparse
 
 from flask import abort, request
 
-SCW_API_LOG_PATH = Path(
-    os.getenv("SCW_API_LOG_PATH", "").strip()
-    or str(Path(__file__).resolve().with_name("scaleway-api.log"))
-)
 HOURLY_PRICE_QUANTUM = Decimal("0.00001")
 STORAGE_PRICE_UNIT_GB = Decimal("10")
 LOCAL_STORAGE_PRICE_PER_UNIT_HOUR_EUR = Decimal("0.00049")
@@ -463,7 +458,6 @@ class ScalewayManager:
         self._shorten = shorten
         self._normalize_ip_address = normalize_ip_address
         self._request_external_base_url = request_external_base_url
-        self._logger = build_scaleway_logger()
 
     def _pricing_totals_path(self) -> Path:
         return Path(self.config.cost_totals_path)
@@ -912,21 +906,6 @@ class ScalewayManager:
             body = json.dumps(payload).encode("utf-8")
         if body is not None:
             headers["Content-Type"] = content_type
-        request_id = f"scw-{time.time_ns()}"
-        self._logger.info(
-            json.dumps(
-                {
-                    "event": "request",
-                    "request_id": request_id,
-                    "method": method.upper(),
-                    "url": url,
-                    "headers": self._sanitize_headers(headers),
-                    "payload": self._sanitize_log_value(payload),
-                    "raw_body": self._sanitize_raw_body(raw_body, content_type),
-                },
-                ensure_ascii=True,
-            )
-        )
         request_obj = Request(url, data=body, method=method.upper(), headers=headers)
         try:
             with urlopen(request_obj, timeout=20) as response:
@@ -943,18 +922,6 @@ class ScalewayManager:
                             parsed_body = response_text
                     else:
                         parsed_body = response_text
-                self._logger.info(
-                    json.dumps(
-                        {
-                            "event": "response",
-                            "request_id": request_id,
-                            "status": int(getattr(response, "status", 200) or 200),
-                            "headers": self._sanitize_headers(response_headers),
-                            "body": self._sanitize_log_value(parsed_body),
-                        },
-                        ensure_ascii=True,
-                    )
-                )
                 if not response_body:
                     return None
                 return parsed_body
@@ -965,19 +932,6 @@ class ScalewayManager:
                 error_text = exc.read().decode("utf-8", errors="replace")
             except Exception:
                 error_text = ""
-            self._logger.error(
-                json.dumps(
-                    {
-                        "event": "response_error",
-                        "request_id": request_id,
-                        "status": exc.code,
-                        "reason": getattr(exc, "reason", ""),
-                        "headers": self._sanitize_headers(dict(exc.headers.items()) if exc.headers else {}),
-                        "body": self._sanitize_log_value(self._parse_log_body(error_text)),
-                    },
-                    ensure_ascii=True,
-                )
-            )
             if error_text:
                 try:
                     parsed = json.loads(error_text)
@@ -995,17 +949,6 @@ class ScalewayManager:
                     details = self._shorten(error_text, 240) or ""
             raise ScalewayAPIError(exc.code, details or f"Scaleway API returned {exc.code}") from exc
         except URLError as exc:
-            self._logger.error(
-                json.dumps(
-                    {
-                        "event": "response_error",
-                        "request_id": request_id,
-                        "status": 502,
-                        "reason": str(exc.reason),
-                    },
-                    ensure_ascii=True,
-                )
-            )
             raise ScalewayAPIError(
                 502,
                 self._shorten(str(exc.reason), 240) or "Scaleway API unreachable",
@@ -1623,68 +1566,3 @@ class ScalewayManager:
             if option["id"] in self.config.allowed_zones
         ]
 
-    def _parse_log_body(self, value: str) -> object:
-        text = str(value or "")
-        if not text:
-            return ""
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            return text
-
-    def _sanitize_headers(self, headers: dict[str, object]) -> dict[str, object]:
-        redacted: dict[str, object] = {}
-        for key, value in headers.items():
-            if str(key).lower() in {"x-auth-token", "authorization"}:
-                redacted[str(key)] = "[redacted]"
-            else:
-                redacted[str(key)] = self._sanitize_log_value(value)
-        return redacted
-
-    def _sanitize_raw_body(self, raw_body: bytes | None, content_type: str) -> object | None:
-        if raw_body is None:
-            return None
-        try:
-            text = raw_body.decode("utf-8", errors="replace")
-        except Exception:
-            return f"<{len(raw_body)} bytes>"
-        if content_type == "application/json":
-            return self._sanitize_log_value(self._parse_log_body(text))
-        return self._sanitize_log_value(text)
-
-    def _sanitize_log_value(self, value: object) -> object:
-        secrets_to_redact = [
-            self.config.secret_key,
-            self.config.access_key,
-            self.config.manage_token,
-            self.config.satellite_api_key,
-            self.config.satellite_bootstrap_token,
-        ]
-        if isinstance(value, dict):
-            return {str(key): self._sanitize_log_value(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [self._sanitize_log_value(item) for item in value]
-        if isinstance(value, tuple):
-            return [self._sanitize_log_value(item) for item in value]
-        if value is None:
-            return None
-        text = str(value)
-        for secret in secrets_to_redact:
-            if secret:
-                text = text.replace(secret, "[redacted]")
-        text = re.sub(r'(BOOTSTRAP_TOKEN=")[^"]*(")', r"\1[redacted]\2", text)
-        text = re.sub(r"(SATELLITE_API_KEY=)[^\n\r]*", r"\1[redacted]", text)
-        return text
-
-
-def build_scaleway_logger() -> logging.Logger:
-    logger = logging.getLogger("scaleway_api")
-    if logger.handlers:
-        return logger
-    SCW_API_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    handler = logging.FileHandler(SCW_API_LOG_PATH, encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    return logger
