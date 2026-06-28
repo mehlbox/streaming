@@ -1,18 +1,50 @@
 /* ============================================================================
    THEME — single source of truth for the site's colors.
 
-   Loaded after style.css, so the :root below overrides style.css's built-in
-   defaults. These are the variables the stylesheet actually consumes
-   (--primary, --accent, --text-*, --bg-*, --border-color, --shadow*, glows).
-   To change the look, edit the values here. The previous default palette is
-   kept commented out at the bottom — swap the two blocks to revert.
+   Loaded after style.css, so these :root values override style.css's built-in
+   defaults. The palette is chosen per deployment with the SITE_THEME env var,
+   which the template renders as <html data-palette="..."> — NOT by editing this
+   file. Leave SITE_THEME unset (or "default") for the slate palette; set
+   SITE_THEME=crimson for the crimson palette.
 
-   Active: crimson palette.
-   Anchored on crimson #b50e3c with burgundy darks and light-pink
-   surfaces. Note: this is a fixed light theme (overrides OS dark mode).
+   To add a palette: copy a :root[data-palette="..."] block and commit it once.
    ============================================================================ */
 
+/* ---------------------------------------------------------------------------
+   DEFAULT PALETTE (slate) — applies unless data-palette selects another.
+   --------------------------------------------------------------------------- */
 :root {
+  /* Brand / accents */
+  --primary:        #2c3e50;
+  --primary-light:  #34495e;
+  --accent:         #e74c3c;
+  --accent-soft:    #ecf0f1;
+
+  /* Text */
+  --text-primary:   #2c3e50;
+  --text-secondary: #7f8c8d;
+  --text-light:     #bdc3c7;
+
+  /* Surfaces */
+  --bg-light:       #f8f9fa;
+  --bg-lighter:     #ffffff;
+  --border-color:   #e0e0e0;
+
+  /* Shadows */
+  --shadow:         0 2px 8px rgba(0, 0, 0, 0.1);
+  --shadow-md:      0 4px 16px rgba(0, 0, 0, 0.15);
+  --shadow-lg:      0 8px 24px rgba(0, 0, 0, 0.2);
+
+  /* Decorative background glows */
+  --page-glow-1:    rgba(44, 62, 80, 0.12);
+  --page-glow-2:    rgba(231, 76, 60, 0.10);
+}
+
+/* ---------------------------------------------------------------------------
+   CRIMSON PALETTE — active with SITE_THEME=crimson (<html data-palette="crimson">).
+   Crimson #b50e3c with burgundy darks and light-pink surfaces. Fixed light theme.
+   --------------------------------------------------------------------------- */
+:root[data-palette="crimson"] {
   /* Brand / accents */
   --primary:        #780a29;   /* deep burgundy — headers, dark UI        */
   --primary-light:  #8d0b30;   /* mid burgundy                            */
@@ -38,28 +70,3 @@
   --page-glow-1:    rgba(181, 14, 60, 0.18);
   --page-glow-2:    rgba(141, 11, 48, 0.15);
 }
-
-/* ============================================================================
-   DEFAULT PALETTE (previous look) — kept for easy revert, not deleted.
-   To restore it: comment out the :root above and uncomment the block below.
-   ============================================================================ */
-
-/*
-:root {
-  --primary:        #2c3e50;
-  --primary-light:  #34495e;
-  --accent:         #e74c3c;
-  --accent-soft:    #ecf0f1;
-  --text-primary:   #2c3e50;
-  --text-secondary: #7f8c8d;
-  --text-light:     #bdc3c7;
-  --bg-light:       #f8f9fa;
-  --bg-lighter:     #ffffff;
-  --border-color:   #e0e0e0;
-  --shadow:         0 2px 8px rgba(0, 0, 0, 0.1);
-  --shadow-md:      0 4px 16px rgba(0, 0, 0, 0.15);
-  --shadow-lg:      0 8px 24px rgba(0, 0, 0, 0.2);
-  --page-glow-1:    rgba(44, 62, 80, 0.12);
-  --page-glow-2:    rgba(231, 76, 60, 0.10);
-}
-*/

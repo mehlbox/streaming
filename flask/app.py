@@ -80,6 +80,7 @@ AUDIO_ONLY = parse_bool(os.getenv("AUDIO_ONLY", ""))
 # The site uses a single theme defined entirely in static/css/theme.css. There
 # is no theme selection — to change the look, edit the variables in that file.
 SITE_TITLE = get_env_default("SITE_TITLE", "docker streaming")
+SITE_THEME = get_env_default("SITE_THEME", "default")
 SITE_SUBTITLE = get_env_default("SITE_SUBTITLE", "")
 PAGE_TITLE = get_env_default("PAGE_TITLE", f"Live Stream - {SITE_TITLE}")
 LOGO_URL = get_env_default("LOGO_URL", "")
@@ -302,6 +303,7 @@ def render_page_context(debug_enabled: bool) -> dict[str, object]:
         "audio_hls_url": audio_hls_url,
         "local_satellite_name": LOCAL_SATELLITE_NAME,
         "site_title": SITE_TITLE,
+        "site_theme": SITE_THEME,
         "site_subtitle": SITE_SUBTITLE,
         "page_title": PAGE_TITLE,
         "logo_url": LOGO_URL,

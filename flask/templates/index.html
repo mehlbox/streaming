@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="de"{% if schedule_name %} data-theme="{{ schedule_name }}"{% endif %}>
+<html lang="de"{% if schedule_name %} data-theme="{{ schedule_name }}"{% endif %}{% if site_theme and site_theme != "default" %} data-palette="{{ site_theme }}"{% endif %}>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
