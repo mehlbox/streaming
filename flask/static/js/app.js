@@ -316,6 +316,19 @@ const resolveHlsUrl = (baseUrl) => {
   return `${satelliteUrl.replace(/\/$/, "")}/${filename}`;
 };
 
+// Origin (scheme://host[:port]) of the node currently serving the stream. Read live by
+// the custom hls.js loader so a mid-playback node switch only redirects future requests.
+const activeNodeOrigin = () => {
+  if (satelliteAssigned && satelliteUrl) {
+    try {
+      return new URL(satelliteUrl, window.location.href).origin;
+    } catch (error) {
+      // fall through to the main origin
+    }
+  }
+  return window.location.origin;
+};
+
 const resetSatelliteStartupRetries = () => {};
 
 const clearSatelliteStartupSwitchTimer = () => {
@@ -351,11 +364,54 @@ const performSourceSwitch = (reason, updateSource) => {
   const shouldPlay = !!started;
   const restoreAudio = !!(started && previousMediaEl && !previousMediaEl.muted && currentVolume > 0);
   const previousNode = activeNodeName();
+  // Captured before updateSource(): can we swap the node host in place instead of
+  // tearing the player down and re-buffering? Requires the hls.js engine (native HLS
+  // can't redirect per-segment requests) and a populated buffer to coast on while the
+  // new node takes over.
+  const seamlessEligible = (
+    started
+    && !!hls
+    && !!mediaEl
+    && !canUseNativeHls(mediaEl)
+    && mediaEl.readyState >= 2
+  );
 
   updateSource();
 
   if (!started) return;
   if (mediaEl !== previousMediaEl || !activeHlsUrl || activeHlsUrl === previousActiveHlsUrl) {
+    return;
+  }
+
+  // Seamless node swap. updateSource() has already flipped satelliteUrl/satelliteAssigned,
+  // so the custom hls.js loader (getNodeRewriteLoaderClass) now redirects every subsequent
+  // request — the next live-playlist reload and all following fragments — to the new node.
+  // Nodes serve identical, timeline-aligned segments, so the already-buffered timeline keeps
+  // playing uninterrupted; we never touch the hls instance or the MSE buffer.
+  if (seamlessEligible) {
+    logNodeSwitchConsole("seamless-node-swap", {
+      reason,
+      previousNode,
+      nextNode: activeNodeName(),
+      previousActiveHlsUrl,
+      nextActiveHlsUrl: activeHlsUrl
+    });
+    clearStallState();
+    if (mediaEl) {
+      mediaEl.crossOrigin = satelliteAssigned ? "use-credentials" : "";
+    }
+    // A healthy, actively-playing stream migrates on its own at the next live-playlist
+    // reload (rewritten to the new origin) — leave it untouched. Only nudge loading when
+    // playback isn't progressing (failover off a dead node, or paused); startLoad(-1)
+    // keeps the current position (no seek) and also resumes a stream that hls.js stopped
+    // after a fatal network error.
+    if (!playbackActive) {
+      try {
+        if (typeof hls.startLoad === "function") hls.startLoad(-1);
+      } catch (error) {
+        debugLog(`seamless swap startLoad failed: ${error?.message || error}`);
+      }
+    }
     return;
   }
 
@@ -696,6 +752,39 @@ const isHlsRequestUrl = (value) => {
   } catch {
     return /\.(?:m3u8|ts|m4s|mp4|aac)(?:[?#]|$)/i.test(String(value));
   }
+};
+
+let nodeRewriteLoaderClass = null;
+// hls.js loader that rewrites the origin of every stream request to the currently
+// selected node (activeNodeOrigin()). Because all nodes serve byte-identical,
+// timeline-aligned segments (satellites reverse-proxy the same origin), switching nodes
+// mid-playback only needs future requests pointed at the new host — the MSE buffer and
+// the media timeline are left untouched, so playback continues without a gap. Built
+// lazily because it extends the runtime Hls.DefaultConfig.loader.
+const getNodeRewriteLoaderClass = () => {
+  if (nodeRewriteLoaderClass) return nodeRewriteLoaderClass;
+  if (!window.Hls || !Hls.DefaultConfig || !Hls.DefaultConfig.loader) return null;
+  const BaseLoader = Hls.DefaultConfig.loader;
+  nodeRewriteLoaderClass = class NodeRewriteLoader extends BaseLoader {
+    load(context, config, callbacks) {
+      try {
+        if (context && context.url) {
+          const targetOrigin = activeNodeOrigin();
+          const requestUrl = new URL(context.url, window.location.href);
+          if (requestUrl.origin !== targetOrigin) {
+            const target = new URL(targetOrigin);
+            requestUrl.protocol = target.protocol;
+            requestUrl.host = target.host;
+            context.url = requestUrl.toString();
+          }
+        }
+      } catch (error) {
+        // Leave the original URL untouched on any parse failure.
+      }
+      super.load(context, config, callbacks);
+    }
+  };
+  return nodeRewriteLoaderClass;
 };
 
 const triggerSatelliteRequestFailover = (reason, requestUrl, failedSatelliteUrl = satelliteUrl, details = {}) => {
@@ -2635,7 +2724,9 @@ const startPlayerWithOptions = ({
     const segmentRetries = satelliteAssigned ? 1 : 3;
     const retryDelayMs = 500;
     const maxRetryDelayMs = satelliteAssigned ? 1000 : 2000;
+    const nodeRewriteLoader = getNodeRewriteLoaderClass();
     hls = new Hls({
+      ...(nodeRewriteLoader ? { loader: nodeRewriteLoader } : {}),
       liveSyncDurationCount: 6,
       liveMaxLatencyDurationCount: 12,
       maxLiveSyncPlaybackRate: 1.2,
